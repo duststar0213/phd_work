@@ -61,6 +61,9 @@ const notesLayerStyle = computed(() => ({
   transform: `translate(${pan.value.x}px, ${pan.value.y}px) scale(${scale})`,
 }))
 
+/** Distance from note edge to mag-point center (must match StickyNoteCard --mag-outset). */
+const MAG_OUTSET = 18
+
 /** Mag-point position in canvas space (uses live size so wrapped text is included). */
 function magPos(noteId, side) {
   const note = notes.value.find((n) => n.id === noteId)
@@ -68,10 +71,10 @@ function magPos(noteId, side) {
   const size = metrics.value[noteId]
   const w = size?.width ?? note.width ?? 168
   const h = size?.height ?? note.height ?? 168
-  if (side === 'top') return { x: note.x + w / 2, y: note.y }
-  if (side === 'right') return { x: note.x + w, y: note.y + h / 2 }
-  if (side === 'bottom') return { x: note.x + w / 2, y: note.y + h }
-  return { x: note.x, y: note.y + h / 2 }
+  if (side === 'top') return { x: note.x + w / 2, y: note.y - MAG_OUTSET }
+  if (side === 'right') return { x: note.x + w + MAG_OUTSET, y: note.y + h / 2 }
+  if (side === 'bottom') return { x: note.x + w / 2, y: note.y + h + MAG_OUTSET }
+  return { x: note.x - MAG_OUTSET, y: note.y + h / 2 }
 }
 
 /** Map a mouse event to canvas coordinates (accounts for pan). */
@@ -161,10 +164,20 @@ function onConnectEnd(noteId, side) {
   draft.value = null
 }
 
-/** Drag empty canvas to pan. Skipped while placing a note or drawing a connector. */
-function onCanvasMouseDown(e) {
-  if (stickyActive.value || draft.value) return
+/** Idle canvas: no selection, no connector tool, no in-progress path. Sticky place-tool stays on. */
+function resetToIdle() {
+  clearConnectDrag()
+  draft.value = null
+  if (activeTool.value === 'connect') activeTool.value = null
   selectedId.value = null
+  const el = document.activeElement
+  if (el instanceof HTMLElement && el.isContentEditable) el.blur()
+}
+
+/** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky tool still places on click. */
+function onCanvasMouseDown(e) {
+  if (stickyActive.value) return
+  resetToIdle()
 
   const drag = {
     startX: e.clientX,
@@ -335,6 +348,8 @@ onUnmounted(() => {
           :scale="scale"
           :selected="selectedId === note.id"
           :connect-mode="connectActive"
+          :mag-outset="MAG_OUTSET"
+          :drafting="!!draft"
           @move="moveNote"
           @text-change="changeText"
           @select="selectNote"
@@ -347,25 +362,20 @@ onUnmounted(() => {
         />
       </div>
 
-      <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
-      <div v-if="connectActive" class="hint">drag from a mag point to another note · esc to cancel</div>
-
-      <div v-if="notes.length === 0 && !activeTool" class="empty">
-        <StickyNoteIcon :size="32" color="rgba(255,255,255,0.1)" />
-        <p>select the sticky note tool to begin</p>
-      </div>
-
       <!-- FigJam-style compact bar: width hugs content, not full screen -->
       <div class="bottom-bar" @mousedown.stop @click.stop>
-        <button
-          type="button"
-          class="tool-btn"
-          :class="{ active: stickyActive }"
-          title="Sticky note (N)"
-          @click="toggleTool('sticky')"
-        >
-          <StickyNoteIcon :size="28" />
-        </button>
+        <div class="tool-slot">
+          <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
+          <button
+            type="button"
+            class="tool-btn"
+            :class="{ active: stickyActive }"
+            title="Sticky note (N)"
+            @click="toggleTool('sticky')"
+          >
+            <StickyNoteIcon :size="28" />
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -436,6 +446,10 @@ onUnmounted(() => {
   z-index: 30;
 }
 
+.tool-slot {
+  position: relative;
+}
+
 .tool-btn {
   width: 44px;
   height: 44px;
@@ -464,7 +478,7 @@ onUnmounted(() => {
 
 .hint {
   position: absolute;
-  bottom: 92px;
+  bottom: calc(100% + 10px);
   left: 50%;
   transform: translateX(-50%);
   background: rgba(253, 230, 138, 0.12);

@@ -9,12 +9,15 @@ import ConnectionIcon from './ConnectionIcon.vue'
 
 const MIN_SIZE = 96 // smallest width/height from corner resize
 const SIDES = ['top', 'right', 'bottom', 'left']
+const PLACEHOLDER = 'define idea here' // grey hint on empty notes; hidden while typing
 
 const props = defineProps({
   note: { type: Object, required: true },
   scale: { type: Number, default: 1 },
   selected: { type: Boolean, default: false },
   connectMode: { type: Boolean, default: false },
+  magOutset: { type: Number, default: 18 }, // px from note edge to mag-point center
+  drafting: { type: Boolean, default: false }, // true while dragging a connector from a mag point
 })
 
 const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect'])
@@ -24,6 +27,7 @@ const noteRef = ref(null)
 const colorOpen = ref(false)
 const dragging = ref(false)
 const resizing = ref(false)
+const textFocused = ref(false) // hide placeholder while the caret is in the note
 let didDrag = false // click vs drag: click focuses text, drag moves the note
 
 const CORNERS = ['nw', 'ne', 'sw', 'se']
@@ -57,6 +61,13 @@ watch(
   },
 )
 
+watch(
+  () => props.drafting,
+  (drafting) => {
+    if (drafting) colorOpen.value = false
+  },
+)
+
 /** Dark text on light fills, light text on dark fills. */
 const textColor = computed(() => {
   const hex = props.note.color.replace('#', '')
@@ -67,6 +78,30 @@ const textColor = computed(() => {
   const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
   return luminance > 0.55 ? 'rgba(0,0,0,0.75)' : 'rgba(255,255,255,0.88)'
 })
+
+/** Grey hint color, slightly faded vs body text so it reads as placeholder. */
+const placeholderColor = computed(() => {
+  const hex = props.note.color.replace('#', '')
+  if (hex.length !== 6) return 'rgba(0,0,0,0.32)'
+  const r = parseInt(hex.slice(0, 2), 16)
+  const g = parseInt(hex.slice(2, 4), 16)
+  const b = parseInt(hex.slice(4, 6), 16)
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+  return luminance > 0.55 ? 'rgba(0,0,0,0.32)' : 'rgba(255,255,255,0.42)'
+})
+
+const showPlaceholder = computed(
+  () => !String(props.note.text ?? '').trim() && !textFocused.value,
+)
+
+/** Caret in: drop the grey hint. Caret out + still empty: hint returns. */
+function onTextFocus() {
+  textFocused.value = true
+}
+
+function onTextBlur() {
+  textFocused.value = false
+}
 
 /** Select this note so the floating toolbar appears. */
 function activate() {
@@ -233,12 +268,13 @@ function onMagMouseUp(e, side) {
       width: `${note.width ?? 168}px`,
       minHeight: `${note.height ?? 168}px`,
       background: note.color,
+      '--mag-outset': `${magOutset}px`,
     }"
     @mousedown="onNoteMouseDown"
     @click="onNoteClick"
   >
-    <!-- FigJam-style strip: color dot opens ColorWheel -->
-    <div v-if="selected" class="toolbar" @pointerdown.stop @mousedown.stop @click.stop>
+    <!-- Hidden while a mag-point drag is in progress so it does not cover the path. -->
+    <div v-if="selected && !drafting" class="toolbar" @pointerdown.stop @mousedown.stop @click.stop>
       <button
         class="color-btn"
         type="button"
@@ -251,15 +287,21 @@ function onMagMouseUp(e, side) {
           <path d="M2.5 4.5 L6 8 L9.5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
       </button>
-      <button
-        class="color-btn"
-        type="button"
-        :class="{ open: connectMode }"
-        title="Connector"
-        @click="requestConnect"
-      >
-        <ConnectionIcon :size="18" />
-      </button>
+      <div class="toolbar-item">
+        <button
+          class="color-btn"
+          type="button"
+          :class="{ open: connectMode }"
+          title="Connector"
+          @click="requestConnect"
+        >
+          <ConnectionIcon :size="18" />
+        </button>
+        <div v-if="connectMode" class="tool-hint">
+          <span>drag to mag</span>
+          <span>esc to cancel</span>
+        </div>
+      </div>
 
       <div v-if="colorOpen" class="color-popover">
         <ColorWheel :model-value="note.color" @update:model-value="onColorChange" />
@@ -291,6 +333,11 @@ function onMagMouseUp(e, side) {
     </template>
 
     <!-- Native contenteditable; wraps and grows the note (no inner scroll) -->
+    <span
+      v-if="showPlaceholder"
+      class="note-placeholder"
+      :style="{ color: placeholderColor }"
+    >{{ PLACEHOLDER }}</span>
     <div
       ref="textRef"
       class="note-text"
@@ -298,6 +345,9 @@ function onMagMouseUp(e, side) {
       contenteditable="true"
       spellcheck="false"
       @input="onTextInput"
+      @focus="onTextFocus"
+      @mousedown="onTextFocus"
+      @blur="onTextBlur"
     />
   </div>
 </template>
@@ -332,13 +382,17 @@ function onMagMouseUp(e, side) {
 
 .toolbar {
   position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  transform: translateX(-50%);
+  top: 50%;
+  right: calc(100% + var(--mag-outset) + 14px);
+  left: auto;
+  bottom: auto;
+  transform: translateY(-50%);
   display: flex;
+  flex-direction: column;
   align-items: center;
-  height: 36px;
-  padding: 0 6px;
+  width: 36px;
+  height: auto;
+  padding: 6px 4px;
   background: #2c2c2c;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
@@ -348,10 +402,13 @@ function onMagMouseUp(e, side) {
 
 .color-btn {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  gap: 1px;
+  width: 28px;
   height: 28px;
-  padding: 0 6px 0 5px;
+  padding: 0;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -365,6 +422,41 @@ function onMagMouseUp(e, side) {
   color: rgba(255, 255, 255, 0.85);
 }
 
+.toolbar-item {
+  position: relative;
+}
+
+.tool-hint {
+  position: absolute;
+  right: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  width: max-content;
+  max-width: none;
+  padding: 3px 7px;
+  background: rgba(253, 230, 138, 0.12);
+  border: 1px solid rgba(253, 230, 138, 0.25);
+  border-radius: 7px;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.3;
+  color: rgba(253, 230, 138, 0.78);
+  letter-spacing: 0.02em;
+  text-align: right;
+  white-space: nowrap;
+  pointer-events: auto;
+  z-index: 8;
+}
+
+.tool-hint:hover {
+  padding: 5px 9px;
+  font-size: 11px;
+}
+
 .color-dot {
   width: 16px;
   height: 16px;
@@ -375,14 +467,16 @@ function onMagMouseUp(e, side) {
 }
 
 .caret {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
+  transform: rotate(90deg);
 }
 
 .color-popover {
   position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
+  top: 0;
+  left: calc(100% + 8px);
+  right: auto;
   padding: 10px 12px;
   background: #2c2c2c;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -426,6 +520,22 @@ function onMagMouseUp(e, side) {
   cursor: nwse-resize;
 }
 
+.note-placeholder {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  right: 14px;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  pointer-events: none;
+  user-select: none;
+}
+
+.note:focus-within .note-placeholder {
+  display: none;
+}
+
 .note-text {
   padding: 14px;
   overflow: visible;
@@ -437,6 +547,8 @@ function onMagMouseUp(e, side) {
   overflow-wrap: break-word;
   word-break: break-word;
   cursor: text;
+  flex: 1;
+  min-height: 100%;
 }
 
 .mag-point {
@@ -450,6 +562,7 @@ function onMagMouseUp(e, side) {
   box-sizing: border-box;
   z-index: 6;
   cursor: inherit;
+  transform: translate(-50%, -50%);
 }
 
 .mag-point:hover {
@@ -459,37 +572,21 @@ function onMagMouseUp(e, side) {
 
 .mag-point.top {
   left: 50%;
-  top: 0;
-  transform: translate(-50%, -50%);
+  top: calc(-1 * var(--mag-outset));
 }
 
 .mag-point.right {
-  right: 0;
+  left: calc(100% + var(--mag-outset));
   top: 50%;
-  transform: translate(50%, -50%);
 }
 
 .mag-point.bottom {
   left: 50%;
-  bottom: 0;
-  transform: translate(-50%, 50%);
+  top: calc(100% + var(--mag-outset));
 }
 
 .mag-point.left {
-  left: 0;
+  left: calc(-1 * var(--mag-outset));
   top: 50%;
-  transform: translate(-50%, -50%);
-}
-
-.mag-point.right:hover {
-  transform: translate(50%, -50%) scale(1.25);
-}
-
-.mag-point.bottom:hover {
-  transform: translate(-50%, 50%) scale(1.25);
-}
-
-.mag-point.left:hover {
-  transform: translate(-50%, -50%) scale(1.25);
 }
 </style>
