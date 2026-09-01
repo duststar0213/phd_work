@@ -1,6 +1,9 @@
-* {
-  box-sizing: border-box;
-}
+/**
+ * Global CSS reset for the prototype.
+ * No CSS framework (no Tailwind / UnoCSS). Font: DM Mono via Google Fonts in index.html.
+ */
+
+/* Full-viewport shell so the canvas can fill the window. */
 
 html,
 body,

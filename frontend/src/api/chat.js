@@ -1,3 +1,4 @@
+/** POST /api/chat — used by ChatPanel (not wired into the canvas UI yet). */
 export async function sendChat(messages) {
   const response = await fetch('/api/chat', {
     method: 'POST',

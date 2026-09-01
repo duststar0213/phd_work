@@ -1,3 +1,5 @@
+"""FastAPI backend: OpenAI chat for the unused ChatPanel. Canvas UI does not call this yet."""
+
 import os
 
 from dotenv import load_dotenv
@@ -37,6 +39,7 @@ class ChatRequest(BaseModel):
 
 
 def get_client() -> AsyncOpenAI:
+    """Build an OpenAI client from backend/.env (OPENAI_API_KEY)."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or api_key.startswith("sk-your-key"):
         raise HTTPException(
@@ -48,6 +51,7 @@ def get_client() -> AsyncOpenAI:
 
 @app.get("/api/health")
 async def health():
+    """Liveness check; also reports whether an API key is configured."""
     has_key = bool(os.getenv("OPENAI_API_KEY")) and not os.getenv(
         "OPENAI_API_KEY", ""
     ).startswith("sk-your-key")
@@ -56,6 +60,7 @@ async def health():
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
+    """Forward a message list to OpenAI chat completions."""
     for message in req.messages:
         if message.role not in ALLOWED_ROLES:
             raise HTTPException(

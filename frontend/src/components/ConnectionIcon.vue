@@ -1,7 +1,7 @@
-<!-- Lucide-style sticky-note glyph (inline SVG, no icon package). -->
+<!-- Connector tool glyph: two nodes + a rounded orthogonal path (matches the provided icon). -->
 <script setup>
 defineProps({
-  size: { type: Number, default: 18 },
+  size: { type: Number, default: 28 },
   color: { type: String, default: 'currentColor' },
 })
 </script>
@@ -19,7 +19,8 @@ defineProps({
     stroke-linejoin="round"
     aria-hidden="true"
   >
-    <path d="M16 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8Z" />
-    <path d="M15 3v4a2 2 0 0 0 2 2h4" />
+    <circle cx="18.5" cy="5" r="2.15" />
+    <circle cx="5.5" cy="19" r="2.15" />
+    <path d="M16.4 5 H9.2 a3 3 0 0 0 0 6 h5.6 a3 3 0 0 1 0 6 H7.6" />
   </svg>
 </template>

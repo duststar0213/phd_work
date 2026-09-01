@@ -1,4 +1,8 @@
 <script setup>
+/**
+ * Early chat UI (Vue + FastAPI + OpenAI). Not mounted; App.vue uses CanvasBoard.
+ * fetch() is the only HTTP client — see api/chat.js.
+ */
 import { nextTick, ref } from 'vue'
 import { sendChat } from '../api/chat'
 
@@ -13,13 +17,15 @@ const messages = ref([
 ])
 const listEl = ref(null)
 
+/** After Vue paints, scroll the message list to the latest bubble. */
 async function scrollToBottom() {
-  await nextTick()
+  await nextTick() // wait until Vue has rendered the new message
   if (listEl.value) {
     listEl.value.scrollTop = listEl.value.scrollHeight
   }
 }
 
+/** Send the typed prompt through FastAPI → OpenAI (api/chat.js). */
 async function onSubmit() {
   const text = input.value.trim()
   if (!text || loading.value) return
