@@ -1,8 +1,13 @@
 <script setup>
-/** Root view: the canvas is the whole prototype UI. */
+/** Root: canvas by default; ?ai=1 opens the standalone rationale-label module. */
 import CanvasBoard from './components/CanvasBoard.vue'
+import RationalePlayground from './components/RationalePlayground.vue'
+
+const params = new URLSearchParams(window.location.search)
+const showRationale = params.get('ai') === '1' || params.get('ai') === 'rationale'
 </script>
 
 <template>
-  <CanvasBoard />
+  <RationalePlayground v-if="showRationale" />
+  <CanvasBoard v-else />
 </template>

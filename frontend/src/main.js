@@ -13,7 +13,8 @@
  *   ResizeObserver       — live note size for mag points
  *   Google Fonts (DM Mono)
  *
- * Unused right now: ChatPanel.vue + api/chat.js (fetch to FastAPI).
+ * Unused right now: ChatPanel.vue + api/chat.js (chatbot — not the rationale module).
+ * Rationale labels: api/rationale.js + RationaleModule.vue  (?ai=1 to test alone).
  */
 import { createApp } from 'vue'
 import './style.css'
