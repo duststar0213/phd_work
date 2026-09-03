@@ -6,6 +6,13 @@ backend/**/__pycache__/
 backend/**/*.pyc
 backend/.env
 
+# Study data (SQLite + local exports)
+backend/data/*.db
+backend/data/participant_credentials.txt
+backend/data/study_export.json
+backend/data/export/
+backend/data/allowlist.txt
+
 # Node / Vue
 frontend/node_modules/
 frontend/dist/

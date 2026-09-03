@@ -31,7 +31,7 @@ onMounted(async () => {
         <p class="kicker">repertoire · ai module</p>
         <h1>rationale labels</h1>
         <p class="lede">
-          Type a why, then press enter. Get short labels — not a chatbot reply.
+          Talk about the idea, then press enter. You get short labels — not a chatbot reply.
           Not attached to sticky notes or connections yet.
         </p>
         <p class="health" :class="{ bad: healthOk === false }">{{ health }}</p>

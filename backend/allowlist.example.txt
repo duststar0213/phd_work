@@ -1,0 +1,7 @@
+# Invite-only emails for the Repertoire study.
+# Copy to backend/data/allowlist.txt and put one address per line.
+# If this file is missing or has no emails, anyone with the access code can join.
+
+# ada@example.com
+# bob@university.edu
+duststar950213@gmail.com

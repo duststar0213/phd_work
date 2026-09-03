@@ -1,12 +1,14 @@
-"""FastAPI backend: OpenAI for rationale labels (and unused ChatPanel)."""
+"""FastAPI backend: participant sessions, canvas records, OpenAI rationale labels."""
 
+import hmac
 import json
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,6 +21,9 @@ from openai import (
     RateLimitError,
 )
 from pydantic import BaseModel, Field
+
+import auth
+import db
 
 load_dotenv()
 
@@ -47,8 +52,16 @@ Rules:
 MIN_RATIONALE_CHARS = 8
 OPENAI_TIMEOUT_S = 30.0
 MAX_LABEL_WORDS = 3
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+STUDY_CAP = int(os.getenv("STUDY_CAP", str(db.STUDY_CAP)) or db.STUDY_CAP)
 
-app = FastAPI(title="PhD Work API")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.init_db()
+    yield
+
+
+app = FastAPI(title="PhD Work API", lifespan=lifespan)
 
 
 def cors_origins() -> list[str]:
@@ -79,14 +92,14 @@ def api_error(status: int, code: str, message: str) -> HTTPException:
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_handler(_request: Request, _exc: RequestValidationError):
+async def validation_handler(_request, _exc: RequestValidationError):
     """Turn 422 validation into the same {code, message} shape the UI expects."""
     return JSONResponse(
         status_code=400,
         content={
             "detail": {
                 "code": "invalid_input",
-                "message": "Type a short rationale first, then generate labels.",
+                "message": "Check the form and try again.",
             }
         },
     )
@@ -100,6 +113,32 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
+
+
+class GateRequest(BaseModel):
+    access: str = Field(min_length=1, max_length=64)
+
+
+class EmailRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=120)
+
+
+class LoginRequest(EmailRequest):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class CanvasRequest(BaseModel):
+    notes: list = Field(default_factory=list)
+    connections: list = Field(default_factory=list)
+    pan: dict = Field(default_factory=dict)
+    nextId: int = 1
+    nextConnId: int = 1
+    scale: float = Field(default=1, ge=0.1, le=4)
+
+
+class EventRequest(BaseModel):
+    type: str = Field(min_length=1, max_length=64)
+    payload: dict = Field(default_factory=dict)
 
 
 class RationaleRequest(BaseModel):
@@ -166,6 +205,217 @@ async def health():
         "OPENAI_API_KEY", ""
     ).startswith("sk-your-key")
     return {"status": "ok", "openai_configured": has_key}
+
+
+def cookie_token(repertoire_session: str | None = Cookie(default=None)) -> str | None:
+    return repertoire_session
+
+
+def study_access_code() -> str:
+    return os.getenv("STUDY_ACCESS_CODE", "").strip()
+
+
+def require_study_access(given: str) -> None:
+    expected = study_access_code()
+    if not expected:
+        return
+    got = (given or "").strip().casefold()
+    expected = expected.casefold()
+    if len(got) != len(expected) or not hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8")):
+        raise api_error(401, "bad_access", "That study access code is not right.")
+
+
+def normalize_email(raw: str) -> str:
+    email = raw.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise api_error(400, "invalid_email", "Please enter a valid email address.")
+    return email
+
+
+def require_participant(token: str | None = Depends(cookie_token)):
+    person = db.participant_for_token(token or "")
+    if not person:
+        raise api_error(401, "auth_required", "Please sign in with your email.")
+    db.touch_participant(person["id"])
+    return person
+
+
+def cookie_secure() -> bool:
+    return os.getenv("COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
+
+
+def set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=auth.COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=db.SESSION_DAYS * 86400,
+        path="/",
+        secure=cookie_secure(),
+    )
+
+
+def set_gate_cookie(response: Response) -> None:
+    expected = study_access_code()
+    if not expected:
+        return
+    response.set_cookie(
+        key=auth.GATE_COOKIE,
+        value=auth.gate_token(expected),
+        httponly=True,
+        samesite="lax",
+        max_age=db.SESSION_DAYS * 86400,
+        path="/",
+        secure=cookie_secure(),
+    )
+
+
+def gate_unlocked(repertoire_gate: str | None) -> bool:
+    expected = study_access_code()
+    if not expected:
+        return True
+    want = auth.gate_token(expected)
+    got = (repertoire_gate or "").strip()
+    return len(got) == len(want) and hmac.compare_digest(got, want)
+
+
+def require_gate(repertoire_gate: str | None = Cookie(default=None)):
+    if not gate_unlocked(repertoire_gate):
+        raise api_error(401, "gate_required", "Enter the invitation code first.")
+
+
+@app.get("/api/auth/config")
+def auth_config(repertoire_gate: str | None = Cookie(default=None)):
+    return {
+        "access_required": bool(study_access_code()),
+        "gate_unlocked": gate_unlocked(repertoire_gate),
+        "invite_only": db.invited_emails() is not None,
+    }
+
+
+@app.post("/api/auth/gate")
+def open_gate(req: GateRequest, response: Response):
+    """Door 1: invitation code. Unlocks the login screen."""
+    require_study_access(req.access)
+    if not study_access_code():
+        raise api_error(401, "bad_access", "That study access code is not right.")
+    set_gate_cookie(response)
+    return {"ok": True}
+
+
+def admit_email(raw_email: str, *, create: bool):
+    """Allowlist, then load or create the participant row. Invitation code is door 1 (cookie)."""
+    email = normalize_email(raw_email)
+    try:
+        db.require_invited(email)
+        if create:
+            person = db.get_or_create_participant(email, cap=STUDY_CAP)
+        else:
+            person = db.get_participant_by_username(email)
+            if not person:
+                raise api_error(401, "unknown_email", "No study space for this email yet. Start from the email step.")
+    except db.NotInvitedError:
+        raise api_error(
+            403,
+            "not_invited",
+            "This email is not on the study list. Use the address from your invitation.",
+        ) from None
+    except db.StudyFullError:
+        raise api_error(
+            403,
+            "study_full",
+            "This study is full. If you already joined, use the same email.",
+        ) from None
+    return email, person
+
+
+def open_session(person, response: Response, event_type: str) -> None:
+    db.delete_sessions_for(person["id"])
+    token = auth.new_token()
+    db.create_session(person["id"], token)
+    db.touch_participant(person["id"])
+    db.add_event(person["id"], event_type, {})
+    set_session_cookie(response, token)
+
+
+def issue_password(person) -> str:
+    password = auth.random_password()
+    db.set_password(person["id"], auth.hash_otp(password))
+    return password
+
+
+@app.post("/api/auth/start")
+def start(req: EmailRequest, response: Response, _gate=Depends(require_gate)):
+    """New email → create a space and show a password once. Existing email → ask for password."""
+    email, person = admit_email(req.email, create=True)
+    if db.has_password(person):
+        return {"email": email, "is_new": False}
+    password = issue_password(person)
+    open_session(person, response, "register")
+    return {"email": email, "is_new": True, "password": password}
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest, response: Response, _gate=Depends(require_gate)):
+    _email, person = admit_email(req.email, create=False)
+    if not db.has_password(person) or not auth.verify_otp(req.password.strip(), person["password_hash"]):
+        raise api_error(401, "bad_credentials", "That password is not right.")
+    open_session(person, response, "login")
+    return {"email": person["username"]}
+
+
+@app.post("/api/auth/reset")
+def reset(req: EmailRequest, response: Response, _gate=Depends(require_gate)):
+    """Forgot password: issue a new one. Door 1 (invitation code) must already be open."""
+    email, person = admit_email(req.email, create=False)
+    password = issue_password(person)
+    open_session(person, response, "password_reset")
+    return {"email": email, "password": password}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response, token: str | None = Depends(cookie_token)):
+    person = db.participant_for_token(token or "")
+    if person:
+        db.add_event(person["id"], "logout", {})
+    if token:
+        db.delete_session(token)
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(person=Depends(require_participant)):
+    return {"email": person["username"]}
+
+
+@app.get("/api/canvas")
+def get_canvas(person=Depends(require_participant)):
+    data = db.load_canvas(person["id"])
+    if not data:
+        return {"notes": [], "connections": [], "pan": {"x": 0, "y": 0}, "nextId": 1, "nextConnId": 1, "scale": 1}
+    return data
+
+
+@app.put("/api/canvas")
+def put_canvas(req: CanvasRequest, person=Depends(require_participant)):
+    payload = {
+        "notes": req.notes,
+        "connections": req.connections,
+        "pan": req.pan,
+        "nextId": req.nextId,
+        "nextConnId": req.nextConnId,
+        "scale": req.scale,
+    }
+    db.save_canvas(person["id"], payload)
+    return {"ok": True, "updated_at": db.utc_now()}
+
+
+@app.post("/api/events")
+def post_event(req: EventRequest, person=Depends(require_participant)):
+    db.add_event(person["id"], req.type.strip()[:64], req.payload)
+    return {"ok": True}
 
 
 @app.post("/api/chat")

@@ -3,9 +3,17 @@
   Vue 3 SFC (script setup). No extra UI libraries: pan/place/select live here.
 -->
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue' // Vue 3 reactivity + lifecycle
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
+import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
+import RationaleModule from './RationaleModule.vue'
+import RelationMarker from './RelationMarker.vue'
+
+const props = defineProps({
+  username: { type: String, default: '' },
+})
+const emit = defineEmits(['signed-out'])
 
 /** Pen nib hotspot — used while the connector tool is on. */
 const PEN_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
@@ -27,6 +35,77 @@ function connectorPath(x1, y1, side1, x2, y2, side2 = 'left') {
   return `M ${x1} ${y1} C ${x1 + a.x} ${y1 + a.y}, ${x2 + b.x} ${y2 + b.y}, ${x2} ${y2}`
 }
 
+/** Point at t along the same cubic used by connectorPath (t=0.5 = visual midpoint). */
+function connectorPoint(x1, y1, side1, x2, y2, side2, t = 0.5) {
+  const a = outward(side1, 48)
+  const b = outward(side2, 48)
+  const p0x = x1
+  const p0y = y1
+  const p1x = x1 + a.x
+  const p1y = y1 + a.y
+  const p2x = x2 + b.x
+  const p2y = y2 + b.y
+  const p3x = x2
+  const p3y = y2
+  const u = 1 - t
+  return {
+    x: u * u * u * p0x + 3 * u * u * t * p1x + 3 * u * t * t * p2x + t * t * t * p3x,
+    y: u * u * u * p0y + 3 * u * u * t * p1y + 3 * u * t * t * p2y + t * t * t * p3y,
+  }
+}
+
+function emptyRelation() {
+  return {
+    rationaleOpen: false,
+    rationaleText: '',
+    rationaleLabels: [],
+    pinnedLabels: [],
+    abandoned: false,
+    abandonOpen: false,
+    abandonText: '',
+    abandonLabels: [],
+    abandonPinned: [],
+  }
+}
+
+function emptyNoteMeta() {
+  return {
+    pinnedLabels: [],
+    rationaleOpen: true,
+    rationaleText: '',
+    rationaleLabels: [],
+    abandoned: false,
+    abandonOpen: false,
+    abandonText: '',
+    abandonLabels: [],
+    abandonPinned: [],
+  }
+}
+
+const ABANDON_PRESET = { text: 'i do not know yet', kind: '', source: 'user' }
+
+function isNoteEmpty(note) {
+  return !String(note?.text || '').trim()
+}
+
+function isAbandoned(note) {
+  return Boolean(note?.abandoned)
+}
+
+function isNoteFrozen(note) {
+  return Boolean(note?.abandoned || note?.abandonOpen)
+}
+
+function isRelationEmpty(conn) {
+  if (String(conn?.rationaleText || '').trim()) return false
+  const labels = [...(conn?.rationaleLabels || []), ...(conn?.pinnedLabels || [])]
+  return !labels.some((item) => String(item?.text || '').trim())
+}
+
+function isRelationAbandoned(conn) {
+  return Boolean(conn?.abandoned)
+}
+
 /** Default fills, cycled as notes are placed. */
 const NOTE_COLORS = [
   '#FDE68A',
@@ -41,10 +120,11 @@ const notes = ref([])
 const connections = ref([]) // { id, fromId, fromSide, toId, toSide } — one mag point can own many
 const metrics = ref({}) // noteId -> { width, height } from ResizeObserver
 const selectedId = ref(null)
+const selectedConnId = ref(null)
 const activeTool = ref(null) // null | 'sticky' | 'connect'
 const draft = ref(null) // in-progress path: { fromId, fromSide, x, y }
 const pan = ref({ x: 0, y: 0 })
-const scale = 1
+const scale = ref(1)
 const canvasRef = ref(null)
 
 let nextId = 1
@@ -53,17 +133,44 @@ const panRef = { x: 0, y: 0 }
 let connectMove = null
 let connectUp = null
 
+const MIN_SCALE = 0.1
+const MAX_SCALE = 4
+const SCALE_STEP = 1.15
+const GRID = 28
+
 const stickyActive = computed(() => activeTool.value === 'sticky') // place-note tool
 const connectActive = computed(() => activeTool.value === 'connect') // mag-point connector tool
+const zoomLabel = computed(() => `${Math.round(scale.value * 100)}%`)
 
-/** Moves the notes layer with the canvas pan. */
+/** Moves the notes layer with the canvas pan and zoom. */
 const notesLayerStyle = computed(() => ({
-  transform: `translate(${pan.value.x}px, ${pan.value.y}px) scale(${scale})`,
+  transform: `translate(${pan.value.x}px, ${pan.value.y}px) scale(${scale.value})`,
 }))
 
 /** Distance from note edge to mag-point center (must match StickyNoteCard --mag-outset). */
 const MAG_OUTSET = 18
+/** Gap under the note so the rationale box sits below the bottom mag point. */
+const RATIONALE_GAP = 28
 
+/** Live note box (ResizeObserver), falling back to the stored size. */
+function noteSize(note) {
+  const size = metrics.value[note.id]
+  return {
+    width: size?.width ?? note.width ?? 168,
+    height: size?.height ?? note.height ?? 168,
+  }
+}
+
+/** Rationale panel sits under the note and matches its current width. */
+function rationaleStyle(note) {
+  const { width, height } = noteSize(note)
+  return {
+    left: `${note.x}px`,
+    top: `${note.y + height + RATIONALE_GAP}px`,
+    width: `${width}px`,
+    zIndex: selectedId.value === note.id ? 19 : 1,
+  }
+}
 /** Mag-point position in canvas space (uses live size so wrapped text is included). */
 function magPos(noteId, side) {
   const note = notes.value.find((n) => n.id === noteId)
@@ -81,17 +188,25 @@ function magPos(noteId, side) {
 function clientToCanvas(e) {
   const rect = canvasRef.value.getBoundingClientRect()
   return {
-    x: (e.clientX - rect.left - panRef.x) / scale,
-    y: (e.clientY - rect.top - panRef.y) / scale,
+    x: (e.clientX - rect.left - panRef.x) / scale.value,
+    y: (e.clientY - rect.top - panRef.y) / scale.value,
   }
 }
 
-/** SVG `d` for every saved connector, recomputed when notes move/resize. */
+/** SVG `d` plus midpoint for every saved connector, recomputed when notes move/resize. */
 const renderedConnections = computed(() =>
   connections.value.map((c) => {
     const from = magPos(c.fromId, c.fromSide)
     const to = magPos(c.toId, c.toSide)
-    return { ...c, d: connectorPath(from.x, from.y, c.fromSide, to.x, to.y, c.toSide) }
+    const fromNote = notes.value.find((n) => n.id === c.fromId)
+    const toNote = notes.value.find((n) => n.id === c.toId)
+    return {
+      ...c,
+      d: connectorPath(from.x, from.y, c.fromSide, to.x, to.y, c.toSide),
+      mid: connectorPoint(from.x, from.y, c.fromSide, to.x, to.y, c.toSide, 0.5),
+      faded: isAbandoned(fromNote) || isAbandoned(toNote) || isRelationAbandoned(c),
+      abandoned: isRelationAbandoned(c),
+    }
   }),
 )
 
@@ -113,11 +228,83 @@ function setMetrics(id, size) {
   metrics.value = { ...metrics.value, [id]: size }
 }
 
-/** Keeps the dot grid visually pinned while panning. */
-const patternOffset = computed(() => ({
-  x: pan.value.x % 28,
-  y: pan.value.y % 28,
-}))
+/** Dot grid follows pan and zoom so it stays locked to the canvas. */
+const patternOffset = computed(() => {
+  const size = GRID * scale.value
+  return {
+    x: pan.value.x % size,
+    y: pan.value.y % size,
+    size,
+    r: Math.max(0.55, scale.value),
+  }
+})
+
+function clampScale(next) {
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, next))
+}
+
+/** Zoom toward a screen point so the world under the cursor stays put (FigJam / Miro). */
+function zoomAt(clientX, clientY, nextScale) {
+  const clamped = clampScale(nextScale)
+  const el = canvasRef.value
+  if (!el || clamped === scale.value) {
+    scale.value = clamped
+    return
+  }
+  const rect = el.getBoundingClientRect()
+  const sx = clientX - rect.left
+  const sy = clientY - rect.top
+  const worldX = (sx - panRef.x) / scale.value
+  const worldY = (sy - panRef.y) / scale.value
+  panRef.x = sx - worldX * clamped
+  panRef.y = sy - worldY * clamped
+  pan.value = { x: panRef.x, y: panRef.y }
+  scale.value = clamped
+}
+
+function canvasCenterPoint() {
+  const el = canvasRef.value
+  if (!el) return { x: window.innerWidth / 2, y: window.innerHeight / 2 }
+  const rect = el.getBoundingClientRect()
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+}
+
+function zoomBy(factor) {
+  const c = canvasCenterPoint()
+  zoomAt(c.x, c.y, scale.value * factor)
+}
+
+function resetZoom() {
+  const c = canvasCenterPoint()
+  zoomAt(c.x, c.y, 1)
+}
+
+function zoomIn() {
+  zoomBy(SCALE_STEP)
+}
+
+function zoomOut() {
+  zoomBy(1 / SCALE_STEP)
+}
+
+/** Pinch / Ctrl+wheel zooms at the cursor; two-finger or plain wheel pans. */
+function onWheel(e) {
+  const t = e.target
+  if (
+    t instanceof HTMLElement &&
+    (isTypingTarget(t) || t.closest('.rationale-dock textarea') || t.closest('.edge-tray') || t.closest('.relation-marker'))
+  ) {
+    return
+  }
+  e.preventDefault()
+  if (e.ctrlKey || e.metaKey) {
+    zoomAt(e.clientX, e.clientY, scale.value * Math.exp(-e.deltaY * 0.01))
+    return
+  }
+  panRef.x -= e.deltaX
+  panRef.y -= e.deltaY
+  pan.value = { x: panRef.x, y: panRef.y }
+}
 
 /** Drop window listeners used while rubber-banding a connector. */
 function clearConnectDrag() {
@@ -130,6 +317,8 @@ function clearConnectDrag() {
 /** Mag-point mousedown: start a draft path. */
 function onConnectStart(noteId, side) {
   if (!connectActive.value) return
+  const note = notes.value.find((n) => n.id === noteId)
+  if (isNoteFrozen(note)) return
   clearConnectDrag()
   const from = magPos(noteId, side)
   draft.value = { fromId: noteId, fromSide: side, x: from.x, y: from.y }
@@ -147,17 +336,20 @@ function onConnectStart(noteId, side) {
   window.addEventListener('mouseup', connectUp)
 }
 
-/** Mag-point mouseup: commit a path (same point is ignored). */
+/** Mag-point mouseup: commit a path. Same sticky (any mag point) is ignored. */
 function onConnectEnd(noteId, side) {
   if (!draft.value) return
-  const same = draft.value.fromId === noteId && draft.value.fromSide === side
-  if (!same) {
+  const fromNote = notes.value.find((n) => n.id === draft.value.fromId)
+  const toNote = notes.value.find((n) => n.id === noteId)
+  const sameNote = draft.value.fromId === noteId
+  if (!sameNote && !isNoteFrozen(fromNote) && !isNoteFrozen(toNote)) {
     connections.value.push({
       id: nextConnId++,
       fromId: draft.value.fromId,
       fromSide: draft.value.fromSide,
       toId: noteId,
       toSide: side,
+      ...emptyRelation(),
     })
   }
   clearConnectDrag()
@@ -170,8 +362,11 @@ function resetToIdle() {
   draft.value = null
   if (activeTool.value === 'connect') activeTool.value = null
   selectedId.value = null
+  selectedConnId.value = null
   const el = document.activeElement
-  if (el instanceof HTMLElement && el.isContentEditable) el.blur()
+  if (el instanceof HTMLElement && (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+    el.blur()
+  }
 }
 
 /** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky tool still places on click. */
@@ -209,9 +404,13 @@ function onCanvasClick(e) {
   if (!stickyActive.value || !canvasRef.value) return
 
   const rect = canvasRef.value.getBoundingClientRect()
-  const cx = (e.clientX - rect.left - panRef.x) / scale
-  const cy = (e.clientY - rect.top - panRef.y) / scale
+  const cx = (e.clientX - rect.left - panRef.x) / scale.value
+  const cy = (e.clientY - rect.top - panRef.y) / scale.value
   const id = nextId++
+
+  for (const note of notes.value) {
+    note.rationaleOpen = false
+  }
 
   notes.value.push({
     id,
@@ -221,15 +420,17 @@ function onCanvasClick(e) {
     color: NOTE_COLORS[(id - 1) % NOTE_COLORS.length],
     width: 168,
     height: 168,
+    ...emptyNoteMeta(),
   })
   selectedId.value = id
   activeTool.value = null
+  logEvent('note_created', { id }).catch(() => {})
 }
 
 /** Nudge a note after a drag. */
 function moveNote(id, dx, dy) {
   const note = notes.value.find((n) => n.id === id)
-  if (!note) return
+  if (!note || isNoteFrozen(note)) return
   note.x += dx
   note.y += dy
 }
@@ -237,21 +438,21 @@ function moveNote(id, dx, dy) {
 /** Persist contenteditable text. */
 function changeText(id, text) {
   const note = notes.value.find((n) => n.id === id)
-  if (!note) return
+  if (!note || isNoteFrozen(note)) return
   note.text = text
 }
 
 /** Persist fill from the color wheel. */
 function changeColor(id, color) {
   const note = notes.value.find((n) => n.id === id)
-  if (!note) return
+  if (!note || isNoteFrozen(note)) return
   note.color = color
 }
 
 /** Apply corner-resize result (x/y + width/height). */
 function resizeNote(id, patch) {
   const note = notes.value.find((n) => n.id === id)
-  if (!note) return
+  if (!note || isNoteFrozen(note)) return
   note.x = patch.x
   note.y = patch.y
   note.width = patch.width
@@ -260,36 +461,523 @@ function resizeNote(id, patch) {
 
 /** Mark this note as the selected one (toolbar / resize handles). */
 function selectNote(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (isAbandoned(note)) return
   selectedId.value = id
+  selectedConnId.value = null
+}
+
+/** Keep up to 3 labels attached to the side of a note. */
+function setPinnedLabels(id, pinned) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isNoteFrozen(note)) return
+  note.pinnedLabels = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  logEvent('pin_change', { noteId: id, pinned: note.pinnedLabels }).catch(() => {})
+}
+
+function updateLabels(id, labels) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isNoteFrozen(note)) return
+  note.rationaleLabels = Array.isArray(labels) ? labels : []
+  const ids = new Set(note.rationaleLabels.map((item) => item.id))
+  note.pinnedLabels = (note.pinnedLabels || [])
+    .map((pin) => {
+      const match = note.rationaleLabels.find((item) => item.id === pin.id)
+      return match
+        ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source }
+        : pin
+    })
+    .filter((pin) => ids.has(pin.id))
+    .slice(0, 3)
+}
+
+/** Fold / unfold the rationale panel. New notes always start open. */
+function toggleRationale(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isAbandoned(note) || note.abandonOpen) return
+  note.rationaleOpen = !note.rationaleOpen
+}
+
+/** Clicking a side tab opens the rationale panel for that note. */
+function openRationale(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isAbandoned(note) || note.abandonOpen) return
+  note.rationaleOpen = true
+}
+
+function presetAbandonLabel(noteId) {
+  return { id: `abandon-${noteId}-idk`, ...ABANDON_PRESET }
+}
+
+/** Empty notes are removed. Notes with an idea open the abandon rationale instead. */
+function removeNote(id) {
+  notes.value = notes.value.filter((n) => n.id !== id)
+  connections.value = connections.value.filter((c) => c.fromId !== id && c.toId !== id)
+  if (selectedId.value === id) selectedId.value = null
+  if (metrics.value[id]) {
+    const next = { ...metrics.value }
+    delete next[id]
+    metrics.value = next
+  }
+  logEvent('note_deleted', { noteId: id }).catch(() => {})
+}
+
+function beginAbandon(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isAbandoned(note)) return
+  note.frozenX = note.x
+  note.frozenY = note.y
+  note.frozenWidth = note.width ?? 168
+  note.frozenHeight = note.height ?? 168
+  for (const item of notes.value) {
+    item.abandonOpen = item.id === id
+    if (item.id === id) item.rationaleOpen = false
+  }
+  for (const conn of connections.value) {
+    conn.rationaleOpen = false
+    conn.abandonOpen = false
+  }
+  if (!Array.isArray(note.abandonLabels) || !note.abandonLabels.length) {
+    note.abandonLabels = [presetAbandonLabel(id)]
+  }
+  note.abandonOpen = true
+  selectedId.value = id
+  selectedConnId.value = null
+  logEvent('note_abandon_started', { noteId: id }).catch(() => {})
+}
+
+function cancelAbandon(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note) return
+  note.abandonOpen = false
+  note.frozenX = undefined
+  note.frozenY = undefined
+  note.frozenWidth = undefined
+  note.frozenHeight = undefined
+}
+
+function confirmAbandon(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isAbandoned(note)) return
+  note.abandoned = true
+  note.abandonOpen = false
+  note.rationaleOpen = false
+  note.frozenX = note.x
+  note.frozenY = note.y
+  note.frozenWidth = note.width ?? 168
+  note.frozenHeight = note.height ?? 168
+  if (draft.value?.fromId === id) {
+    clearConnectDrag()
+    draft.value = null
+  }
+  if (selectedId.value === id) selectedId.value = null
+  if (activeTool.value === 'connect') activeTool.value = null
+  logEvent('note_abandoned', {
+    noteId: id,
+    abandonText: note.abandonText || '',
+    abandonLabels: note.abandonLabels || [],
+  }).catch(() => {})
+}
+
+/** Right-click → revive: the ghost comes back at the position it was frozen at. */
+function reviveNote(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || !isAbandoned(note)) return
+  if (typeof note.frozenX === 'number') {
+    note.x = note.frozenX
+    note.y = note.frozenY
+  }
+  if (typeof note.frozenWidth === 'number') {
+    note.width = note.frozenWidth
+    note.height = note.frozenHeight
+  }
+  note.abandoned = false
+  note.abandonOpen = false
+  note.frozenX = undefined
+  note.frozenY = undefined
+  note.frozenWidth = undefined
+  note.frozenHeight = undefined
+  selectedId.value = id
+  selectedConnId.value = null
+  logEvent('note_revived', { noteId: id, abandonText: note.abandonText || '' }).catch(() => {})
+}
+
+function setAbandonPinned(id, pinned) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note) return
+  note.abandonPinned = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+}
+
+function updateAbandonRationale(id, payload) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note) return
+  note.abandonText = payload.input || ''
+  note.abandonLabels = Array.isArray(payload.labels) ? payload.labels : []
+}
+
+function removeConnection(id) {
+  connections.value = connections.value.filter((c) => c.id !== id)
+  if (selectedConnId.value === id) selectedConnId.value = null
+  logEvent('relation_deleted', { connectionId: id }).catch(() => {})
+}
+
+function beginAbandonRelation(id) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn || isRelationAbandoned(conn)) return
+  for (const note of notes.value) note.abandonOpen = false
+  for (const item of connections.value) {
+    item.abandonOpen = item.id === id
+    if (item.id === id) item.rationaleOpen = false
+  }
+  if (!Array.isArray(conn.abandonLabels) || !conn.abandonLabels.length) {
+    conn.abandonLabels = [presetAbandonLabel(`rel-${id}`)]
+  }
+  conn.abandonOpen = true
+  selectConnection(id)
+  logEvent('relation_abandon_started', { connectionId: id }).catch(() => {})
+}
+
+function cancelAbandonRelation(id) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn) return
+  conn.abandonOpen = false
+}
+
+function confirmAbandonRelation(id) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn || isRelationAbandoned(conn)) return
+  conn.abandoned = true
+  conn.abandonOpen = false
+  conn.rationaleOpen = false
+  if (selectedConnId.value === id) selectedConnId.value = null
+  logEvent('relation_abandoned', {
+    connectionId: id,
+    abandonText: conn.abandonText || '',
+    abandonLabels: conn.abandonLabels || [],
+  }).catch(() => {})
+}
+
+function setRelationAbandonPinned(id, pinned) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn) return
+  conn.abandonPinned = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+}
+
+function updateRelationAbandonRationale(id, payload) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn) return
+  conn.abandonText = payload.input || ''
+  conn.abandonLabels = Array.isArray(payload.labels) ? payload.labels : []
+}
+
+/** Clicking a note's rationale box selects that note (and does not pan / place). */
+function onRationalePointer(noteId) {
+  selectedId.value = noteId
+  selectedConnId.value = null
+}
+
+function relationIdea(conn) {
+  const from = notes.value.find((n) => n.id === conn.fromId)
+  const to = notes.value.find((n) => n.id === conn.toId)
+  const left = String(from?.text || '').trim() || 'this idea'
+  const right = String(to?.text || '').trim() || 'this idea'
+  return `${left} ↔ ${right}`
+}
+
+function relationRationaleStyle(line) {
+  return {
+    left: `${line.mid.x}px`,
+    top: `${line.mid.y + 16}px`,
+    width: '220px',
+    transform: 'translateX(-50%)',
+    zIndex: selectedConnId.value === line.id ? 19 : 8,
+  }
+}
+
+function selectConnection(id) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn || isRelationAbandoned(conn)) return
+  selectedConnId.value = id
+  selectedId.value = null
+}
+
+function openRelationRationale(id) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn || isRelationAbandoned(conn) || conn.abandonOpen) return
+  selectConnection(id)
+  for (const item of connections.value) {
+    item.rationaleOpen = item.id === id
+  }
+}
+
+function toggleRelationRationale(id) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn || isRelationAbandoned(conn) || conn.abandonOpen) return
+  selectConnection(id)
+  conn.rationaleOpen = !conn.rationaleOpen
+}
+
+function setRelationPinned(id, pinned) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn) return
+  conn.pinnedLabels = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  logEvent('pin_change', { connectionId: id, pinned: conn.pinnedLabels }).catch(() => {})
+}
+
+function updateRelationLabels(id, labels) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn) return
+  conn.rationaleLabels = Array.isArray(labels) ? labels : []
+  const ids = new Set(conn.rationaleLabels.map((item) => item.id))
+  conn.pinnedLabels = (conn.pinnedLabels || [])
+    .map((pin) => {
+      const match = conn.rationaleLabels.find((item) => item.id === pin.id)
+      return match
+        ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source }
+        : pin
+    })
+    .filter((pin) => ids.has(pin.id))
+    .slice(0, 3)
+}
+
+function updateRelationRationale(id, payload) {
+  const conn = connections.value.find((c) => c.id === id)
+  if (!conn) return
+  conn.rationaleText = payload.input || ''
+  conn.rationaleLabels = Array.isArray(payload.labels) ? payload.labels : []
+}
+
+function onRelationPointer(id) {
+  selectConnection(id)
+}
+
+function onConnectorPointer(id) {
+  if (draft.value) return
+  selectConnection(id)
+  const el = document.activeElement
+  if (el instanceof HTMLElement && isTypingTarget(el)) el.blur()
+}
+
+/** True while typing in a note or in a rationale field — skip canvas shortcuts. */
+function isTypingTarget(el) {
+  if (!(el instanceof HTMLElement)) return false
+  if (el.isContentEditable) return true
+  const tag = el.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
 }
 
 /** Esc: drop draft, then cancel tool / deselect. N: toggle sticky tool. */
 function onKeydown(e) {
-  const editing = e.target instanceof HTMLElement && e.target.isContentEditable
+  const typing = isTypingTarget(e.target)
   if (e.key === 'Escape') {
     if (draft.value) {
       draft.value = null
       return
     }
+    const pending = notes.value.find((n) => n.abandonOpen)
+    if (pending && !typing) {
+      cancelAbandon(pending.id)
+      return
+    }
+    const pendingRel = connections.value.find((c) => c.abandonOpen)
+    if (pendingRel && !typing) {
+      cancelAbandonRelation(pendingRel.id)
+      return
+    }
     activeTool.value = null
     selectedId.value = null
-    if (editing) e.target.blur()
+    selectedConnId.value = null
+    if (!typing) {
+      for (const conn of connections.value) conn.rationaleOpen = false
+    }
+    if (typing && e.target instanceof HTMLElement) e.target.blur()
     return
   }
-  if ((e.key === 'n' || e.key === 'N') && !editing && !e.metaKey && !e.ctrlKey && !e.altKey) {
+  if ((e.key === 'Backspace' || e.key === 'Delete') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    const note = notes.value.find((n) => n.id === selectedId.value)
+    if (note && !isAbandoned(note) && !note.abandonOpen) {
+      const inNoteText = e.target instanceof HTMLElement && e.target.classList.contains('note-text')
+      if (!typing || (inNoteText && isNoteEmpty(note))) {
+        e.preventDefault()
+        if (isNoteEmpty(note)) removeNote(note.id)
+        else beginAbandon(note.id)
+        return
+      }
+    }
+    const conn = connections.value.find((c) => c.id === selectedConnId.value)
+    if (conn && !isRelationAbandoned(conn) && !conn.abandonOpen && !typing) {
+      e.preventDefault()
+      if (isRelationEmpty(conn)) removeConnection(conn.id)
+      else beginAbandonRelation(conn.id)
+      return
+    }
+  }
+  if (typing) return
+  if (e.metaKey || e.ctrlKey) {
+    if (e.key === '=' || e.key === '+' || e.code === 'NumpadAdd') {
+      e.preventDefault()
+      zoomIn()
+      return
+    }
+    if (e.key === '-' || e.code === 'NumpadSubtract') {
+      e.preventDefault()
+      zoomOut()
+      return
+    }
+    if (e.key === '0' || e.code === 'Numpad0') {
+      e.preventDefault()
+      resetZoom()
+      return
+    }
+  }
+  if ((e.key === 'n' || e.key === 'N') && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault()
     toggleTool('sticky')
   }
 }
 
-/** Register / drop keyboard shortcuts (N, Esc). */
-onMounted(() => {
+function updateRationale(id, payload) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isNoteFrozen(note)) return
+  note.rationaleText = payload.input || ''
+  note.rationaleLabels = Array.isArray(payload.labels) ? payload.labels : []
+}
+
+function canvasPayload() {
+  return {
+    notes: notes.value.map((note) => ({
+      id: note.id,
+      x: note.x,
+      y: note.y,
+      text: note.text,
+      color: note.color,
+      width: note.width,
+      height: note.height,
+      pinnedLabels: note.pinnedLabels || [],
+      rationaleOpen: Boolean(note.rationaleOpen),
+      rationaleText: note.rationaleText || '',
+      rationaleLabels: note.rationaleLabels || [],
+      abandoned: Boolean(note.abandoned),
+      abandonOpen: Boolean(note.abandonOpen),
+      abandonText: note.abandonText || '',
+      abandonLabels: note.abandonLabels || [],
+      abandonPinned: note.abandonPinned || [],
+      frozenX: note.frozenX,
+      frozenY: note.frozenY,
+      frozenWidth: note.frozenWidth,
+      frozenHeight: note.frozenHeight,
+    })),
+    connections: connections.value,
+    pan: pan.value,
+    scale: scale.value,
+    nextId,
+    nextConnId,
+  }
+}
+
+let saveTimer = null
+let loaded = false
+let wheelTarget = null
+
+function scheduleSave() {
+  if (!loaded) return
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    saveCanvas(canvasPayload()).catch(() => {})
+  }, 1400)
+}
+
+async function signOut() {
+  clearTimeout(saveTimer)
+  try {
+    await saveCanvas(canvasPayload())
+  } catch {
+    /* still log out */
+  }
+  try {
+    await logout()
+  } catch {
+    /* cookie may already be gone */
+  }
+  emit('signed-out')
+}
+
+/** Register / drop keyboard shortcuts (N, Esc, zoom). Load this participant's canvas. */
+onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
+  wheelTarget = canvasRef.value
+  wheelTarget?.addEventListener('wheel', onWheel, { passive: false })
+  try {
+    const data = await fetchCanvas()
+    notes.value = (Array.isArray(data.notes) ? data.notes : []).map((note) => {
+      const loaded = {
+        id: note.id,
+        x: note.x,
+        y: note.y,
+        text: note.text || '',
+        color: note.color || NOTE_COLORS[0],
+        width: note.width || 168,
+        height: note.height || 168,
+        pinnedLabels: Array.isArray(note.pinnedLabels) ? note.pinnedLabels : [],
+        rationaleOpen: Boolean(note.rationaleOpen),
+        rationaleText: note.rationaleText || '',
+        rationaleLabels: Array.isArray(note.rationaleLabels) ? note.rationaleLabels : [],
+        abandoned: Boolean(note.abandoned),
+        abandonOpen: Boolean(note.abandonOpen),
+        abandonText: note.abandonText || '',
+        abandonLabels: Array.isArray(note.abandonLabels) ? note.abandonLabels : [],
+        abandonPinned: Array.isArray(note.abandonPinned) ? note.abandonPinned : [],
+        frozenX: typeof note.frozenX === 'number' ? note.frozenX : undefined,
+        frozenY: typeof note.frozenY === 'number' ? note.frozenY : undefined,
+        frozenWidth: typeof note.frozenWidth === 'number' ? note.frozenWidth : undefined,
+        frozenHeight: typeof note.frozenHeight === 'number' ? note.frozenHeight : undefined,
+      }
+      if (loaded.abandoned && loaded.frozenX != null) {
+        loaded.x = loaded.frozenX
+        loaded.y = loaded.frozenY
+        loaded.width = loaded.frozenWidth ?? loaded.width
+        loaded.height = loaded.frozenHeight ?? loaded.height
+      }
+      return loaded
+    })
+    connections.value = (Array.isArray(data.connections) ? data.connections : []).map((c) => ({
+      id: c.id,
+      fromId: c.fromId,
+      fromSide: c.fromSide,
+      toId: c.toId,
+      toSide: c.toSide,
+      rationaleOpen: Boolean(c.rationaleOpen),
+      rationaleText: c.rationaleText || '',
+      rationaleLabels: Array.isArray(c.rationaleLabels) ? c.rationaleLabels : [],
+      pinnedLabels: Array.isArray(c.pinnedLabels) ? c.pinnedLabels : [],
+      abandoned: Boolean(c.abandoned),
+      abandonOpen: Boolean(c.abandonOpen),
+      abandonText: c.abandonText || '',
+      abandonLabels: Array.isArray(c.abandonLabels) ? c.abandonLabels : [],
+      abandonPinned: Array.isArray(c.abandonPinned) ? c.abandonPinned : [],
+    }))
+    pan.value = data.pan && typeof data.pan.x === 'number' ? { x: data.pan.x, y: data.pan.y } : { x: 0, y: 0 }
+    panRef.x = pan.value.x
+    panRef.y = pan.value.y
+    scale.value = clampScale(Number(data.scale) > 0 ? Number(data.scale) : 1)
+    nextId = Number(data.nextId) > 0 ? Number(data.nextId) : 1
+    nextConnId = Number(data.nextConnId) > 0 ? Number(data.nextConnId) : 1
+  } catch {
+    notes.value = []
+  }
+  loaded = true
+  watch(notes, scheduleSave, { deep: true })
+  watch(connections, scheduleSave, { deep: true })
+  watch(pan, scheduleSave, { deep: true })
+  watch(scale, scheduleSave)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
+  wheelTarget?.removeEventListener('wheel', onWheel)
+  wheelTarget = null
   clearConnectDrag()
+  clearTimeout(saveTimer)
 })
 </script>
 
@@ -310,11 +998,11 @@ onUnmounted(() => {
             id="dots"
             :x="patternOffset.x"
             :y="patternOffset.y"
-            width="28"
-            height="28"
+            :width="patternOffset.size"
+            :height="patternOffset.size"
             patternUnits="userSpaceOnUse"
           >
-            <circle cx="1" cy="1" r="1" fill="rgba(255,255,255,0.08)" />
+            <circle :cx="patternOffset.r" :cy="patternOffset.r" :r="patternOffset.r" fill="rgba(255,255,255,0.08)" />
           </pattern>
         </defs>
         <rect width="100%" height="100%" fill="url(#dots)" />
@@ -322,15 +1010,27 @@ onUnmounted(() => {
 
       <div class="notes-layer" :style="notesLayerStyle">
         <svg class="connectors" overflow="visible" aria-hidden="true">
-          <path
-            v-for="line in renderedConnections"
-            :key="line.id"
-            :d="line.d"
-            fill="none"
-            stroke="rgba(232,228,220,0.85)"
-            stroke-width="2.5"
-            stroke-linecap="round"
-          />
+          <g v-for="line in renderedConnections" :key="line.id">
+            <path
+              class="connector-hit"
+              :class="{ abandoned: line.abandoned }"
+              :d="line.d"
+              fill="none"
+              stroke="transparent"
+              stroke-width="16"
+              stroke-linecap="round"
+              @mousedown.stop.prevent="onConnectorPointer(line.id)"
+            />
+            <path
+              class="connector-line"
+              :class="{ selected: selectedConnId === line.id && !line.abandoned, faded: line.faded }"
+              :d="line.d"
+              fill="none"
+              :stroke="line.faded ? 'rgba(232,228,220,0.1)' : selectedConnId === line.id ? '#8ec8ff' : 'rgba(232,228,220,0.85)'"
+              :stroke-width="selectedConnId === line.id && !line.abandoned ? 3 : 2.5"
+              stroke-linecap="round"
+            />
+          </g>
           <path
             v-if="draftPath"
             :d="draftPath"
@@ -341,41 +1041,208 @@ onUnmounted(() => {
             stroke-dasharray="6 5"
           />
         </svg>
-        <StickyNoteCard
-          v-for="note in notes"
-          :key="note.id"
-          :note="note"
-          :scale="scale"
-          :selected="selectedId === note.id"
-          :connect-mode="connectActive"
-          :mag-outset="MAG_OUTSET"
-          :drafting="!!draft"
-          @move="moveNote"
-          @text-change="changeText"
-          @select="selectNote"
-          @color-change="changeColor"
-          @resize="resizeNote"
-          @metrics="setMetrics"
-          @connect-start="onConnectStart"
-          @connect-end="onConnectEnd"
-          @request-connect="toggleTool('connect')"
-        />
+        <div
+          v-for="line in renderedConnections"
+          :key="`rel-${line.id}`"
+          class="relation-wrap"
+          :class="{ abandoned: line.abandoned }"
+          :style="{
+            left: `${line.mid.x}px`,
+            top: `${line.mid.y}px`,
+            zIndex: selectedConnId === line.id || line.rationaleOpen || line.abandonOpen ? 18 : 8,
+            opacity: line.faded || line.abandoned ? 0.08 : 1,
+          }"
+          @pointerdown.stop="onRelationPointer(line.id)"
+          @mousedown.stop="onRelationPointer(line.id)"
+        >
+          <RelationMarker
+            :connection="line"
+            :open="Boolean(line.rationaleOpen)"
+            :selected="selectedConnId === line.id && !line.abandoned"
+            :abandoned="Boolean(line.abandoned)"
+            @open-rationale="openRelationRationale(line.id)"
+            @toggle-rationale="toggleRelationRationale(line.id)"
+            @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
+            @labels-change="(labels) => updateRelationLabels(line.id, labels)"
+          />
+        </div>
+        <template v-for="note in notes" :key="note.id">
+          <StickyNoteCard
+            :note="note"
+            :scale="scale"
+            :selected="selectedId === note.id"
+            :connect-mode="connectActive"
+            :mag-outset="MAG_OUTSET"
+            :drafting="!!draft"
+            :draft-from-id="draft?.fromId ?? null"
+            @move="moveNote"
+            @text-change="changeText"
+            @select="selectNote"
+            @color-change="changeColor"
+            @resize="resizeNote"
+            @metrics="setMetrics"
+            @connect-start="onConnectStart"
+            @connect-end="onConnectEnd"
+            @request-connect="toggleTool('connect')"
+            @suggest-relations="(id) => logEvent('suggest_relations', { noteId: id })"
+            @toggle-rationale="toggleRationale"
+            @open-rationale="openRationale"
+            @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
+            @labels-change="(labels) => updateLabels(note.id, labels)"
+            @revive="reviveNote"
+          />
+          <div
+            v-if="note.abandonOpen && !note.abandoned"
+            class="rationale-dock"
+            :style="rationaleStyle(note)"
+            @pointerdown.stop="onRationalePointer(note.id)"
+            @mousedown.stop="onRationalePointer(note.id)"
+            @click.stop
+          >
+            <RationaleModule
+              :key="`abandon-${note.id}`"
+              compact
+              target="note"
+              :idea="note.text"
+              :id-prefix="`abandon-${note.id}`"
+              :pinned="note.abandonPinned || []"
+              :saved-input="note.abandonText || ''"
+              :saved-labels="note.abandonLabels || []"
+              :preset-labels="[presetAbandonLabel(note.id)]"
+              placeholder="Tell me why abandon this idea…"
+              action-label="just abandon it"
+              complete-on-generate
+              @pin-change="(pinned) => setAbandonPinned(note.id, pinned)"
+              @rationale-change="(payload) => updateAbandonRationale(note.id, payload)"
+              @labels="() => logEvent('abandon_labels_generated', { noteId: note.id })"
+              @action="confirmAbandon(note.id)"
+              @complete="confirmAbandon(note.id)"
+            />
+          </div>
+          <div
+            v-show="note.rationaleOpen && !note.abandoned && !note.abandonOpen"
+            class="rationale-dock"
+            :style="rationaleStyle(note)"
+            @pointerdown.stop="onRationalePointer(note.id)"
+            @mousedown.stop="onRationalePointer(note.id)"
+            @click.stop
+          >
+            <RationaleModule
+              :key="note.id"
+              compact
+              target="note"
+              :idea="note.text"
+              :id-prefix="`note-${note.id}`"
+              :pinned="note.pinnedLabels || []"
+              :saved-input="note.rationaleText || ''"
+              :saved-labels="note.rationaleLabels || []"
+              @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
+              @rationale-change="(payload) => updateRationale(note.id, payload)"
+              @labels="() => logEvent('labels_generated', { noteId: note.id })"
+            />
+          </div>
+        </template>
+        <template v-for="line in renderedConnections" :key="`rel-abandon-${line.id}`">
+          <div
+            v-if="line.abandonOpen && !line.abandoned"
+            class="rationale-dock"
+            :style="relationRationaleStyle(line)"
+            @pointerdown.stop="onRelationPointer(line.id)"
+            @mousedown.stop="onRelationPointer(line.id)"
+            @click.stop
+          >
+          <RationaleModule
+            :key="`rel-abandon-${line.id}`"
+            compact
+            target="relation"
+            :idea="relationIdea(line)"
+            :id-prefix="`rel-abandon-${line.id}`"
+            :pinned="line.abandonPinned || []"
+            :saved-input="line.abandonText || ''"
+            :saved-labels="line.abandonLabels || []"
+            :preset-labels="[presetAbandonLabel(`rel-${line.id}`)]"
+            placeholder="Tell me why abandon this relation…"
+            action-label="just abandon it"
+            complete-on-generate
+            @pin-change="(pinned) => setRelationAbandonPinned(line.id, pinned)"
+            @rationale-change="(payload) => updateRelationAbandonRationale(line.id, payload)"
+            @labels="() => logEvent('relation_abandon_labels_generated', { connectionId: line.id })"
+            @action="confirmAbandonRelation(line.id)"
+            @complete="confirmAbandonRelation(line.id)"
+          />
+          </div>
+        </template>
+        <div
+          v-for="line in renderedConnections"
+          v-show="line.rationaleOpen && !line.abandoned && !line.abandonOpen"
+          :key="`rel-dock-${line.id}`"
+          class="rationale-dock"
+          :style="relationRationaleStyle(line)"
+          @pointerdown.stop="onRelationPointer(line.id)"
+          @mousedown.stop="onRelationPointer(line.id)"
+          @click.stop
+        >
+          <RationaleModule
+            :key="`rel-${line.id}`"
+            compact
+            target="relation"
+            :idea="relationIdea(line)"
+            :id-prefix="`rel-${line.id}`"
+            :pinned="line.pinnedLabels || []"
+            :saved-input="line.rationaleText || ''"
+            :saved-labels="line.rationaleLabels || []"
+            placeholder="Tell me about how they relates…"
+            @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
+            @rationale-change="(payload) => updateRelationRationale(line.id, payload)"
+            @labels="() => logEvent('labels_generated', { connectionId: line.id })"
+          />
+        </div>
       </div>
 
-      <!-- FigJam-style compact bar: width hugs content, not full screen -->
+      <!-- Account: floating logout, separate from the tool well -->
+      <button
+        type="button"
+        class="logout-btn"
+        :title="props.username ? `Log out · ${props.username}` : 'Log out'"
+        @mousedown.stop
+        @click.stop="signOut"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+          <polyline points="16 17 21 12 16 7" />
+          <line x1="21" x2="9" y1="12" y2="12" />
+        </svg>
+      </button>
+
+      <!-- FigJam-style tool well: sticky note only -->
       <div class="bottom-bar" @mousedown.stop @click.stop>
-        <div class="tool-slot">
-          <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
-          <button
-            type="button"
-            class="tool-btn"
-            :class="{ active: stickyActive }"
-            title="Sticky note (N)"
-            @click="toggleTool('sticky')"
-          >
-            <StickyNoteIcon :size="28" />
-          </button>
-        </div>
+        <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
+        <button
+          type="button"
+          class="tool-btn"
+          :class="{ active: stickyActive }"
+          title="Sticky note (N)"
+          @click="toggleTool('sticky')"
+        >
+          <StickyNoteIcon :size="28" />
+        </button>
+      </div>
+
+      <div class="zoom-bar" @mousedown.stop @click.stop @wheel.stop.prevent>
+        <button type="button" class="zoom-btn" title="Zoom out" @click="zoomOut">−</button>
+        <button type="button" class="zoom-pct" title="Reset to 100%" @click="resetZoom">{{ zoomLabel }}</button>
+        <button type="button" class="zoom-btn" title="Zoom in" @click="zoomIn">+</button>
       </div>
     </div>
   </div>
@@ -394,6 +1261,8 @@ onUnmounted(() => {
   position: relative;
   overflow: hidden;
   cursor: grab;
+  touch-action: none;
+  overscroll-behavior: none;
 }
 
 .canvas.placing {
@@ -418,6 +1287,20 @@ onUnmounted(() => {
   height: 1px;
 }
 
+.connector-hit {
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.connector-hit.abandoned {
+  pointer-events: none;
+  cursor: default;
+}
+
+.relation-wrap.abandoned {
+  pointer-events: none;
+}
+
 .notes-layer {
   position: absolute;
   left: 0;
@@ -428,6 +1311,23 @@ onUnmounted(() => {
   overflow: visible;
 }
 
+.relation-wrap {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+}
+
+.rationale-dock {
+  position: absolute;
+  box-sizing: border-box;
+  padding: 10px;
+  background: #2c2c2c;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  cursor: default;
+}
+
 .bottom-bar {
   position: absolute;
   left: 50%;
@@ -435,10 +1335,10 @@ onUnmounted(() => {
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 2px;
+  justify-content: center;
   width: max-content;
   height: 56px;
-  padding: 6px 8px;
+  padding: 6px;
   background: #2c2c2c;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
@@ -446,8 +1346,28 @@ onUnmounted(() => {
   z-index: 30;
 }
 
-.tool-slot {
-  position: relative;
+.logout-btn {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: #2c2c2c;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  z-index: 30;
+}
+
+.logout-btn:hover {
+  color: #fde68a;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .tool-btn {
@@ -491,6 +1411,51 @@ onUnmounted(() => {
   pointer-events: none;
   letter-spacing: 0.04em;
   white-space: nowrap;
+}
+
+.zoom-bar {
+  position: absolute;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  align-items: center;
+  height: 40px;
+  padding: 4px;
+  background: #2c2c2c;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  z-index: 30;
+}
+
+.zoom-btn,
+.zoom-pct {
+  height: 32px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+  font-family: 'DM Mono', ui-monospace, monospace;
+}
+
+.zoom-btn {
+  width: 32px;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.zoom-pct {
+  min-width: 52px;
+  padding: 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+
+.zoom-btn:hover,
+.zoom-pct:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
 }
 
 .empty {
