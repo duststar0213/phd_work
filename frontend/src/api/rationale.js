@@ -7,7 +7,7 @@
 const LABEL_KINDS = ['assumption', 'constraint', 'goal', 'tension', 'insight', 'question']
 const MIN_RATIONALE_CHARS = 8
 const REQUEST_TIMEOUT_MS = 35000
-const MAX_LABEL_WORDS = 3
+const MAX_LABEL_WORDS = 10
 
 export class RationaleApiError extends Error {
   constructor(message, { code = 'unknown', status = 0 } = {}) {
@@ -151,7 +151,7 @@ function normalizeLabel(item) {
   return { text, kind }
 }
 
-/** Visible tag text: at most three words. Kind stays in data only. */
+/** Visible tag text: at most ten words. Kind stays in data only. */
 export function clipWords(text, max = MAX_LABEL_WORDS) {
   return String(text || '')
     .trim()

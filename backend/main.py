@@ -41,7 +41,7 @@ Return JSON only:
 
 Rules:
 - 3 to 6 labels
-- each visible text is AT MOST 3 words, specific to THIS input
+- each visible text is AT MOST 10 words, specific to THIS input
 - kind is internal only (do not put kind words into text)
 - no paragraphs, no chatbot tone, no greetings, no markdown
 - kind must be one of the listed values
@@ -51,7 +51,7 @@ Rules:
 """
 MIN_RATIONALE_CHARS = 8
 OPENAI_TIMEOUT_S = 30.0
-MAX_LABEL_WORDS = 3
+MAX_LABEL_WORDS = 10
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 STUDY_CAP = int(os.getenv("STUDY_CAP", str(db.STUDY_CAP)) or db.STUDY_CAP)
 

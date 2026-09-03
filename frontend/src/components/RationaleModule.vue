@@ -4,7 +4,7 @@
   Enter generates (costs an API call). Empty input never generates.
 -->
 <script setup>
-import { nextTick, onUnmounted, ref, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { clipWords, generateRationaleLabels } from '../api/rationale'
 
 const MAX_PINNED = 3
@@ -31,14 +31,21 @@ const loading = ref(false)
 const error = ref('')
 const source = ref('') // 'api' | ''
 const editingId = ref(null)
+const editingZone = ref(null) // which copy of the chip holds the caret
 const draft = ref('')
 const pinLimitHint = ref(false)
 const localPinned = ref([])
+const draggingId = ref(null) // label being dragged between the two sections
+const dragOrigin = ref(null) // 'pool' | 'chosen' — decides re-rank vs pin/unpin
+const chosenHot = ref(false) // chosen zone is a live drop target
+
+const fieldRef = ref(null)
 
 let abortGenerate = null
 let nextLabelId = 1
-let clickTimer = null
 let hydrating = true
+let fieldObserver = null
+let fieldWidth = 0
 
 function fromSaved(item, fallbackSource) {
   const source = item.source || fallbackSource
@@ -67,9 +74,31 @@ if (Array.isArray(props.savedLabels) && props.savedLabels.length) {
   nextLabelId = Math.max(nextLabelId, maxId + 1)
 }
 
+/** No scrollbar: the field grows with its text and follows the note's width. */
+function autoGrow() {
+  const el = fieldRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  const borders = el.offsetHeight - el.clientHeight // border-box: scrollHeight leaves these out
+  el.style.height = `${el.scrollHeight + borders}px`
+}
+
+onMounted(() => {
+  autoGrow()
+  if (!fieldRef.value) return
+  fieldWidth = fieldRef.value.offsetWidth
+  fieldObserver = new ResizeObserver((entries) => {
+    const width = entries[0]?.contentRect.width
+    if (width == null || width === fieldWidth) return // height changes are ours, ignore them
+    fieldWidth = width
+    autoGrow()
+  })
+  fieldObserver.observe(fieldRef.value)
+})
+
 onUnmounted(() => {
   abortGenerate?.abort()
-  clearTimeout(clickTimer)
+  fieldObserver?.disconnect()
 })
 
 function emitRationale() {
@@ -88,6 +117,7 @@ function emitRationale() {
 hydrating = false
 
 watch(input, (value) => {
+  nextTick(autoGrow) // covers programmatic changes, not just typing
   if (hydrating) return
   if (!value.trim()) {
     const presets = seedPresets()
@@ -105,12 +135,7 @@ watch(
   () => props.savedLabels,
   (list) => {
     if (!Array.isArray(list)) return
-    labels.value = list.map((item) => ({
-      id: item.id || nextLabelId++,
-      text: clipWords(item.text),
-      kind: item.kind || '',
-      source: item.source || 'ai',
-    }))
+    labels.value = list.map((item) => fromSaved(item, 'ai'))
     const maxId = labels.value.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
     nextLabelId = Math.max(nextLabelId, maxId + 1)
   },
@@ -141,40 +166,135 @@ function isPinned(label) {
   return currentPinned().some((item) => item.id === label.id || item.text === label.text)
 }
 
-/** Click edits. Double-click pins (or unpins) as a tab on the note. */
-function onChipClick(label) {
-  clearTimeout(clickTimer)
-  clickTimer = setTimeout(() => {
-    clickTimer = null
-    startEdit(label)
-  }, 250)
+function chipTitle(label) {
+  if (isPinned(label)) return 'already chosen — drag it back down to take it off'
+  if (currentPinned().length >= MAX_PINNED) return '3 already chosen — drag one out first'
+  return 'click to edit · drag to rank or to choose'
 }
 
-function onChipDblClick(label) {
-  clearTimeout(clickTimer)
-  clickTimer = null
-  togglePin(label)
-}
-
-/** Double-click a chip to pin it on the note (max 3). Double-click again to swap it off. */
-function togglePin(label) {
-  if (!label.text) return
-  const pinned = currentPinned().slice()
-  const idx = pinned.findIndex((item) => item.id === label.id || item.text === label.text)
-  if (idx >= 0) {
-    pinned.splice(idx, 1)
-    setPinned(pinned)
+/** Drag-and-drop is the only way a label gets onto the note. */
+function onDragStart(e, label, origin) {
+  if (!label.text) {
+    e.preventDefault()
     return
   }
-  if (pinned.length >= MAX_PINNED) pinned.pop()
-  pinned.push(pinSnapshot(label))
-  setPinned(pinned)
+  draggingId.value = label.id
+  dragOrigin.value = origin
+  pinLimitHint.value = false
+  e.dataTransfer.effectAllowed = 'move'
+  e.dataTransfer.setData('text/plain', String(label.id))
 }
 
-function chipTitle(label) {
-  if (isPinned(label)) return 'double-click to take off the note'
-  if (currentPinned().length >= MAX_PINNED) return 'already 3 on the note — double-click one to swap'
-  return 'click to edit · double-click to pin'
+function onDragEnd() {
+  draggingId.value = null
+  dragOrigin.value = null
+  chosenHot.value = false
+}
+
+/** Shared reorder: the dragged chip takes the slot it is hovering. */
+function reorder(list, dragId, targetId) {
+  const from = list.findIndex((item) => String(item.id) === String(dragId))
+  const to = list.findIndex((item) => String(item.id) === String(targetId))
+  if (from < 0 || to < 0 || from === to) return null
+  const next = list.slice()
+  const [moved] = next.splice(from, 1)
+  next.splice(to, 0, moved)
+  return next
+}
+
+/** Hovering another pool chip while dragging within the pool re-ranks the list. */
+function onPoolChipDragOver(e, target) {
+  if (dragOrigin.value !== 'pool' || draggingId.value == null) return
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'move'
+  const next = reorder(labels.value, draggingId.value, target.id)
+  if (next) labels.value = next
+}
+
+function onChosenChipDragOver(e, target) {
+  if (dragOrigin.value !== 'chosen' || draggingId.value == null) return
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'move'
+  const next = reorder(currentPinned(), draggingId.value, target.id)
+  if (next) setPinned(next)
+}
+
+function draggedLabel(e) {
+  const raw = e.dataTransfer?.getData('text/plain')
+  const id = raw ? raw : draggingId.value
+  return visibleLabels().find((item) => String(item.id) === String(id))
+}
+
+/** Chosen zone takes exactly 3 — a 4th drop is refused rather than swapped. */
+function canDropInChosen() {
+  const label = visibleLabels().find((item) => String(item.id) === String(draggingId.value))
+  if (!label || !label.text) return false
+  if (isPinned(label)) return false
+  return currentPinned().length < MAX_PINNED
+}
+
+function onChosenDragOver(e) {
+  if (dragOrigin.value === 'chosen') return // re-ranking inside the zone, not a new pin
+  if (!canDropInChosen()) {
+    if (draggingId.value != null && currentPinned().length >= MAX_PINNED) pinLimitHint.value = true
+    return
+  }
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'move'
+  chosenHot.value = true
+}
+
+function onChosenDragLeave() {
+  chosenHot.value = false
+}
+
+function onChosenDrop(e) {
+  e.preventDefault()
+  chosenHot.value = false
+  const label = draggedLabel(e)
+  const origin = dragOrigin.value
+  draggingId.value = null
+  dragOrigin.value = null
+  if (origin === 'chosen') return // order was already applied while dragging
+  if (!label || !label.text || isPinned(label)) return
+  if (currentPinned().length >= MAX_PINNED) {
+    pinLimitHint.value = true
+    return
+  }
+  setPinned([...currentPinned(), pinSnapshot(label)])
+}
+
+/** Pool takes both a re-rank from inside and a chosen label dropped back down. */
+function onPoolDragOver(e) {
+  if (dragOrigin.value === 'pool') {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    return
+  }
+  const label = visibleLabels().find((item) => String(item.id) === String(draggingId.value))
+  if (!label || !isPinned(label)) return
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'move'
+}
+
+function onPoolDrop(e) {
+  e.preventDefault()
+  const label = draggedLabel(e)
+  const origin = dragOrigin.value
+  draggingId.value = null
+  dragOrigin.value = null
+  if (origin === 'pool') {
+    emitRationale() // persist the new ranking
+    return
+  }
+  if (!label) return
+  unpin(label)
+}
+
+function unpin(label) {
+  if (!isPinned(label)) return
+  pinLimitHint.value = false
+  setPinned(currentPinned().filter((item) => item.id !== label.id && item.text !== label.text))
 }
 
 /** Generated chips plus any pins that are no longer in the current set (so they can be swapped). */
@@ -224,7 +344,7 @@ async function generate() {
     labels.value = data.labels.map((item) => toChip(item, 'ai'))
     source.value = 'api'
     editingId.value = null
-    setPinned(labels.value.slice(0, MAX_PINNED).map(pinSnapshot))
+    setPinned([]) // nothing reaches the note until the person drags it up
     notify()
     if (props.completeOnGenerate) emit('complete')
   } catch (err) {
@@ -237,15 +357,15 @@ async function generate() {
   }
 }
 
-function startEdit(label) {
+function startEdit(label, zone = 'pool') {
   if (editingId.value != null && editingId.value !== label.id) {
-    const current = labels.value.find((item) => item.id === editingId.value)
-    if (current) finishEdit(current)
+    applyEdit(editingId.value, draft.value, editingZone.value === 'pool')
   }
   editingId.value = label.id
+  editingZone.value = zone
   draft.value = label.text
   nextTick(() => {
-    document.getElementById(`${props.idPrefix}-edit-${label.id}`)?.focus()
+    document.getElementById(`${props.idPrefix}-${zone}-edit-${label.id}`)?.focus()
   })
 }
 
@@ -253,30 +373,33 @@ function onDraftInput(e) {
   draft.value = clipWords(e.target.value)
 }
 
-function finishEdit(label) {
-  const text = clipWords(draft.value)
+/** Any text change makes the label human-authored, which turns it yellow. */
+function applyEdit(id, rawText, allowDelete) {
+  const text = clipWords(rawText)
+  const poolItem = labels.value.find((item) => item.id === id)
+  const pinnedItem = currentPinned().find((item) => item.id === id)
   if (!text) {
-    labels.value = labels.value.filter((item) => item.id !== label.id)
-    if (currentPinned().some((item) => item.id === label.id)) {
-      setPinned(currentPinned().filter((item) => item.id !== label.id))
-    }
+    if (!allowDelete) return
+    labels.value = labels.value.filter((item) => item.id !== id)
+    if (pinnedItem) setPinned(currentPinned().filter((item) => item.id !== id))
     return
   }
-  if (text !== label.text) label.source = 'user'
-  label.text = text
-  if (currentPinned().some((item) => item.id === label.id)) {
-    setPinned(
-      currentPinned().map((item) =>
-        item.id === label.id ? { ...item, text, source: label.source } : item,
-      ),
-    )
+  const previous = poolItem?.text ?? pinnedItem?.text ?? ''
+  const source = text !== previous ? 'user' : poolItem?.source || pinnedItem?.source || 'ai'
+  if (poolItem) {
+    poolItem.text = text
+    poolItem.source = source
+  }
+  if (pinnedItem) {
+    setPinned(currentPinned().map((item) => (item.id === id ? { ...item, text, source } : item)))
   }
 }
 
 function commitEdit(label) {
   if (editingId.value !== label.id) return
-  finishEdit(label)
+  applyEdit(label.id, draft.value, editingZone.value === 'pool')
   editingId.value = null
+  editingZone.value = null
   draft.value = ''
   notify()
 }
@@ -284,7 +407,6 @@ function commitEdit(label) {
 function removeLabel(label, e) {
   e?.preventDefault()
   e?.stopPropagation()
-  clearTimeout(clickTimer)
   if (editingId.value === label.id) {
     editingId.value = null
     draft.value = ''
@@ -306,6 +428,7 @@ function onEditKeydown(e, label) {
     e.preventDefault()
     draft.value = label.text
     editingId.value = null
+    editingZone.value = null
   }
 }
 
@@ -333,11 +456,13 @@ defineExpose({ generate, input, labels })
     <label class="field">
       <span class="field-label">reflection</span>
       <textarea
+        ref="fieldRef"
         v-model="input"
-        :rows="compact ? 3 : 5"
+        rows="1"
         :disabled="loading"
         :placeholder="placeholder"
         @keydown="onFieldKeydown"
+        @input="autoGrow"
       />
       <span class="hint">press enter when you're ready · shift+enter for a new line</span>
     </label>
@@ -348,67 +473,121 @@ defineExpose({ generate, input, labels })
       <p class="banner-hint">press enter to try again</p>
       <button type="button" class="btn tiny ghost" @click="dismissError">dismiss</button>
     </div>
-    <p v-else-if="source === 'api'" class="status">Rationale Label based on reflection</p>
-    <p v-if="pinLimitHint && !compact" class="status">3 on the note — click one to swap</p>
-    <p v-else-if="currentPinned().length && !compact" class="status">
-      {{ currentPinned().length }} / {{ MAX_PINNED }} on the note
-    </p>
 
-    <div v-if="!compact || (visibleLabels().length && !loading)" class="labels" aria-live="polite">
-      <span v-if="!compact && !visibleLabels().length && !loading" class="empty-labels">no labels yet</span>
-      <template v-else>
-        <span
-          v-for="label in visibleLabels()"
-          :key="label.id"
-          class="chip"
-          :class="{
-            editing: editingId === label.id,
-            ai: label.source === 'ai',
-            user: label.source === 'user',
-            selected: isPinned(label),
-            full: !isPinned(label) && currentPinned().length >= MAX_PINNED,
-          }"
+    <!-- Both label sections only exist once there is a reflection to label. -->
+    <template v-if="visibleLabels().length && !loading">
+      <div class="section">
+        <span class="section-label">top 3 chosen</span>
+        <div
+          class="zone chosen"
+          :class="{ hot: chosenHot, full: currentPinned().length >= MAX_PINNED }"
+          @dragover="onChosenDragOver"
+          @dragleave="onChosenDragLeave"
+          @drop="onChosenDrop"
         >
-          <input
-            v-if="editingId === label.id"
-            :id="`${idPrefix}-edit-${label.id}`"
-            class="chip-input"
-            :value="draft"
-            maxlength="48"
-            @input="onDraftInput"
-            @keydown="onEditKeydown($event, label)"
-            @blur="commitEdit(label)"
-          />
-          <button
-            v-else
-            type="button"
-            class="chip-text"
-            :title="chipTitle(label)"
-            @click="onChipClick(label)"
-            @dblclick.prevent="onChipDblClick(label)"
+          <span
+            v-for="label in currentPinned()"
+            :key="label.id"
+            class="chip selected"
+            :class="{
+              ai: label.source === 'ai',
+              user: label.source === 'user',
+              editing: editingId === label.id && editingZone === 'chosen',
+              dragging: draggingId === label.id,
+            }"
+            :draggable="!(editingId === label.id && editingZone === 'chosen')"
+            title="click to edit · drag to re-rank · drag back down to take it off"
+            @dragstart="onDragStart($event, label, 'chosen')"
+            @dragover="onChosenChipDragOver($event, label)"
+            @dragend="onDragEnd"
           >
-            {{ label.text || '…' }}
-          </button>
+            <input
+              v-if="editingId === label.id && editingZone === 'chosen'"
+              :id="`${idPrefix}-chosen-edit-${label.id}`"
+              class="chip-input"
+              :value="draft"
+              maxlength="96"
+              @input="onDraftInput"
+              @keydown="onEditKeydown($event, label)"
+              @blur="commitEdit(label)"
+            />
+            <button
+              v-else
+              type="button"
+              class="chip-text"
+              @click="startEdit(label, 'chosen')"
+            >{{ label.text }}</button>
+            <button
+              type="button"
+              class="chip-del"
+              title="Take off the note"
+              @mousedown.stop
+              @click.stop="unpin(label)"
+            >×</button>
+          </span>
+          <span v-if="!currentPinned().length" class="zone-empty">drag your top 3 here</span>
+        </div>
+        <span v-if="pinLimitHint" class="hint warn">3 already chosen — drag one out first</span>
+      </div>
+
+      <div class="section">
+        <span class="section-label">all rationale labels</span>
+        <span class="hint">drag to rank them, then drag your top 3 up · blue is generated by ai</span>
+        <div class="zone pool" @dragover="onPoolDragOver" @drop="onPoolDrop">
+          <span
+            v-for="label in visibleLabels()"
+            :key="label.id"
+            class="chip"
+            :class="{
+              editing: editingId === label.id && editingZone === 'pool',
+              ai: label.source === 'ai',
+              user: label.source === 'user',
+              chosen: isPinned(label),
+              dragging: draggingId === label.id,
+            }"
+            :draggable="!(editingId === label.id && editingZone === 'pool')"
+            @dragstart="onDragStart($event, label, 'pool')"
+            @dragover="onPoolChipDragOver($event, label)"
+            @dragend="onDragEnd"
+          >
+            <input
+              v-if="editingId === label.id && editingZone === 'pool'"
+              :id="`${idPrefix}-pool-edit-${label.id}`"
+              class="chip-input"
+              :value="draft"
+              maxlength="96"
+              @input="onDraftInput"
+              @keydown="onEditKeydown($event, label)"
+              @blur="commitEdit(label)"
+            />
+            <button
+              v-else
+              type="button"
+              class="chip-text"
+              :title="chipTitle(label)"
+              @click="startEdit(label)"
+            >
+              {{ label.text || '…' }}
+            </button>
+            <button
+              type="button"
+              class="chip-del"
+              title="Delete label"
+              @mousedown.stop
+              @click.stop="removeLabel(label, $event)"
+            >×</button>
+          </span>
           <button
             type="button"
-            class="chip-del"
-            title="Delete label"
-            @mousedown.stop
-            @click.stop="removeLabel(label, $event)"
-          >×</button>
-        </span>
-        <button
-          v-if="labels.length"
-          type="button"
-          class="add"
-          title="Add a label"
-          @click="startAdd"
-        >
-          +
-        </button>
-      </template>
-    </div>
-    <span v-if="!compact && visibleLabels().length && !loading" class="hint">click to edit · double-click to pin · × to delete · max 3</span>
+            class="add"
+            title="Add your own label"
+            @click="startAdd"
+          >
+            +
+          </button>
+        </div>
+      </div>
+    </template>
     <button
       v-if="actionLabel"
       type="button"
@@ -436,15 +615,17 @@ defineExpose({ generate, input, labels })
 
 .field-label {
   font-size: 11px;
+  font-weight: 700;
   letter-spacing: 0.08em;
-  text-transform: lowercase;
+  text-transform: uppercase;
   color: rgba(253, 230, 138, 0.65);
 }
 
 textarea {
   width: 100%;
   box-sizing: border-box;
-  resize: vertical;
+  resize: none;
+  overflow: hidden;
   min-height: 108px;
   padding: 10px 12px;
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -466,7 +647,8 @@ textarea::placeholder {
 }
 
 .hint {
-  font-size: 11px;
+  font-size: 9px;
+  line-height: 1.4;
   letter-spacing: 0.03em;
   color: rgba(255, 255, 255, 0.28);
 }
@@ -540,16 +722,53 @@ textarea::placeholder {
   color: rgba(255, 255, 255, 0.35);
 }
 
-.labels {
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.section-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(253, 230, 138, 0.65);
+}
+
+.zone {
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 8px;
+  min-height: 34px;
+  padding: 6px;
+  border-radius: 8px;
+}
+
+.zone.chosen {
+  border: 1px dashed rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.zone.chosen.hot {
+  border-color: rgba(253, 230, 138, 0.6);
+  background: rgba(253, 230, 138, 0.08);
+}
+
+.zone.pool {
+  padding: 0;
   min-height: 28px;
 }
 
-.empty-labels {
-  font-size: 12px;
+.zone-empty {
+  align-self: center;
+  font-size: 11px;
   color: rgba(255, 255, 255, 0.22);
+}
+
+.hint.warn {
+  color: rgba(252, 165, 165, 0.8);
 }
 
 .chip {
@@ -561,6 +780,20 @@ textarea::placeholder {
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.07);
+  cursor: grab;
+}
+
+.chip.dragging {
+  opacity: 0.4;
+}
+
+/* Already on the note: dimmed in the pool so the remaining choices stand out. */
+.chip.chosen {
+  opacity: 0.4;
+}
+
+.chip.editing {
+  cursor: text;
 }
 
 .chip.ai {
@@ -632,10 +865,6 @@ textarea::placeholder {
   border-color: rgba(253, 230, 138, 0.9);
 }
 
-.chip.full {
-  opacity: 0.45;
-}
-
 .chip.ai .chip-input {
   color: #bfdbfe;
 }
@@ -670,15 +899,23 @@ textarea::placeholder {
   min-height: 72px;
   padding: 8px;
   font-size: 12px;
-  resize: vertical;
 }
 
 .module.compact .hint,
 .module.compact .status,
-.module.compact .empty-labels,
+.module.compact .zone-empty,
 .module.compact .banner p {
   white-space: normal;
   overflow-wrap: break-word;
+}
+
+.module.compact .section-label {
+  font-size: 10px;
+}
+
+.module.compact .zone {
+  gap: 6px;
+  min-height: 30px;
 }
 
 .module.compact .chip-text,
