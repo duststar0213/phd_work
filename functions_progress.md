@@ -10,17 +10,17 @@ title: Repertoire prototype(temporary name)
 - Research prototype for capturing **why** an idea exists, not a chatbot suggest what ideas they should make
 - Designer writes a **reflection** → AI (or the person) turns it into **short labels** = surfacing rationale out from reflection (vebalized)
 - Using reflection instead of rationale: **relationship between reflection and rationale? raionale is more structrued while reflection is more fluid and will give user more freedom to express**
-- Labels can **recur** on the same note and **across notes** and defines a pattern that may be reusable for users 
+
 
 ---
 
 # Research intent
 
 - Sticky notes hold the **idea** 
-- Reflection holds the **rationale** (why this idea / why abandon / why two ideas link)
+- Reflection includes the **rationale** (why this idea / why abandon / why two ideas link)
 - Labels are compact, reusable **rationale identities** (`rid`)
-- Repeating wording patterns may matter to users — same note **or** across notes
-
+- Labels can **recur** on the same note and **across notes** and defines a pattern that may be reusable for users 
+- Labels can **recur** on the same note and **across notes** and defines a pattern that may be reusable for users 
 ---
 
 # Stack
@@ -31,7 +31,7 @@ title: Repertoire prototype(temporary name)
 
 **Backend**
 - FastAPI (Python)
-- SQLite (`backend/data/repertoire.db`)
+- SQLite (`backend/data/repertoire.db`) for json 
 - OpenAI API (`gpt-4o-mini` + `text-embedding-3-small`)
 
 **Not used on the canvas:** chatbot panel (`ChatPanel`) — code exists, not wired in
@@ -55,7 +55,7 @@ NEED TO FIGURE OUT: where should i host this prototype? what are policy if I nee
 - Then email + password (or emailed one-time code)
 - Same email **always** maps to the same canvas 
 - Optional allowlist of emails (manually add participants email is possible)
-- Cap on how many new accounts can join
+
 
 ---
 

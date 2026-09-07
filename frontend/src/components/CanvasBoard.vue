@@ -1,15 +1,17 @@
 <!--
-  Repertoire prototype — viewport canvas for sticky-note brainstorming.
+  Repertoire prototype — infinite canvas for sticky-note brainstorming.
   Vue 3 SFC (script setup). No extra UI libraries: pan/place/select live here.
 -->
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
-import { patternStatsFromLabels } from '../api/rationale'
+import { patternStatsFromLabels, embedTexts, cosine, asVector } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
+import SearchIcon from './SearchIcon.vue'
 import RationaleModule from './RationaleModule.vue'
 import RelationMarker from './RelationMarker.vue'
+import { SEARCH_TEST_PACKS } from '../data/searchTestPacks'
 
 const props = defineProps({
   username: { type: String, default: '' },
@@ -127,6 +129,18 @@ const draft = ref(null) // in-progress path: { fromId, fromSide, x, y }
 const pan = ref({ x: 0, y: 0 })
 const scale = ref(1)
 const canvasRef = ref(null)
+const searchOpen = ref(false)
+const searchQuery = ref('')
+const searchHits = ref([]) // [{ id, score, title, why }]
+const searchPicked = ref([]) // note ids the designer kept
+const searchLoading = ref(false)
+const searchError = ref('')
+const searchInputRef = ref(null)
+const searchVecCache = new Map() // blob -> vector; one embed per unique note text
+const isDev = import.meta.env.DEV
+const searchTestHint = ref('')
+const clearArmed = ref(false)
+let searchTestPackCursor = 0
 
 let nextId = 1
 let nextConnId = 1
@@ -134,17 +148,15 @@ const panRef = { x: 0, y: 0 }
 let connectMove = null
 let connectUp = null
 
-const MIN_SCALE = 1
-const MAX_SCALE = 2
-const SCALE_STEP = 1.15
 const GRID = 28
 const BOARD_PAD = 28
+const SEARCH_THRESHOLD = 0.28
+const SEARCH_MAX = 16
 
 const stickyActive = computed(() => activeTool.value === 'sticky') // place-note tool
 const connectActive = computed(() => activeTool.value === 'connect') // mag-point connector tool
-const zoomLabel = computed(() => `${Math.round(scale.value * 100)}%`)
 
-/** Moves the notes layer with the canvas pan and zoom. */
+/** Moves the notes layer with the canvas pan. Scale stays at 100%. */
 const notesLayerStyle = computed(() => ({
   transform: `translate(${pan.value.x}px, ${pan.value.y}px) scale(${scale.value})`,
 }))
@@ -219,10 +231,227 @@ const draftPath = computed(() => {
   return connectorPath(from.x, from.y, draft.value.fromSide, draft.value.x, draft.value.y, 'left')
 })
 
+const searchHitIds = computed(() => new Set(searchHits.value.map((item) => item.id)))
+const searchPickedIds = computed(() => new Set(searchPicked.value))
+const searchDimActive = computed(() => searchHits.value.length > 0)
+
 /** Arm / disarm a tool. Sticky and connect are mutually exclusive. */
 function toggleTool(name) {
+  if (name === 'sticky' && searchOpen.value) closeSearch()
   activeTool.value = activeTool.value === name ? null : name
   if (activeTool.value !== 'connect') draft.value = null
+}
+
+function noteSearchBlob(note) {
+  const pins = (note.pinnedLabels || [])
+    .map((item) => String(item?.text || '').trim())
+    .filter(Boolean)
+    .slice(0, 3)
+  return [note.text, note.rationaleText, ...pins]
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .join('\n')
+}
+
+function lexicalScore(blob, query) {
+  const terms = String(query || '')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term.length > 1)
+  if (!terms.length) return 0
+  const hay = String(blob || '').toLowerCase()
+  let hits = 0
+  for (const term of terms) if (hay.includes(term)) hits += 1
+  return hits / terms.length
+}
+
+function noteSearchWhy(note) {
+  const pin = (note.pinnedLabels || []).map((item) => String(item?.text || '').trim()).find(Boolean)
+  if (pin) return pin
+  const reflection = String(note.rationaleText || '').trim()
+  if (reflection) return reflection.length > 72 ? `${reflection.slice(0, 72)}…` : reflection
+  const idea = String(note.text || '').trim()
+  if (idea) return idea.length > 72 ? `${idea.slice(0, 72)}…` : idea
+  return 'empty idea'
+}
+
+function closeSearch() {
+  searchOpen.value = false
+  searchQuery.value = ''
+  searchHits.value = []
+  searchPicked.value = []
+  searchError.value = ''
+  searchLoading.value = false
+  searchTestHint.value = ''
+}
+
+function clearBoard() {
+  clearArmed.value = false
+  closeSearch()
+  clearConnectDrag()
+  notes.value = []
+  connections.value = []
+  metrics.value = {}
+  selectedId.value = null
+  selectedConnId.value = null
+  activeTool.value = null
+  draft.value = null
+  searchVecCache.clear()
+  searchTestHint.value = ''
+  nextId = 1
+  nextConnId = 1
+  panRef.x = 0
+  panRef.y = 0
+  pan.value = { x: 0, y: 0 }
+  scale.value = 1
+  clearTimeout(saveTimer)
+  saveCanvas(canvasPayload()).catch(() => {})
+  logEvent('canvas_cleared', {}).catch(() => {})
+}
+
+function armClearBoard() {
+  if (clearArmed.value) {
+    clearBoard()
+    return
+  }
+  clearArmed.value = true
+}
+
+/** Pool labels for sample ideas — unique ids so they cannot collide with later AI chips. */
+let sampleLabelSeq = Date.now()
+function samplePoolLabels(pins) {
+  return (Array.isArray(pins) ? pins : [])
+    .map((text) => String(text || '').trim())
+    .filter(Boolean)
+    .map((text) => ({
+      id: ++sampleLabelSeq,
+      text,
+      kind: '',
+      source: 'user',
+      rid: newRid(),
+    }))
+}
+
+/** DEV only: append the next sample pack. Search still embeds whatever is live. */
+function addSearchTestPack() {
+  if (!isDev || !SEARCH_TEST_PACKS.length) return
+  const pack = SEARCH_TEST_PACKS[searchTestPackCursor % SEARCH_TEST_PACKS.length]
+  searchTestPackCursor += 1
+  const s = scale.value
+  const originX = (BOARD_PAD - panRef.x) / s
+  const originY = (BOARD_PAD - panRef.y) / s
+  const cols = 4
+  const cellW = 220
+  const cellH = 200
+  const offset = notes.value.length
+  for (const [i, idea] of pack.ideas.entries()) {
+    const id = nextId++
+    const col = (offset + i) % cols
+    const row = Math.floor((offset + i) / cols)
+    notes.value.push(
+      hydrateRids({
+        id,
+        x: originX + col * cellW + ((offset + i) % 3) * 10,
+        y: originY + row * cellH + ((offset + i) % 2) * 12,
+        text: idea.text,
+        color: NOTE_COLORS[(id - 1) % NOTE_COLORS.length],
+        width: 200,
+        height: 168,
+        ...emptyNoteMeta(),
+        rationaleOpen: false,
+        rationaleText: idea.rationale || '',
+        rationaleLabels: samplePoolLabels(idea.pins),
+        pinnedLabels: [],
+      }),
+    )
+  }
+  searchTestHint.value = `added “${pack.id}” (${pack.ideas.length}) · try “${pack.tryQuery}”, then add another pack and search again`
+  logEvent('search_test_pack', { pack: pack.id, added: pack.ideas.length, total: notes.value.length }).catch(() => {})
+}
+
+function toggleSearch() {
+  if (searchOpen.value) {
+    closeSearch()
+    return
+  }
+  activeTool.value = null
+  draft.value = null
+  searchOpen.value = true
+  searchError.value = ''
+  nextTick(() => searchInputRef.value?.focus())
+}
+
+function toggleSearchPick(id) {
+  const has = searchPicked.value.includes(id)
+  searchPicked.value = has ? searchPicked.value.filter((item) => item !== id) : [...searchPicked.value, id]
+}
+
+function clearSearchHits() {
+  searchHits.value = []
+  searchPicked.value = []
+  searchError.value = ''
+}
+
+function jumpToSearchHit(id) {
+  selectNote(id)
+  const note = notes.value.find((item) => item.id === id)
+  if (!note || !canvasRef.value) return
+  const { w, h } = viewSize()
+  const { width, height } = noteSize(note)
+  const s = scale.value
+  panRef.x = w / 2 - (note.x + width / 2) * s
+  panRef.y = h / 2 - (note.y + height / 2) * s
+  applyPan()
+}
+
+async function runBoardSearch() {
+  const query = searchQuery.value.trim()
+  if (!query || searchLoading.value) return
+  const live = notes.value.filter((note) => !isAbandoned(note) && !note.abandonOpen)
+  if (!live.length) {
+    searchHits.value = []
+    searchError.value = 'Place an idea first, then look it up.'
+    return
+  }
+  searchLoading.value = true
+  searchError.value = ''
+  searchPicked.value = []
+  try {
+    const blobs = live.map((note) => ({ note, blob: noteSearchBlob(note) }))
+    const missing = [...new Set(blobs.map((item) => item.blob).filter((blob) => blob && !asVector(searchVecCache.get(blob))))]
+    const texts = missing.length ? [query, ...missing] : [query]
+    let byText = new Map()
+    try {
+      byText = await embedTexts(texts)
+      for (const [text, vec] of byText) searchVecCache.set(text, vec)
+    } catch {
+      byText = new Map()
+    }
+    const qVec = asVector(byText.get(query)) || asVector(searchVecCache.get(query))
+    const ranked = []
+    for (const { note, blob } of blobs) {
+      const vec = asVector(searchVecCache.get(blob))
+      const semantic = qVec && vec ? cosine(qVec, vec) : 0
+      const lexical = lexicalScore(blob, query)
+      const score = semantic > 0 ? semantic * 0.85 + lexical * 0.15 : lexical
+      if (score < SEARCH_THRESHOLD && lexical < 0.34) continue
+      ranked.push({
+        id: note.id,
+        score,
+        title: String(note.text || '').trim() || 'untitled idea',
+        why: noteSearchWhy(note),
+      })
+    }
+    ranked.sort((a, b) => b.score - a.score)
+    searchHits.value = ranked.slice(0, SEARCH_MAX)
+    if (!searchHits.value.length) searchError.value = 'Nothing on the board is close to that yet.'
+    logEvent('board_search', { q: query, hits: searchHits.value.map((item) => item.id) }).catch(() => {})
+  } catch (err) {
+    searchHits.value = []
+    searchError.value = err?.message || "Couldn't look that up."
+  } finally {
+    searchLoading.value = false
+  }
 }
 
 /** Store live width/height from a note's ResizeObserver. */
@@ -230,7 +459,7 @@ function setMetrics(id, size) {
   metrics.value = { ...metrics.value, [id]: size }
 }
 
-/** Dot grid follows pan and zoom so it stays locked to the canvas. */
+/** Dot grid follows pan so it stays locked to the canvas. */
 const patternOffset = computed(() => {
   const size = GRID * scale.value
   return {
@@ -241,11 +470,6 @@ const patternOffset = computed(() => {
   }
 })
 
-function clampScale(next) {
-  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, next))
-}
-
-/** The board is the current window. 100% zoom fills it; pan only exists when zoomed in. */
 function viewSize() {
   const el = canvasRef.value
   if (!el) return { w: window.innerWidth, h: window.innerHeight }
@@ -253,112 +477,15 @@ function viewSize() {
   return { w: rect.width, h: rect.height }
 }
 
-function clampPanToBoard() {
-  const { w, h } = viewSize()
-  const s = scale.value
-  const minX = w - w * s
-  const minY = h - h * s
-  panRef.x = Math.min(0, Math.max(minX, panRef.x))
-  panRef.y = Math.min(0, Math.max(minY, panRef.y))
+function applyPan() {
   pan.value = { x: panRef.x, y: panRef.y }
 }
 
-function clampNoteToBoard(note) {
-  if (!note) return
-  const { w, h } = viewSize()
-  const { width, height } = noteSize(note)
-  const maxX = Math.max(BOARD_PAD, w - width - BOARD_PAD)
-  const maxY = Math.max(BOARD_PAD, h - height - BOARD_PAD)
-  note.x = Math.min(maxX, Math.max(BOARD_PAD, note.x))
-  note.y = Math.min(maxY, Math.max(BOARD_PAD, note.y))
-}
-
-/** If saved notes sit far off-screen, pack them into this window so no one has to zoom out. */
-function packNotesIntoViewport() {
-  const { w, h } = viewSize()
-  if (w < 80 || h < 80 || !notes.value.length) return
-  let minX = Infinity
-  let minY = Infinity
-  let maxX = -Infinity
-  let maxY = -Infinity
-  for (const note of notes.value) {
-    const { width, height } = noteSize(note)
-    minX = Math.min(minX, note.x)
-    minY = Math.min(minY, note.y)
-    maxX = Math.max(maxX, note.x + width)
-    maxY = Math.max(maxY, note.y + height)
-  }
-  const innerW = Math.max(80, w - BOARD_PAD * 2)
-  const innerH = Math.max(80, h - BOARD_PAD * 2)
-  const fits =
-    minX >= 0 &&
-    minY >= 0 &&
-    maxX <= w &&
-    maxY <= h
-  if (fits) return
-  const bw = Math.max(1, maxX - minX)
-  const bh = Math.max(1, maxY - minY)
-  const fit = Math.min(1, innerW / bw, innerH / bh)
-  for (const note of notes.value) {
-    note.x = BOARD_PAD + (note.x - minX) * fit
-    note.y = BOARD_PAD + (note.y - minY) * fit
-  }
-}
-
 function onWindowResize() {
-  packNotesIntoViewport()
-  for (const note of notes.value) clampNoteToBoard(note)
-  clampPanToBoard()
+  applyPan()
 }
 
-/** Zoom toward a screen point so the world under the cursor stays put (FigJam / Miro). */
-function zoomAt(clientX, clientY, nextScale) {
-  const clamped = clampScale(nextScale)
-  const el = canvasRef.value
-  if (!el || clamped === scale.value) {
-    scale.value = clamped
-    clampPanToBoard()
-    return
-  }
-  const rect = el.getBoundingClientRect()
-  const sx = clientX - rect.left
-  const sy = clientY - rect.top
-  const worldX = (sx - panRef.x) / scale.value
-  const worldY = (sy - panRef.y) / scale.value
-  panRef.x = sx - worldX * clamped
-  panRef.y = sy - worldY * clamped
-  scale.value = clamped
-  clampPanToBoard()
-}
-
-function canvasCenterPoint() {
-  const el = canvasRef.value
-  if (!el) return { x: window.innerWidth / 2, y: window.innerHeight / 2 }
-  const rect = el.getBoundingClientRect()
-  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
-}
-
-function zoomBy(factor) {
-  const c = canvasCenterPoint()
-  zoomAt(c.x, c.y, scale.value * factor)
-}
-
-function resetZoom() {
-  scale.value = 1
-  panRef.x = 0
-  panRef.y = 0
-  pan.value = { x: 0, y: 0 }
-}
-
-function zoomIn() {
-  zoomBy(SCALE_STEP)
-}
-
-function zoomOut() {
-  zoomBy(1 / SCALE_STEP)
-}
-
-/** Pinch / Ctrl+wheel zooms at the cursor; two-finger or plain wheel pans. */
+/** Trackpad / wheel pans the board. Pinch-zoom is ignored so scale stays at 100%. */
 function onWheel(e) {
   const t = e.target
   if (
@@ -368,13 +495,9 @@ function onWheel(e) {
     return
   }
   e.preventDefault()
-  if (e.ctrlKey || e.metaKey) {
-    zoomAt(e.clientX, e.clientY, scale.value * Math.exp(-e.deltaY * 0.01))
-    return
-  }
   panRef.x -= e.deltaX
   panRef.y -= e.deltaY
-  clampPanToBoard()
+  applyPan()
 }
 
 /** Drop window listeners used while rubber-banding a connector. */
@@ -429,6 +552,7 @@ function onConnectEnd(noteId, side) {
 
 /** Idle canvas: no selection, no connector tool, no in-progress path. Sticky place-tool stays on. */
 function resetToIdle() {
+  clearArmed.value = false
   clearConnectDrag()
   draft.value = null
   if (activeTool.value === 'connect') activeTool.value = null
@@ -460,7 +584,7 @@ function onCanvasMouseDown(e) {
     }
     panRef.x = pan.value.x
     panRef.y = pan.value.y
-    clampPanToBoard()
+    applyPan()
   }
 
   const up = () => {
@@ -495,7 +619,6 @@ function onCanvasClick(e) {
     height: 168,
     ...emptyNoteMeta(),
   })
-  clampNoteToBoard(notes.value[notes.value.length - 1])
   selectedId.value = id
   activeTool.value = null
   logEvent('note_created', { id }).catch(() => {})
@@ -507,7 +630,6 @@ function moveNote(id, dx, dy) {
   if (!note || isNoteFrozen(note)) return
   note.x += dx
   note.y += dy
-  clampNoteToBoard(note)
 }
 
 /** Persist contenteditable text. */
@@ -532,7 +654,6 @@ function resizeNote(id, patch) {
   note.y = patch.y
   note.width = patch.width
   note.height = patch.height
-  clampNoteToBoard(note)
 }
 
 /** Mark this note as the selected one (toolbar / resize handles). */
@@ -633,19 +754,25 @@ function setPinnedLabels(id, pinned) {
   logEvent('pin_change', { noteId: id, pinned: note.pinnedLabels }).catch(() => {})
 }
 
+function sameRationale(a, b) {
+  if (!a || !b) return false
+  if (a.rid && b.rid && a.rid === b.rid) return true
+  const at = String(a.text || '').trim()
+  const bt = String(b.text || '').trim()
+  return Boolean(at && at === bt)
+}
+
 function updateLabels(id, labels) {
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
   note.rationaleLabels = Array.isArray(labels) ? labels : []
-  const ids = new Set(note.rationaleLabels.map((item) => item.id))
   note.pinnedLabels = (note.pinnedLabels || [])
     .map((pin) => {
-      const match = note.rationaleLabels.find((item) => item.id === pin.id)
+      const match = note.rationaleLabels.find((item) => sameRationale(item, pin))
       return match
         ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source, rid: match.rid }
         : pin
     })
-    .filter((pin) => ids.has(pin.id))
     .slice(0, 3)
 }
 
@@ -678,6 +805,14 @@ function removeNote(id) {
     metrics.value = next
   }
   logEvent('note_deleted', { noteId: id }).catch(() => {})
+}
+
+/** Same as the old Delete key: empty notes vanish; ideas with text open abandon. */
+function requestDeleteNote(id) {
+  const note = notes.value.find((n) => n.id === id)
+  if (!note || isAbandoned(note) || note.abandonOpen) return
+  if (isNoteEmpty(note)) removeNote(note.id)
+  else beginAbandon(note.id)
 }
 
 function beginAbandon(id) {
@@ -928,6 +1063,14 @@ function isTypingTarget(el) {
 function onKeydown(e) {
   const typing = isTypingTarget(e.target)
   if (e.key === 'Escape') {
+    if (clearArmed.value) {
+      clearArmed.value = false
+      return
+    }
+    if (searchOpen.value) {
+      closeSearch()
+      return
+    }
     if (draft.value) {
       draft.value = null
       return
@@ -952,16 +1095,6 @@ function onKeydown(e) {
     return
   }
   if ((e.key === 'Backspace' || e.key === 'Delete') && !e.metaKey && !e.ctrlKey && !e.altKey) {
-    const note = notes.value.find((n) => n.id === selectedId.value)
-    if (note && !isAbandoned(note) && !note.abandonOpen) {
-      const inNoteText = e.target instanceof HTMLElement && e.target.classList.contains('note-text')
-      if (!typing || (inNoteText && isNoteEmpty(note))) {
-        e.preventDefault()
-        if (isNoteEmpty(note)) removeNote(note.id)
-        else beginAbandon(note.id)
-        return
-      }
-    }
     const conn = connections.value.find((c) => c.id === selectedConnId.value)
     if (conn && !isRelationAbandoned(conn) && !conn.abandonOpen && !typing) {
       e.preventDefault()
@@ -971,23 +1104,6 @@ function onKeydown(e) {
     }
   }
   if (typing) return
-  if (e.metaKey || e.ctrlKey) {
-    if (e.key === '=' || e.key === '+' || e.code === 'NumpadAdd') {
-      e.preventDefault()
-      zoomIn()
-      return
-    }
-    if (e.key === '-' || e.code === 'NumpadSubtract') {
-      e.preventDefault()
-      zoomOut()
-      return
-    }
-    if (e.key === '0' || e.code === 'Numpad0') {
-      e.preventDefault()
-      resetZoom()
-      return
-    }
-  }
   if ((e.key === 'n' || e.key === 'N') && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault()
     toggleTool('sticky')
@@ -1060,7 +1176,7 @@ async function signOut() {
   emit('signed-out')
 }
 
-/** Register / drop keyboard shortcuts (N, Esc, zoom). Load this participant's canvas. */
+/** Register / drop keyboard shortcuts (N, Esc). Load this participant's canvas. */
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   wheelTarget = canvasRef.value
@@ -1114,9 +1230,10 @@ onMounted(async () => {
       abandonLabels: Array.isArray(c.abandonLabels) ? c.abandonLabels : [],
       abandonPinned: Array.isArray(c.abandonPinned) ? c.abandonPinned : [],
     }))
-    pan.value = { x: 0, y: 0 }
-    panRef.x = 0
-    panRef.y = 0
+    const savedPan = data.pan && typeof data.pan === 'object' ? data.pan : {}
+    panRef.x = Number(savedPan.x) || 0
+    panRef.y = Number(savedPan.y) || 0
+    pan.value = { x: panRef.x, y: panRef.y }
     scale.value = 1
     nextId = Number(data.nextId) > 0 ? Number(data.nextId) : 1
     nextConnId = Number(data.nextConnId) > 0 ? Number(data.nextConnId) : 1
@@ -1125,16 +1242,10 @@ onMounted(async () => {
   }
   loaded = true
   await nextTick()
-  requestAnimationFrame(() => {
-    packNotesIntoViewport()
-    for (const note of notes.value) clampNoteToBoard(note)
-    clampPanToBoard()
-  })
   window.addEventListener('resize', onWindowResize)
   watch(notes, scheduleSave, { deep: true })
   watch(connections, scheduleSave, { deep: true })
   watch(pan, scheduleSave, { deep: true })
-  watch(scale, scheduleSave)
 })
 
 onUnmounted(() => {
@@ -1247,6 +1358,9 @@ onUnmounted(() => {
             :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
+            :search-hit="searchHitIds.has(note.id)"
+            :search-picked="searchPickedIds.has(note.id)"
+            :search-dim="searchDimActive"
             @move="moveNote"
             @text-change="changeText"
             @select="selectNote"
@@ -1257,6 +1371,7 @@ onUnmounted(() => {
             @connect-end="onConnectEnd"
             @request-connect="toggleTool('connect')"
             @suggest-relations="(id) => logEvent('suggest_relations', { noteId: id })"
+            @request-delete="requestDeleteNote"
             @toggle-rationale="toggleRationale"
             @open-rationale="openRationale"
             @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
@@ -1387,36 +1502,63 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- Account: floating logout, separate from the tool well -->
-      <button
-        type="button"
-        class="logout-btn"
-        :title="props.username ? `Log out · ${props.username}` : 'Log out'"
-        @mousedown.stop
-        @click.stop="signOut"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="18"
-          height="18"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
+      <!-- Account: floating clear + logout -->
+      <div class="account-bar" @mousedown.stop @click.stop>
+        <button
+          type="button"
+          class="logout-btn"
+          :class="{ armed: clearArmed }"
+          :title="clearArmed ? 'Click again to clear the board' : 'Clear canvas'"
+          @click="armClearBoard"
         >
-          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-          <polyline points="16 17 21 12 16 7" />
-          <line x1="21" x2="9" y1="12" y2="12" />
-        </svg>
-        <span class="btn-label">log-out</span>
-      </button>
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="3 6 5 6 21 6" />
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+          </svg>
+          <span class="btn-label">{{ clearArmed ? 'confirm?' : 'clear' }}</span>
+        </button>
+        <button
+          type="button"
+          class="logout-btn"
+          :title="props.username ? `Log out · ${props.username}` : 'Log out'"
+          @click="signOut"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+            <polyline points="16 17 21 12 16 7" />
+            <line x1="21" x2="9" y1="12" y2="12" />
+          </svg>
+          <span class="btn-label">log-out</span>
+        </button>
+      </div>
 
       <!-- FigJam-style tool well: sticky note only -->
       <div class="bottom-bar" @mousedown.stop @click.stop>
         <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
+        <div v-else-if="searchTestHint" class="hint">{{ searchTestHint }}</div>
+        <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
         <button
           type="button"
           class="tool-btn"
@@ -1427,12 +1569,64 @@ onUnmounted(() => {
           <StickyNoteIcon :size="28" />
           <span class="btn-label">create idea</span>
         </button>
-      </div>
-
-      <div class="zoom-bar" @mousedown.stop @click.stop @wheel.stop.prevent>
-        <button type="button" class="zoom-btn" title="Zoom out" @click="zoomOut">−</button>
-        <button type="button" class="zoom-pct" title="Reset to 100%" @click="resetZoom">{{ zoomLabel }}</button>
-        <button type="button" class="zoom-btn" title="Zoom in" @click="zoomIn">+</button>
+        <div class="search-slot">
+          <div v-if="searchHits.length || (searchOpen && searchError)" class="search-results">
+            <div class="search-results-head">
+              <p v-if="searchError" class="search-status">{{ searchError }}</p>
+              <p v-else class="search-status">{{ searchHits.length }} close {{ searchHits.length === 1 ? 'idea' : 'ideas' }} · pick what matches</p>
+              <button v-if="searchHits.length" type="button" class="search-clear" @click="clearSearchHits">clear</button>
+            </div>
+            <button
+              v-for="hit in searchHits"
+              :key="hit.id"
+              type="button"
+              class="search-hit-row"
+              :class="{ picked: searchPickedIds.has(hit.id) }"
+              @click="jumpToSearchHit(hit.id)"
+            >
+              <span
+                class="search-check"
+                :class="{ on: searchPickedIds.has(hit.id) }"
+                @click.stop="toggleSearchPick(hit.id)"
+              />
+              <span class="search-hit-copy">
+                <span class="search-hit-title">{{ hit.title }}</span>
+                <span class="search-hit-why">{{ hit.why }}</span>
+              </span>
+            </button>
+          </div>
+          <input
+            v-if="searchOpen"
+            ref="searchInputRef"
+            v-model="searchQuery"
+            class="search-input"
+            type="text"
+            maxlength="200"
+            placeholder="are you looking for an idea? a rationale"
+            :disabled="searchLoading"
+            @keydown.enter.prevent="runBoardSearch"
+          />
+          <button
+            type="button"
+            class="tool-btn"
+            :class="{ active: searchOpen }"
+            title="Look up ideas"
+            @click="toggleSearch"
+          >
+            <SearchIcon :size="28" />
+            <span class="btn-label">{{ searchLoading ? 'looking…' : 'look up' }}</span>
+          </button>
+        </div>
+        <button
+          v-if="isDev"
+          type="button"
+          class="tool-btn"
+          title="DEV: append a sample pack. Look-up embeds whatever is on this board, not this file."
+          @click="addSearchTestPack"
+        >
+          <span class="sample-plus">+</span>
+          <span class="btn-label">add samples</span>
+        </button>
       </div>
     </div>
   </div>
@@ -1542,10 +1736,17 @@ onUnmounted(() => {
   z-index: 30;
 }
 
-.logout-btn {
+.account-bar {
   position: absolute;
   top: 20px;
   right: 20px;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  z-index: 30;
+}
+
+.logout-btn {
   min-width: 52px;
   display: flex;
   flex-direction: column;
@@ -1559,12 +1760,17 @@ onUnmounted(() => {
   color: var(--ink-muted);
   cursor: pointer;
   box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
-  z-index: 30;
 }
 
 .logout-btn:hover {
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+.logout-btn.armed {
+  color: #b91c1c;
+  border-color: rgba(185, 28, 28, 0.45);
+  background: #fee2e2;
 }
 
 .tool-btn {
@@ -1603,6 +1809,12 @@ onUnmounted(() => {
   color: var(--accent);
 }
 
+.sample-plus {
+  font-size: 22px;
+  line-height: 1;
+  font-family: 'DM Mono', ui-monospace, monospace;
+}
+
 .hint {
   position: absolute;
   bottom: calc(100% + 10px);
@@ -1620,49 +1832,136 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.zoom-bar {
-  position: absolute;
-  right: 20px;
-  bottom: 20px;
+.search-slot {
+  position: relative;
   display: flex;
   align-items: center;
-  height: 40px;
-  padding: 4px;
+  gap: 6px;
+}
+
+.search-input {
+  width: min(42vw, 320px);
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
+
+.search-input::placeholder {
+  color: var(--ink-muted);
+  opacity: 0.72;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: rgba(180, 83, 9, 0.45);
+}
+
+.search-results {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 12px);
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px;
   background: var(--chrome);
   border: 1px solid var(--line);
   border-radius: 10px;
   box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
-  z-index: 30;
+  z-index: 31;
 }
 
-.zoom-btn,
-.zoom-pct {
-  height: 32px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
+.search-results-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 8px;
+}
+
+.search-status {
+  margin: 0;
+  flex: 1;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.35;
   color: var(--ink-muted);
+}
+
+.search-clear {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
   cursor: pointer;
   font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 11px;
+  padding: 0;
 }
 
-.zoom-btn {
-  width: 32px;
-  font-size: 18px;
-  line-height: 1;
-}
-
-.zoom-pct {
-  min-width: 52px;
-  padding: 0 6px;
-  font-size: 12px;
-  letter-spacing: 0.04em;
-}
-
-.zoom-btn:hover,
-.zoom-pct:hover {
-  background: var(--accent-soft);
+.search-hit-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 7px 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
   color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.search-hit-row:hover,
+.search-hit-row.picked {
+  background: var(--accent-soft);
+}
+
+.search-check {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  border: 1.5px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+}
+
+.search-check.on {
+  border-color: #2563eb;
+  background: #2563eb;
+  box-shadow: inset 0 0 0 2px var(--chrome);
+}
+
+.search-hit-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.search-hit-title,
+.search-hit-why {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-hit-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.search-hit-why {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--ink-muted);
 }
 
 .empty {

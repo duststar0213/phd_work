@@ -24,6 +24,7 @@ import {
 import ColorWheel from './ColorWheel.vue'
 import ConnectionIcon from './ConnectionIcon.vue'
 import SuggestRelationIcon from './SuggestRelationIcon.vue'
+import DeleteIcon from './DeleteIcon.vue'
 
 const MIN_SIZE = 120 // smallest width/height from corner resize; keeps room for the edge tabs
 const BASE_FONT_PX = 13
@@ -43,6 +44,9 @@ const props = defineProps({
   ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
   patternStats: { type: Object, default: () => ({}) },
   canvasLabels: { type: Array, default: () => [] },
+  searchHit: { type: Boolean, default: false },
+  searchPicked: { type: Boolean, default: false },
+  searchDim: { type: Boolean, default: false },
 })
 
 /** How many ideas share this rationale. 2+ earns a badge on the tab. */
@@ -59,7 +63,7 @@ function groupPatternHint(group) {
   return pairPatternHint(group.members.length, stats)
 }
 
-const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect', 'suggestRelations', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive'])
+const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect', 'suggestRelations', 'requestDelete', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive'])
 
 const textRef = ref(null)
 const noteRef = ref(null)
@@ -67,7 +71,7 @@ const colorOpen = ref(false)
 const dragging = ref(false)
 const resizing = ref(false)
 const textFocused = ref(false) // hide placeholder while the caret is in the note
-const editing = ref(false) // selected ≠ editing; Delete abandons unless the caret is in the text
+const editing = ref(false) // selected ≠ editing; the toolbar delete icon abandons / removes
 let didDrag = false // click vs drag: click selects; second click / empty note edits
 
 const CORNERS = ['nw', 'ne', 'sw', 'se']
@@ -562,6 +566,12 @@ function requestSuggest(e) {
   emit('suggestRelations', props.note.id)
 }
 
+function requestDelete(e) {
+  e.stopPropagation()
+  colorOpen.value = false
+  emit('requestDelete', props.note.id)
+}
+
 /** Fold / unfold the rationale panel under this note. */
 function toggleRationale(e) {
   e.stopPropagation()
@@ -838,7 +848,17 @@ function onMagMouseUp(e, side) {
   <div
     ref="noteRef"
     class="note"
-    :class="{ selected: selected && !frozen, dragging, resizing, abandoned: note.abandoned, frozen, editing }"
+    :class="{
+      selected: selected && !frozen,
+      dragging,
+      resizing,
+      abandoned: note.abandoned,
+      frozen,
+      editing,
+      'search-hit': searchHit && !frozen,
+      'search-picked': searchPicked && !frozen,
+      'search-dim': searchDim && !searchHit && !searchPicked && !frozen,
+    }"
     :style="{
       left: `${note.x}px`,
       top: `${note.y}px`,
@@ -891,6 +911,16 @@ function onMagMouseUp(e, side) {
           @click="requestSuggest"
         >
           <SuggestRelationIcon :size="18" />
+        </button>
+      </div>
+      <div class="toolbar-item">
+        <button
+          class="color-btn delete-btn"
+          type="button"
+          title="Delete idea"
+          @click="requestDelete"
+        >
+          <DeleteIcon :size="18" />
         </button>
       </div>
 
@@ -1145,6 +1175,24 @@ function onMagMouseUp(e, side) {
     0 8px 24px rgba(44, 40, 31, 0.16);
 }
 
+.note.search-hit {
+  z-index: 21;
+  box-shadow:
+    0 0 0 2px #b45309,
+    0 8px 24px rgba(180, 83, 9, 0.22);
+}
+
+.note.search-picked {
+  z-index: 22;
+  box-shadow:
+    0 0 0 2.5px #2563eb,
+    0 8px 24px rgba(37, 99, 235, 0.22);
+}
+
+.note.search-dim {
+  opacity: 0.28;
+}
+
 .note.frozen {
   pointer-events: none;
   cursor: default;
@@ -1284,6 +1332,11 @@ function onMagMouseUp(e, side) {
 
 .suggest-btn:hover {
   color: var(--accent);
+}
+
+.delete-btn:hover {
+  color: #b91c1c;
+  background: #fee2e2;
 }
 
 .toolbar-item {

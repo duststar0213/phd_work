@@ -328,24 +328,28 @@ function sameVec(a, b) {
 export async function embedTexts(texts, options = {}) {
   const unique = [...new Set((Array.isArray(texts) ? texts : []).map((item) => String(item || '').trim()).filter(Boolean))]
   if (!unique.length) return new Map()
-  const response = await fetchWithTimeout(
-    '/api/embeddings',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ texts: unique }),
-      signal: options.signal,
-    },
-    REQUEST_TIMEOUT_MS,
-  )
-  const data = await readJson(response)
-  if (!response.ok) throw toApiError(response.status, data)
-  const vectors = Array.isArray(data.vectors) ? data.vectors : []
   const byText = new Map()
-  unique.forEach((text, i) => {
-    const vec = asVector(vectors[i])
-    if (vec) byText.set(text, vec)
-  })
+  const chunkSize = 32
+  for (let start = 0; start < unique.length; start += chunkSize) {
+    const chunk = unique.slice(start, start + chunkSize)
+    const response = await fetchWithTimeout(
+      '/api/embeddings',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ texts: chunk }),
+        signal: options.signal,
+      },
+      REQUEST_TIMEOUT_MS,
+    )
+    const data = await readJson(response)
+    if (!response.ok) throw toApiError(response.status, data)
+    const vectors = Array.isArray(data.vectors) ? data.vectors : []
+    chunk.forEach((text, i) => {
+      const vec = asVector(vectors[i])
+      if (vec) byText.set(text, vec)
+    })
+  }
   return byText
 }
 

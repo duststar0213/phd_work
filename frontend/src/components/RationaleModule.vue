@@ -86,6 +86,19 @@ let hydrating = true
 let fieldObserver = null
 let fieldWidth = 0
 
+function bumpNextLabelId(list) {
+  const maxId = (Array.isArray(list) ? list : []).reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
+  nextLabelId = Math.max(nextLabelId, maxId + 1)
+}
+
+function sameRationale(a, b) {
+  if (!a || !b) return false
+  if (a.rid && b.rid && a.rid === b.rid) return true
+  const at = String(a.text || '').trim()
+  const bt = String(b.text || '').trim()
+  return Boolean(at && at === bt)
+}
+
 function fromSaved(item, fallbackSource) {
   const source = item.source || fallbackSource
   return {
@@ -110,15 +123,14 @@ function seedPresets() {
 
 if (Array.isArray(props.savedLabels) && props.savedLabels.length) {
   labels.value = props.savedLabels.map((item) => fromSaved(item, 'ai'))
-  const maxId = labels.value.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
-  nextLabelId = maxId + 1
+  bumpNextLabelId(labels.value)
   if (labels.value.some((item) => item.source === 'ai')) source.value = 'api'
   lastGenerated.value = String(props.savedInput || '').trim()
 } else {
   labels.value = seedPresets()
-  const maxId = labels.value.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
-  nextLabelId = Math.max(nextLabelId, maxId + 1)
+  bumpNextLabelId(labels.value)
 }
+bumpNextLabelId(props.pinned)
 
 /** No scrollbar: the field grows with its text and follows the note's width. */
 function autoGrow() {
@@ -186,8 +198,7 @@ watch(
   (list) => {
     if (!Array.isArray(list)) return
     const incoming = list.map((item) => fromSaved(item, 'ai'))
-    const maxId = incoming.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
-    nextLabelId = Math.max(nextLabelId, maxId + 1)
+    bumpNextLabelId(incoming)
     const unchanged =
       incoming.length === labels.value.length &&
       incoming.every((item) =>
@@ -223,11 +234,11 @@ function setPinned(next) {
 }
 
 function pinSnapshot(label) {
-  return { id: label.id, text: label.text, kind: label.kind || '', source: label.source }
+  return { id: label.id, text: label.text, kind: label.kind || '', source: label.source, rid: label.rid }
 }
 
 function isPinned(label) {
-  return currentPinned().some((item) => item.id === label.id || item.text === label.text)
+  return currentPinned().some((item) => sameRationale(item, label))
 }
 
 function chipTitle(label) {
@@ -598,14 +609,14 @@ function onPoolDrop(e) {
 function unpin(label) {
   if (!isPinned(label)) return
   pinLimitHint.value = false
-  setPinned(currentPinned().filter((item) => item.id !== label.id && item.text !== label.text))
+  setPinned(currentPinned().filter((item) => !sameRationale(item, label)))
 }
 
 /** Generated chips plus any pins that are no longer in the current set (so they can be swapped). */
 function visibleLabels() {
   const pool = labels.value
   const extras = currentPinned().filter(
-    (item) => !pool.some((label) => label.id === item.id || label.text === item.text),
+    (item) => !pool.some((label) => sameRationale(label, item)),
   )
   return extras.length ? [...pool, ...extras] : pool
 }
@@ -881,8 +892,8 @@ function removeLabel(label, e) {
   echoByQuery.delete(label.id)
   vectorIndex.remove(label.id)
   paintEchoes()
-  if (currentPinned().some((item) => item.id === label.id || item.text === label.text)) {
-    setPinned(currentPinned().filter((item) => item.id !== label.id && item.text !== label.text))
+  if (currentPinned().some((item) => sameRationale(item, label))) {
+    setPinned(currentPinned().filter((item) => !sameRationale(item, label)))
   }
   notify()
 }
