@@ -11,7 +11,7 @@ title: Repertoire prototype — group meeting
 - Designer writes a **reflection** → AI (or the person) turns it into **short labels**
 - Labels can **recur** on the same note and **across notes**
 
-组会用：讲现在的 prototype 在做什么、技术栈、每个功能、AI 怎么被调用
+For the group meeting: what the prototype does, the stack, each function, and how AI is called.
 
 ---
 

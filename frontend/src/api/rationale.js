@@ -511,7 +511,7 @@ function fallbackMessage(status) {
 /** Cue leftovers that flip the claim. Synonyms (because/since, cheap/inexpensive) are not here. */
 const NEGATION_TOKENS = new Set([
   'not', 'no', 'never', 'none', 'nor', 'cannot', 'cant', "can't", 'dont', "don't", 'wont', "won't",
-  'without', '不', '没', '非', '不能', '没有', '不是',
+  'without',
 ])
 
 const OPPOSITE_OF = oppositeMap([
@@ -522,7 +522,6 @@ const OPPOSITE_OF = oppositeMap([
   ['more', 'less'],
   ['better', 'worse'],
   ['wrong', 'right'],
-  ['便宜', '贵'],
   ['break', 'merge'],
   ['break', 'combine'],
   ['breaking', 'merging'],
@@ -584,7 +583,7 @@ export function assessReflection(text, previous = '') {
   return { ok: true }
 }
 
-/** Latin words stay whole; each Han character is its own token so a one-character flip is visible. */
+/** Latin words stay whole; CJK ideographs are tokenized one character at a time. */
 function reflectionTokens(text) {
   return String(text || '')
     .toLowerCase()
