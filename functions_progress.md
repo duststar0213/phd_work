@@ -8,9 +8,9 @@ title: Repertoire prototype(temporary name)
 ## sticky-note ideation + rationale labels
 
 - Research prototype for capturing **why** an idea exists, not a chatbot suggest what ideas they should make
-- Designer writes a **reflection** → AI (or the person) turns it into **short labels** 
+- Designer writes a **reflection** → AI (or the person) turns it into **short labels** = surfacing rationale out from reflection (vebalized)
 - Using reflection instead of rationale: **relationship between reflection and rationale? raionale is more structrued while reflection is more fluid and will give user more freedom to express**
-- Labels can **recur** on the same note and **across notes**
+- Labels can **recur** on the same note and **across notes** and defines a pattern that may be reusable for users 
 
 ---
 
@@ -50,7 +50,7 @@ title: Repertoire prototype(temporary name)
 
 # Function: get on the prototype
 
-- Invitation code first (`STUDY_ACCESS_CODE`, currently `rep-c6e4`), need to host on website for sending to participants
+- Invitation code first (`STUDY_ACCESS_CODE`, currently `rep-c6e4`), need to host on website for sending to participants in evaluating 
 NEED TO FIGURE OUT: where should i host this prototype? what are policy if I need to get json info of how participant interacting with the prototype
 - Then email + password (or emailed one-time code)
 - Same email **always** maps to the same canvas 
