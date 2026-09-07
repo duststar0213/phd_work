@@ -685,21 +685,20 @@ function onCreateKeydown(e) {
 /** Select + optional drag. Toolbar / resize handles are ignored here. */
 function onNoteMouseDown(e) {
   if (e.button !== 0) return
-  if (frozen.value) return
-  if (e.target.closest('.toolbar') || e.target.closest('.resize-handle') || e.target.closest('.mag-point') || e.target.closest('.fold-btn') || e.target.closest('.edge-add-wrap') || e.target.closest('.tab-del')) return
-  // While typing, the caret owns the pointer so text can be selected by dragging.
-  if (editing.value && e.target.closest('.note-text')) {
+  if (frozen.value) {
     e.stopPropagation()
-    colorOpen.value = false
-    didDrag = false
     return
   }
+  if (e.target.closest('.toolbar') || e.target.closest('.resize-handle') || e.target.closest('.mag-point') || e.target.closest('.fold-btn') || e.target.closest('.edge-add-wrap') || e.target.closest('.tab-del')) return
   e.stopPropagation()
   const alreadySelected = props.selected
   activate()
   colorOpen.value = false
   didDrag = false
   const onTab = Boolean(e.target.closest('.edge-tab'))
+  // Shift+drag inside the idea text still selects characters; a normal drag always moves the note.
+  const textSelect = Boolean(editing.value && e.shiftKey && e.target.closest('.note-text'))
+  if (textSelect) return
 
   let lastX = e.clientX
   let lastY = e.clientY
@@ -713,6 +712,7 @@ function onNoteMouseDown(e) {
       dragging.value = true
       textRef.value?.blur()
     }
+    ev.preventDefault()
     emit(
       'move',
       props.note.id,
@@ -1133,14 +1133,16 @@ function onMagMouseUp(e, side) {
   transform-origin: top left;
   z-index: 1;
   cursor: grab;
+  touch-action: none;
   overflow: visible;
+  pointer-events: auto;
 }
 
 .note.selected {
   z-index: 20;
   box-shadow:
-    0 0 0 1.5px #8ec8ff,
-    0 8px 24px rgba(0, 0, 0, 0.4);
+    0 0 0 1.5px #2563eb,
+    0 8px 24px rgba(44, 40, 31, 0.16);
 }
 
 .note.frozen {
@@ -1161,7 +1163,7 @@ function onMagMouseUp(e, side) {
 /* Ghost stays inert, but hover + right-click still reach it so it can be revived. */
 .note.abandoned {
   z-index: 0;
-  opacity: 0.08;
+  opacity: 0.28;
   box-shadow: none;
   pointer-events: auto;
   cursor: context-menu;
@@ -1195,10 +1197,10 @@ function onMagMouseUp(e, side) {
   position: fixed;
   transform: translate(-50%, calc(-100% - 8px));
   padding: 3px 8px;
-  background: rgba(253, 230, 138, 0.12);
-  border: 1px solid rgba(253, 230, 138, 0.25);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 7px;
-  color: rgba(253, 230, 138, 0.85);
+  color: var(--ink-muted);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 10px;
   line-height: 1.35;
@@ -1211,10 +1213,10 @@ function onMagMouseUp(e, side) {
   position: fixed;
   min-width: 118px;
   padding: 4px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 16px rgba(44, 40, 31, 0.14);
   z-index: 4001;
 }
 
@@ -1225,7 +1227,7 @@ function onMagMouseUp(e, side) {
   background: none;
   border: 0;
   border-radius: 5px;
-  color: rgba(255, 255, 255, 0.86);
+  color: var(--ink);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 11px;
   text-align: left;
@@ -1233,8 +1235,8 @@ function onMagMouseUp(e, side) {
 }
 
 .revive-item:hover {
-  background: rgba(253, 230, 138, 0.16);
-  color: #fde68a;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .toolbar {
@@ -1251,10 +1253,10 @@ function onMagMouseUp(e, side) {
   height: auto;
   padding: 6px 4px;
   gap: 2px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 16px rgba(44, 40, 31, 0.14);
   cursor: default;
 }
 
@@ -1270,18 +1272,18 @@ function onMagMouseUp(e, side) {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--ink-muted);
   cursor: pointer;
 }
 
 .color-btn:hover,
 .color-btn.open {
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.85);
+  background: var(--accent-soft);
+  color: var(--ink);
 }
 
 .suggest-btn:hover {
-  color: #fde68a;
+  color: var(--accent);
 }
 
 .toolbar-item {
@@ -1300,13 +1302,13 @@ function onMagMouseUp(e, side) {
   width: max-content;
   max-width: none;
   padding: 3px 7px;
-  background: rgba(253, 230, 138, 0.12);
-  border: 1px solid rgba(253, 230, 138, 0.25);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 7px;
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 10px;
   line-height: 1.3;
-  color: rgba(253, 230, 138, 0.78);
+  color: var(--ink-muted);
   letter-spacing: 0.02em;
   text-align: right;
   white-space: nowrap;
@@ -1323,7 +1325,7 @@ function onMagMouseUp(e, side) {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.35);
+  border: 1px solid var(--line);
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
   flex-shrink: 0;
 }
@@ -1340,10 +1342,10 @@ function onMagMouseUp(e, side) {
   left: calc(100% + 8px);
   right: auto;
   padding: 10px 12px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 28px rgba(44, 40, 31, 0.14);
 }
 
 .resize-handle {
@@ -1351,7 +1353,7 @@ function onMagMouseUp(e, side) {
   width: 9px;
   height: 9px;
   background: #fff;
-  border: 1.5px solid #8ec8ff;
+  border: 1.5px solid #2563eb;
   border-radius: 1px;
   box-sizing: border-box;
   z-index: 4;
@@ -1597,7 +1599,7 @@ function onMagMouseUp(e, side) {
   align-self: center;
   max-width: 92px;
   padding: 0 4px;
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--ink-faint);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 8px;
   line-height: 1.2;

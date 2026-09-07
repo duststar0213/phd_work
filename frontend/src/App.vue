@@ -61,6 +61,6 @@ function onSignedOut() {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: rgba(255, 255, 255, 0.35);
+  color: var(--ink-faint);
 }
 </style>

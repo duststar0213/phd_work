@@ -55,18 +55,18 @@ onMounted(async () => {
   justify-content: center;
   padding: 24px;
   box-sizing: border-box;
-  background: #16161d;
-  background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background: var(--paper);
+  background-image: radial-gradient(var(--dot) 1px, transparent 1px);
   background-size: 28px 28px;
 }
 
 .panel {
   width: min(520px, 100%);
   padding: 22px 22px 18px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 32px rgba(44, 40, 31, 0.1);
 }
 
 .head {
@@ -77,14 +77,14 @@ onMounted(async () => {
   margin: 0 0 8px;
   font-size: 11px;
   letter-spacing: 0.1em;
-  color: rgba(253, 230, 138, 0.7);
+  color: var(--accent);
 }
 
 h1 {
   margin: 0 0 8px;
   font-size: 18px;
   font-weight: 400;
-  color: rgba(255, 255, 255, 0.92);
+  color: var(--ink);
 }
 
 .lede,
@@ -92,16 +92,16 @@ h1 {
   margin: 0;
   font-size: 12px;
   line-height: 1.5;
-  color: rgba(255, 255, 255, 0.42);
+  color: var(--ink-faint);
 }
 
 .health {
   margin-top: 8px;
-  color: rgba(253, 230, 138, 0.5);
+  color: var(--accent);
 }
 
 .health.bad {
-  color: #fca5a5;
+  color: #b91c1c;
 }
 
 .back {
@@ -110,11 +110,11 @@ h1 {
 }
 
 .back a {
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--ink-faint);
   text-decoration: none;
 }
 
 .back a:hover {
-  color: #fde68a;
+  color: var(--accent);
 }
 </style>

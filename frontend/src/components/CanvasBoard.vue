@@ -1,9 +1,9 @@
 <!--
-  Repertoire prototype — infinite canvas for sticky-note brainstorming.
+  Repertoire prototype — viewport canvas for sticky-note brainstorming.
   Vue 3 SFC (script setup). No extra UI libraries: pan/place/select live here.
 -->
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
 import { patternStatsFromLabels } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
@@ -18,7 +18,7 @@ const emit = defineEmits(['signed-out'])
 
 /** Pen nib hotspot — used while the connector tool is on. */
 const PEN_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#fde68a" stroke="#16161d" stroke-width="1.2" d="M3.2 21.2 5 17.8 18.6 4.2a1.5 1.5 0 0 1 2.1 2.1L7.1 20l-3.9 1.2z"/></svg>',
+  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#fde68a" stroke="#2c281f" stroke-width="1.2" d="M3.2 21.2 5 17.8 18.6 4.2a1.5 1.5 0 0 1 2.1 2.1L7.1 20l-3.9 1.2z"/></svg>',
 )}") 3 21, crosshair`
 
 /** Offset a point away from a note edge so the curve leaves the mag point cleanly. */
@@ -134,10 +134,11 @@ const panRef = { x: 0, y: 0 }
 let connectMove = null
 let connectUp = null
 
-const MIN_SCALE = 0.1
-const MAX_SCALE = 4
+const MIN_SCALE = 1
+const MAX_SCALE = 2
 const SCALE_STEP = 1.15
 const GRID = 28
+const BOARD_PAD = 28
 
 const stickyActive = computed(() => activeTool.value === 'sticky') // place-note tool
 const connectActive = computed(() => activeTool.value === 'connect') // mag-point connector tool
@@ -244,12 +245,79 @@ function clampScale(next) {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, next))
 }
 
+/** The board is the current window. 100% zoom fills it; pan only exists when zoomed in. */
+function viewSize() {
+  const el = canvasRef.value
+  if (!el) return { w: window.innerWidth, h: window.innerHeight }
+  const rect = el.getBoundingClientRect()
+  return { w: rect.width, h: rect.height }
+}
+
+function clampPanToBoard() {
+  const { w, h } = viewSize()
+  const s = scale.value
+  const minX = w - w * s
+  const minY = h - h * s
+  panRef.x = Math.min(0, Math.max(minX, panRef.x))
+  panRef.y = Math.min(0, Math.max(minY, panRef.y))
+  pan.value = { x: panRef.x, y: panRef.y }
+}
+
+function clampNoteToBoard(note) {
+  if (!note) return
+  const { w, h } = viewSize()
+  const { width, height } = noteSize(note)
+  const maxX = Math.max(BOARD_PAD, w - width - BOARD_PAD)
+  const maxY = Math.max(BOARD_PAD, h - height - BOARD_PAD)
+  note.x = Math.min(maxX, Math.max(BOARD_PAD, note.x))
+  note.y = Math.min(maxY, Math.max(BOARD_PAD, note.y))
+}
+
+/** If saved notes sit far off-screen, pack them into this window so no one has to zoom out. */
+function packNotesIntoViewport() {
+  const { w, h } = viewSize()
+  if (w < 80 || h < 80 || !notes.value.length) return
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const note of notes.value) {
+    const { width, height } = noteSize(note)
+    minX = Math.min(minX, note.x)
+    minY = Math.min(minY, note.y)
+    maxX = Math.max(maxX, note.x + width)
+    maxY = Math.max(maxY, note.y + height)
+  }
+  const innerW = Math.max(80, w - BOARD_PAD * 2)
+  const innerH = Math.max(80, h - BOARD_PAD * 2)
+  const fits =
+    minX >= 0 &&
+    minY >= 0 &&
+    maxX <= w &&
+    maxY <= h
+  if (fits) return
+  const bw = Math.max(1, maxX - minX)
+  const bh = Math.max(1, maxY - minY)
+  const fit = Math.min(1, innerW / bw, innerH / bh)
+  for (const note of notes.value) {
+    note.x = BOARD_PAD + (note.x - minX) * fit
+    note.y = BOARD_PAD + (note.y - minY) * fit
+  }
+}
+
+function onWindowResize() {
+  packNotesIntoViewport()
+  for (const note of notes.value) clampNoteToBoard(note)
+  clampPanToBoard()
+}
+
 /** Zoom toward a screen point so the world under the cursor stays put (FigJam / Miro). */
 function zoomAt(clientX, clientY, nextScale) {
   const clamped = clampScale(nextScale)
   const el = canvasRef.value
   if (!el || clamped === scale.value) {
     scale.value = clamped
+    clampPanToBoard()
     return
   }
   const rect = el.getBoundingClientRect()
@@ -259,8 +327,8 @@ function zoomAt(clientX, clientY, nextScale) {
   const worldY = (sy - panRef.y) / scale.value
   panRef.x = sx - worldX * clamped
   panRef.y = sy - worldY * clamped
-  pan.value = { x: panRef.x, y: panRef.y }
   scale.value = clamped
+  clampPanToBoard()
 }
 
 function canvasCenterPoint() {
@@ -276,8 +344,10 @@ function zoomBy(factor) {
 }
 
 function resetZoom() {
-  const c = canvasCenterPoint()
-  zoomAt(c.x, c.y, 1)
+  scale.value = 1
+  panRef.x = 0
+  panRef.y = 0
+  pan.value = { x: 0, y: 0 }
 }
 
 function zoomIn() {
@@ -304,7 +374,7 @@ function onWheel(e) {
   }
   panRef.x -= e.deltaX
   panRef.y -= e.deltaY
-  pan.value = { x: panRef.x, y: panRef.y }
+  clampPanToBoard()
 }
 
 /** Drop window listeners used while rubber-banding a connector. */
@@ -373,6 +443,7 @@ function resetToIdle() {
 /** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky tool still places on click. */
 function onCanvasMouseDown(e) {
   if (stickyActive.value) return
+  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock')) return
   resetToIdle()
 
   const drag = {
@@ -389,6 +460,7 @@ function onCanvasMouseDown(e) {
     }
     panRef.x = pan.value.x
     panRef.y = pan.value.y
+    clampPanToBoard()
   }
 
   const up = () => {
@@ -423,6 +495,7 @@ function onCanvasClick(e) {
     height: 168,
     ...emptyNoteMeta(),
   })
+  clampNoteToBoard(notes.value[notes.value.length - 1])
   selectedId.value = id
   activeTool.value = null
   logEvent('note_created', { id }).catch(() => {})
@@ -434,6 +507,7 @@ function moveNote(id, dx, dy) {
   if (!note || isNoteFrozen(note)) return
   note.x += dx
   note.y += dy
+  clampNoteToBoard(note)
 }
 
 /** Persist contenteditable text. */
@@ -458,6 +532,7 @@ function resizeNote(id, patch) {
   note.y = patch.y
   note.width = patch.width
   note.height = patch.height
+  clampNoteToBoard(note)
 }
 
 /** Mark this note as the selected one (toolbar / resize handles). */
@@ -1039,16 +1114,23 @@ onMounted(async () => {
       abandonLabels: Array.isArray(c.abandonLabels) ? c.abandonLabels : [],
       abandonPinned: Array.isArray(c.abandonPinned) ? c.abandonPinned : [],
     }))
-    pan.value = data.pan && typeof data.pan.x === 'number' ? { x: data.pan.x, y: data.pan.y } : { x: 0, y: 0 }
-    panRef.x = pan.value.x
-    panRef.y = pan.value.y
-    scale.value = clampScale(Number(data.scale) > 0 ? Number(data.scale) : 1)
+    pan.value = { x: 0, y: 0 }
+    panRef.x = 0
+    panRef.y = 0
+    scale.value = 1
     nextId = Number(data.nextId) > 0 ? Number(data.nextId) : 1
     nextConnId = Number(data.nextConnId) > 0 ? Number(data.nextConnId) : 1
   } catch {
     notes.value = []
   }
   loaded = true
+  await nextTick()
+  requestAnimationFrame(() => {
+    packNotesIntoViewport()
+    for (const note of notes.value) clampNoteToBoard(note)
+    clampPanToBoard()
+  })
+  window.addEventListener('resize', onWindowResize)
   watch(notes, scheduleSave, { deep: true })
   watch(connections, scheduleSave, { deep: true })
   watch(pan, scheduleSave, { deep: true })
@@ -1057,6 +1139,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('resize', onWindowResize)
   wheelTarget?.removeEventListener('wheel', onWheel)
   wheelTarget = null
   clearConnectDrag()
@@ -1085,7 +1168,7 @@ onUnmounted(() => {
             :height="patternOffset.size"
             patternUnits="userSpaceOnUse"
           >
-            <circle :cx="patternOffset.r" :cy="patternOffset.r" :r="patternOffset.r" fill="rgba(255,255,255,0.08)" />
+            <circle :cx="patternOffset.r" :cy="patternOffset.r" :r="patternOffset.r" fill="rgba(44, 40, 31, 0.16)" />
           </pattern>
         </defs>
         <rect width="100%" height="100%" fill="url(#dots)" />
@@ -1109,7 +1192,7 @@ onUnmounted(() => {
               :class="{ selected: selectedConnId === line.id && !line.abandoned, faded: line.faded }"
               :d="line.d"
               fill="none"
-              :stroke="line.faded ? 'rgba(232,228,220,0.1)' : selectedConnId === line.id ? '#8ec8ff' : 'rgba(232,228,220,0.85)'"
+              :stroke="line.faded ? 'rgba(44, 40, 31, 0.12)' : selectedConnId === line.id ? '#2563eb' : 'rgba(44, 40, 31, 0.45)'"
               :stroke-width="selectedConnId === line.id && !line.abandoned ? 3 : 2.5"
               stroke-linecap="round"
             />
@@ -1118,7 +1201,7 @@ onUnmounted(() => {
             v-if="draftPath"
             :d="draftPath"
             fill="none"
-            stroke="#fde68a"
+            stroke="#b45309"
             stroke-width="2.5"
             stroke-linecap="round"
             stroke-dasharray="6 5"
@@ -1133,7 +1216,7 @@ onUnmounted(() => {
             left: `${line.mid.x}px`,
             top: `${line.mid.y}px`,
             zIndex: selectedConnId === line.id || line.rationaleOpen || line.abandonOpen ? 18 : 8,
-            opacity: line.faded || line.abandoned ? 0.08 : 1,
+            opacity: line.faded || line.abandoned ? 0.22 : 1,
           }"
           @pointerdown.stop="onRelationPointer(line.id)"
           @mousedown.stop="onRelationPointer(line.id)"
@@ -1359,7 +1442,7 @@ onUnmounted(() => {
 .board {
   width: 100%;
   height: 100%;
-  background: #16161d;
+  background: var(--paper);
 }
 
 .canvas {
@@ -1416,6 +1499,13 @@ onUnmounted(() => {
   width: 0;
   height: 0;
   overflow: visible;
+  pointer-events: none;
+}
+
+.notes-layer > :deep(.note),
+.relation-wrap,
+.rationale-dock {
+  pointer-events: auto;
 }
 
 .relation-wrap {
@@ -1428,10 +1518,10 @@ onUnmounted(() => {
   position: absolute;
   box-sizing: border-box;
   padding: 10px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 24px rgba(44, 40, 31, 0.12);
   cursor: default;
 }
 
@@ -1445,10 +1535,10 @@ onUnmounted(() => {
   justify-content: center;
   width: max-content;
   padding: 6px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
   z-index: 30;
 }
 
@@ -1463,18 +1553,18 @@ onUnmounted(() => {
   justify-content: center;
   gap: 3px;
   padding: 7px 8px 6px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
   border-radius: 10px;
-  background: #2c2c2c;
-  color: rgba(255, 255, 255, 0.55);
+  background: var(--chrome);
+  color: var(--ink-muted);
   cursor: pointer;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
   z-index: 30;
 }
 
 .logout-btn:hover {
-  color: #fde68a;
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .tool-btn {
@@ -1488,7 +1578,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 4px;
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--ink-muted);
   transition: all 0.14s ease;
   padding: 7px 10px 6px;
 }
@@ -1503,14 +1593,14 @@ onUnmounted(() => {
 }
 
 .tool-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
+  background: var(--accent-soft);
+  color: var(--ink);
 }
 
 .tool-btn.active {
-  border-color: rgba(253, 230, 138, 0.6);
-  background: rgba(253, 230, 138, 0.18);
-  color: #fde68a;
+  border-color: rgba(180, 83, 9, 0.45);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .hint {
@@ -1518,13 +1608,13 @@ onUnmounted(() => {
   bottom: calc(100% + 10px);
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(253, 230, 138, 0.12);
-  border: 1px solid rgba(253, 230, 138, 0.25);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 20px;
   padding: 6px 16px;
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 12px;
-  color: rgba(253, 230, 138, 0.7);
+  color: var(--ink-muted);
   pointer-events: none;
   letter-spacing: 0.04em;
   white-space: nowrap;
@@ -1538,10 +1628,10 @@ onUnmounted(() => {
   align-items: center;
   height: 40px;
   padding: 4px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 10px;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
   z-index: 30;
 }
 
@@ -1551,7 +1641,7 @@ onUnmounted(() => {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: rgba(255, 255, 255, 0.72);
+  color: var(--ink-muted);
   cursor: pointer;
   font-family: 'DM Mono', ui-monospace, monospace;
 }
@@ -1571,8 +1661,8 @@ onUnmounted(() => {
 
 .zoom-btn:hover,
 .zoom-pct:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
+  background: var(--accent-soft);
+  color: var(--ink);
 }
 
 .empty {
@@ -1589,7 +1679,7 @@ onUnmounted(() => {
 .empty p {
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 13px;
-  color: rgba(255, 255, 255, 0.18);
+  color: var(--ink-faint);
   margin: 0;
   letter-spacing: 0.04em;
 }

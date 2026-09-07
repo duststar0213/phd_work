@@ -1138,7 +1138,7 @@ defineExpose({ generate, input, labels })
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(253, 230, 138, 0.65);
+  color: var(--accent);
 }
 
 textarea {
@@ -1148,10 +1148,10 @@ textarea {
   overflow: hidden;
   min-height: 108px;
   padding: 10px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: #1c1c24;
-  color: rgba(255, 255, 255, 0.88);
+  background: var(--paper);
+  color: var(--ink);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 13px;
   line-height: 1.5;
@@ -1159,35 +1159,35 @@ textarea {
 }
 
 textarea:focus {
-  border-color: rgba(253, 230, 138, 0.45);
+  border-color: rgba(180, 83, 9, 0.45);
 }
 
 textarea::placeholder {
-  color: rgba(255, 255, 255, 0.28);
+  color: var(--ink-faint);
 }
 
 .hint {
   font-size: 9px;
   line-height: 1.4;
   letter-spacing: 0.03em;
-  color: rgba(255, 255, 255, 0.28);
+  color: var(--ink-faint);
 }
 
 .btn {
   height: 32px;
   padding: 0 12px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--line);
   background: transparent;
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--ink-muted);
   cursor: pointer;
   font-size: 12px;
   letter-spacing: 0.03em;
 }
 
 .btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
+  background: var(--accent-soft);
+  color: var(--ink);
 }
 
 .btn.ghost {
@@ -1204,8 +1204,8 @@ textarea::placeholder {
   align-self: stretch;
   height: 28px;
   margin-top: 2px;
-  border-color: rgba(255, 255, 255, 0.14);
-  color: rgba(255, 255, 255, 0.55);
+  border-color: var(--line);
+  color: var(--ink-muted);
   font-family: inherit;
 }
 
@@ -1226,20 +1226,20 @@ textarea::placeholder {
   flex: 1 1 100%;
   font-size: 12px;
   line-height: 1.45;
-  color: #fca5a5;
+  color: #b91c1c;
 }
 
 .banner-hint {
   flex: 1;
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.35);
+  color: var(--ink-faint);
 }
 
 .status {
   margin: 0;
   font-size: 11px;
   letter-spacing: 0.04em;
-  color: rgba(255, 255, 255, 0.35);
+  color: var(--ink-faint);
 }
 
 .merge-ask {
@@ -1248,15 +1248,15 @@ textarea::placeholder {
   gap: 6px;
   padding: 8px 10px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  background: var(--paper);
 }
 
 .merge-line {
   margin: 0;
   font-size: 11px;
   line-height: 1.5;
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--ink-muted);
 }
 
 .merge-new,
@@ -1268,12 +1268,12 @@ textarea::placeholder {
 
 .merge-new {
   background: rgba(147, 197, 253, 0.18);
-  color: #bfdbfe;
+  color: #1e3a5f;
 }
 
 .merge-old {
   background: rgba(147, 197, 253, 0.32);
-  color: #dbeafe;
+  color: #1e3a5f;
 }
 
 .merge-actions {
@@ -1307,7 +1307,7 @@ textarea::placeholder {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(253, 230, 138, 0.65);
+  color: var(--accent);
 }
 
 .zone {
@@ -1321,13 +1321,13 @@ textarea::placeholder {
 }
 
 .zone.chosen {
-  border: 1px dashed rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--line);
+  background: var(--paper);
 }
 
 .zone.chosen.hot {
-  border-color: rgba(253, 230, 138, 0.6);
-  background: rgba(253, 230, 138, 0.08);
+  border-color: rgba(180, 83, 9, 0.45);
+  background: var(--accent-soft);
 }
 
 .zone.pool {
@@ -1338,7 +1338,7 @@ textarea::placeholder {
 .zone-empty {
   align-self: center;
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.22);
+  color: var(--ink-faint);
 }
 
 .hint.warn {
@@ -1362,7 +1362,7 @@ textarea::placeholder {
 
 .shorten-text {
   max-width: 100%;
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--ink-muted);
   font-size: 10px;
   line-height: 1.35;
 }
@@ -1374,8 +1374,8 @@ textarea::placeholder {
   min-height: 26px;
   padding: 0;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--line);
+  background: var(--chrome);
   cursor: grab;
 }
 
@@ -1464,7 +1464,7 @@ textarea::placeholder {
   padding: 4px 10px;
   border: 0;
   background: transparent;
-  color: rgba(255, 255, 255, 0.88);
+  color: var(--ink);
   font-family: inherit;
   font-size: 12px;
   line-height: 1.4;
@@ -1494,7 +1494,7 @@ textarea::placeholder {
 
 .same-hint {
   flex-shrink: 0;
-  color: rgba(255, 255, 255, 0.38);
+  color: var(--ink-faint);
   font-size: 10px;
   line-height: 1.3;
   letter-spacing: 0.02em;
@@ -1523,7 +1523,7 @@ textarea::placeholder {
 }
 
 .chip.selected {
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+  box-shadow: inset 0 0 0 1px var(--line);
 }
 
 .chip.selected.ai {
@@ -1537,11 +1537,11 @@ textarea::placeholder {
 }
 
 .chip.ai .chip-input {
-  color: #bfdbfe;
+  color: #1e3a5f;
 }
 
 .chip.user .chip-input {
-  color: #fde68a;
+  color: #5b4a12;
 }
 
 .add {
@@ -1549,17 +1549,17 @@ textarea::placeholder {
   height: 26px;
   padding: 0;
   border-radius: 50%;
-  border: 1px dashed rgba(255, 255, 255, 0.28);
+  border: 1px dashed var(--line);
   background: transparent;
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--ink-muted);
   cursor: pointer;
   font-size: 16px;
   line-height: 1;
 }
 
 .add:hover {
-  border-color: rgba(253, 230, 138, 0.5);
-  color: #fde68a;
+  border-color: rgba(180, 83, 9, 0.5);
+  color: var(--accent);
 }
 
 .module.compact {

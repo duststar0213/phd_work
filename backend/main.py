@@ -7,6 +7,7 @@ import math
 import os
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
@@ -26,7 +27,7 @@ from pydantic import BaseModel, Field
 import auth
 import db
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 log = logging.getLogger("repertoire")
 
@@ -91,6 +92,7 @@ STUDY_CAP = int(os.getenv("STUDY_CAP", str(db.STUDY_CAP)) or db.STUDY_CAP)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    clear_local_proxies()
     db.init_db()
     yield
 
@@ -201,6 +203,14 @@ class ShortenRequest(BaseModel):
     text: str = Field(min_length=1, max_length=400)
 
 
+def clear_local_proxies() -> None:
+    """Drop HTTP_PROXY aimed at 127.0.0.1 (Cursor sandbox). Those cannot reach api.openai.com."""
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        value = os.environ.get(key, "")
+        if "127.0.0.1" in value or "localhost" in value:
+            os.environ.pop(key, None)
+
+
 def get_client() -> AsyncOpenAI:
     """Build an OpenAI client from OPENAI_API_KEY. Raises a public error if missing."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -210,7 +220,13 @@ def get_client() -> AsyncOpenAI:
             "missing_key",
             "Label generation isn't set up on this server yet. Try again later.",
         )
-    return AsyncOpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT_S)
+    clear_local_proxies()
+    proxy = os.getenv("OPENAI_PROXY", "").strip()
+    kwargs = {"api_key": api_key, "timeout": OPENAI_TIMEOUT_S}
+    if proxy:
+        os.environ["HTTPS_PROXY"] = proxy
+        os.environ["HTTP_PROXY"] = proxy
+    return AsyncOpenAI(**kwargs)
 
 
 def openai_http_error(exc: Exception) -> HTTPException:
@@ -234,6 +250,7 @@ def openai_http_error(exc: Exception) -> HTTPException:
             "The AI took too long. Check your connection and try again.",
         )
     if isinstance(exc, APIConnectionError):
+        log.warning("openai_unreachable: %s", exc)
         return api_error(
             503,
             "upstream_offline",

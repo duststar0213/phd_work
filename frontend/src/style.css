@@ -14,10 +14,22 @@ body,
   overflow: hidden;
 }
 
+:root {
+  --paper: #f3efe6;
+  --ink: #2c281f;
+  --ink-muted: rgba(44, 40, 31, 0.58);
+  --ink-faint: rgba(44, 40, 31, 0.38);
+  --chrome: #ffffff;
+  --line: rgba(44, 40, 31, 0.14);
+  --accent: #b45309;
+  --accent-soft: rgba(180, 83, 9, 0.12);
+  --dot: rgba(44, 40, 31, 0.16);
+}
+
 body {
   font-family: 'DM Mono', ui-monospace, monospace;
-  background: #16161d;
-  color: rgba(255, 255, 255, 0.7);
+  background: var(--paper);
+  color: var(--ink-muted);
 }
 
 button {

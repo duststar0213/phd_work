@@ -50,8 +50,8 @@ async function submit() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #16161d;
-  background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background: var(--paper);
+  background-image: radial-gradient(var(--dot) 1px, transparent 1px);
   background-size: 28px 28px;
 }
 
@@ -61,24 +61,24 @@ async function submit() {
   flex-direction: column;
   gap: 12px;
   padding: 22px;
-  background: #2c2c2c;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--chrome);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 32px rgba(44, 40, 31, 0.1);
 }
 
 .kicker {
   margin: 0;
   font-size: 11px;
   letter-spacing: 0.1em;
-  color: rgba(253, 230, 138, 0.7);
+  color: var(--accent);
 }
 
 h1 {
   margin: 0;
   font-size: 18px;
   font-weight: 400;
-  color: rgba(255, 255, 255, 0.92);
+  color: var(--ink);
 }
 
 .lede,
@@ -86,7 +86,7 @@ label span {
   margin: 0;
   font-size: 12px;
   line-height: 1.5;
-  color: rgba(255, 255, 255, 0.42);
+  color: var(--ink-faint);
 }
 
 label {
@@ -98,36 +98,36 @@ label {
 input {
   height: 36px;
   padding: 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: #1c1c24;
-  color: rgba(255, 255, 255, 0.88);
+  background: var(--paper);
+  color: var(--ink);
   font-family: inherit;
   font-size: 13px;
   outline: none;
 }
 
 input:focus {
-  border-color: rgba(253, 230, 138, 0.45);
+  border-color: rgba(180, 83, 9, 0.45);
 }
 
 .error {
   margin: 0;
   font-size: 12px;
-  color: #fca5a5;
+  color: #b91c1c;
 }
 
 button {
   height: 36px;
-  border: 1px solid rgba(253, 230, 138, 0.35);
+  border: 1px solid rgba(180, 83, 9, 0.35);
   border-radius: 8px;
-  background: rgba(253, 230, 138, 0.12);
-  color: #fde68a;
+  background: var(--accent-soft);
+  color: var(--accent);
   cursor: pointer;
 }
 
 button:hover:not(:disabled) {
-  background: rgba(253, 230, 138, 0.2);
+  background: rgba(180, 83, 9, 0.2);
 }
 
 button:disabled {

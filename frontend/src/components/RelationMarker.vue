@@ -447,7 +447,7 @@ function onCreateKeydown(e) {
 
 <style scoped>
 .relation-marker.selected {
-  box-shadow: 0 0 0 1.5px #8ec8ff;
+  box-shadow: 0 0 0 1.5px #2563eb;
 }
 
 .relation-marker.abandoned {
@@ -465,7 +465,7 @@ function onCreateKeydown(e) {
   align-items: center;
   gap: 1px;
   padding: 2px;
-  background: #16161d;
+  background: var(--paper);
   border-radius: 3px;
   z-index: 4;
 }
@@ -612,7 +612,7 @@ function onCreateKeydown(e) {
 .tab-same-hint {
   max-width: 92px;
   padding: 0 4px;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--ink-faint);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 8px;
   line-height: 1.2;
