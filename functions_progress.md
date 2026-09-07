@@ -1,23 +1,24 @@
 ---
 marp: true
 paginate: true
-title: Repertoire prototype — group meeting
+title: Repertoire prototype(temporary name)
 ---
 
 # Repertoire
 ## sticky-note ideation + rationale labels
 
-- Research prototype for capturing **why** an idea exists, not a chatbot
-- Designer writes a **reflection** → AI (or the person) turns it into **short labels**
+- Research prototype for capturing **why** an idea exists, not a chatbot suggest what ideas they should make
+- Designer writes a **reflection** → AI (or the person) turns it into **short labels** 
+- Using reflection instead of rationale: relationship between reflection and rationale? raionale is more structrued while reflection is more fluid and will give user more freedom to express
 - Labels can **recur** on the same note and **across notes**
 
-For the group meeting: what the prototype does, the stack, each function, and how AI is called.
+
 
 ---
 
 # Research intent
 
-- Sticky notes hold the **idea**
+- Sticky notes hold the **idea** and User 
 - Reflection holds the **rationale** (why this idea / why abandon / why two ideas link)
 - Labels are compact, reusable **rationale identities** (`rid`)
 - Repeating wording patterns may matter to users — same note **or** across notes
@@ -49,39 +50,62 @@ For the group meeting: what the prototype does, the stack, each function, and ho
 
 ---
 
-# Function: study door
+# Function: landing experience/get on the prototype
 
-- Invitation code first (`STUDY_ACCESS_CODE`, currently `rep-c6e4`)
+- Invitation code first (`STUDY_ACCESS_CODE`, currently `rep-c6e4`), need to host on website for sending to participants
+NEED TO FIGURE OUT: where should i host this prototype? what are policy if I need to get json info of how participant interacting with the prototype
 - Then email + password (or emailed one-time code)
-- Same email **always** maps to the same canvas
-- Optional allowlist of emails
+- Same email **always** maps to the same canvas 
+- Optional allowlist of emails (manually add participants email is possible)
 - Cap on how many new accounts can join
 
 ---
 
 # Function: infinite canvas
-
-- Pan (drag empty space) + zoom (wheel / ⌘+/−)
+This part is basically fork what figjam or miro is doing....
 - Dot grid stays locked to the world
 - Place sticky notes with the note tool (or `N`)
 - Select / drag notes
 - Bottom bar: tools + zoom + sign out
+Add:
+- Pan (drag empty space) + zoom (wheel / ⌘+/−). I think I add this just for my habit, not a must on
 
----
+---Below is core function----
 
-# Function: create & edit an idea
+# CORE FUNCTION: create & edit an idea
 
-- Click canvas → new sticky note
-- Placeholder: “define idea here”
+- Click canvas → new sticky note (use the bottom bar)
+- Placeholder: “define idea here” - grey text
 - Click again / empty note → type in the note
 - Color wheel on the selected note
 - Corner handles: **resizable**
-- Short idea + large note → **type grows** so the note is not empty purple
-- Long idea stays 13px and the note can still grow downward
+- Short idea + large note → **type grows** so the note will not have a lot of empty space if user resize it larger
+----
+# CORE FUNCTRION: AI helps surfacing rationale from user verbalized reflection
 
+- Open the chevron under a note (or relation), this part will always stay when user creating idea for **discoverities** and also engaging user to input and rrite rationale in **reflection**
+THINK/NEED: writing is still little be disruptive? although this part is create that user can do it for **optinonal** but
+will there be more engaging way? 
+- **Enter** generates labels (Shift+Enter = new line)
+- Blue chips = AI generated; yellow chips = human add or edited
+THINK/NEED: I used the different label color to make AI and human generated, and also user can edit, delete or keep what ever AI generate
+- Local gate first: empty / junk / near-copy of last generate **do not** call OpenAI. If user is trying to over-rely on AI instead of really inputing rationale, there is detect duplication check...and also this is prevent similar labels is over prducing by AI
+- Hesitation (“I don’t know”…) → fixed chip `not sure`, no API call, allow user to just label vague or uncertainty. 
 ---
 
-# Function: connect two ideas
+---
+# Function: abandon / revive idea
+
+- Delete on a **filled** note does not erase it
+- Opens abandon reflection: “why abandon this idea?” --> define rationale
+- Confirm → ghost note (locked, faded), still on the canvas
+- Empty note → actually removed
+- Right-click ghost → **revive**
+- Same flow exists for relations
+-The canvas auto-saves to your account. Come back later, same email, same board.
+
+---
+# CORE FUNCTION: Relate idea (WIP)
 
 - Connector tool → drag from a mag-point on one note to another
 - Curve sits between notes
@@ -90,36 +114,15 @@ For the group meeting: what the prototype does, the stack, each function, and ho
 
 ---
 
-# Function: abandon / revive
 
-- Delete on a **filled** note does not erase it
-- Opens abandon reflection: “why abandon this idea?”
-- Confirm → ghost note (locked, faded), still on the canvas
-- Empty note → actually removed
-- Right-click ghost → **revive**
-- Same flow exists for relations
 
----
-
-# Function: reflection → labels
-
-This is the core AI loop.
-
-- Open the chevron under a note (or relation)
-- Write rationale in **reflection**
-- **Enter** generates labels (Shift+Enter = new line)
-- Blue chips = AI; yellow chips = human
-- Local gate first: empty / junk / near-copy of last generate **do not** call OpenAI
-- Hesitation (“I don’t know”…) → fixed chip `not sure`, no API call
-
----
 
 # AI prompt 1: create labels
 
 **When:** Enter on reflection  
 **Model:** `gpt-4o-mini` · temperature 0.4 · JSON only
 
-**System (summary)**
+**System prompt (summary)**
 - Turn rationale into **3–6 short labels**
 - Each label ≤ **10 words**, specific to this input
 - Kinds (internal only): assumption / constraint / goal / tension / insight / question
@@ -173,7 +176,7 @@ While **typing or editing** a label (not after Enter):
 ---
 
 # AI prompt 2: meaning check (rare)
-
+This is created if user entering label that share meaning with the current existing labels and also potential offer for user to **merge** labels 
 **When:** confirm whether a new/edited label matches cosine neighbours  
 **Endpoint:** `POST /api/label-meaning`  
 **Model only sees k ≤ 3 neighbours**, never the whole pool
