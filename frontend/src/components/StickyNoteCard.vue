@@ -4,12 +4,30 @@
 -->
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue' // Vue 3
-import { clipWords } from '../api/rationale'
+import {
+  asVector,
+  cachedDraftVector,
+  clipUserLabel,
+  clusterSimilarLabels,
+  pairPatternHint,
+  embedTexts,
+  isSimilarLabel,
+  LIVE_EMBED_MS,
+  MAX_USER_LABEL_CHARS,
+  needsShortLabel,
+  SHORTEN_PAUSE_MS,
+  suggestShortLabel,
+  meaningHitsFromVectors,
+  readyForLiveEmbed,
+  rememberDraftVector,
+} from '../api/rationale'
 import ColorWheel from './ColorWheel.vue'
 import ConnectionIcon from './ConnectionIcon.vue'
 import SuggestRelationIcon from './SuggestRelationIcon.vue'
 
-const MIN_SIZE = 96 // smallest width/height from corner resize
+const MIN_SIZE = 120 // smallest width/height from corner resize; keeps room for the edge tabs
+const BASE_FONT_PX = 13
+const MAX_FONT_PX = 40
 const SIDES = ['top', 'right', 'bottom', 'left']
 const PLACEHOLDER = 'define idea here' // grey hint on empty notes; hidden while typing
 const MAX_PINNED = 3
@@ -22,7 +40,24 @@ const props = defineProps({
   magOutset: { type: Number, default: 18 }, // px from note edge to mag-point center
   drafting: { type: Boolean, default: false }, // true while dragging a connector from a mag point
   draftFromId: { type: [Number, String], default: null }, // origin note; same-note mag points cannot drop
+  ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
+  patternStats: { type: Object, default: () => ({}) },
+  canvasLabels: { type: Array, default: () => [] },
 })
+
+/** How many ideas share this rationale. 2+ earns a badge on the tab. */
+function recurrence(label) {
+  return Number(props.ridOwners?.[label?.rid]) || 0
+}
+
+function labelPattern(label) {
+  return props.patternStats?.byRid?.[label?.rid] || null
+}
+
+function groupPatternHint(group) {
+  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
+  return pairPatternHint(group.members.length, stats)
+}
 
 const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect', 'suggestRelations', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive'])
 
@@ -62,11 +97,18 @@ onMounted(() => {
       width: noteRef.value.offsetWidth,
       height: noteRef.value.offsetHeight,
     })
+    layoutTabs()
   })
   resizeObserver.observe(noteRef.value)
+  relayoutTabs()
+  nextTick(fitIdeaText)
 })
 
 onUnmounted(() => {
+  liveEmbedAbort?.abort()
+  window.clearTimeout(liveEmbedTimer)
+  shortAbort?.abort()
+  window.clearTimeout(shortTimer)
   resizeObserver?.disconnect()
   dragCleanup?.()
   resizeCleanup?.()
@@ -200,6 +242,63 @@ const showPlaceholder = computed(
   () => !String(props.note.text ?? '').trim() && !textFocused.value,
 )
 
+const ideaFontPx = ref(BASE_FONT_PX)
+
+/** True when this font still fits inside the resized note box. */
+function ideaTextFits(px, targetH) {
+  const el = textRef.value
+  if (!el) return true
+  const style = el.style
+  const saved = {
+    fontSize: style.fontSize,
+    flex: style.flex,
+    minHeight: style.minHeight,
+    height: style.height,
+  }
+  style.fontSize = `${px}px`
+  style.flex = 'none'
+  style.minHeight = '0'
+  style.height = 'auto'
+  const fits = el.scrollHeight <= targetH + 1
+  style.fontSize = saved.fontSize
+  style.flex = saved.flex
+  style.minHeight = saved.minHeight
+  style.height = saved.height
+  return fits
+}
+
+/** Grow type with the note so a short idea does not leave a tall empty purple block. */
+function fitIdeaText() {
+  const el = textRef.value
+  if (!el) return
+  const targetH = Math.max(Number(props.note.height) || 168, MIN_SIZE)
+  if (!String(el.innerText || '').trim()) {
+    ideaFontPx.value = BASE_FONT_PX
+    return
+  }
+  if (ideaTextFits(MAX_FONT_PX, targetH)) {
+    ideaFontPx.value = MAX_FONT_PX
+    return
+  }
+  if (!ideaTextFits(BASE_FONT_PX, targetH)) {
+    ideaFontPx.value = BASE_FONT_PX
+    return
+  }
+  let lo = BASE_FONT_PX
+  let hi = MAX_FONT_PX
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi + 1) / 2)
+    if (ideaTextFits(mid, targetH)) lo = mid
+    else hi = mid - 1
+  }
+  ideaFontPx.value = lo
+}
+
+watch(
+  () => [props.note.width, props.note.height, props.note.text],
+  () => nextTick(fitIdeaText),
+)
+
 const pinnedLabels = computed(() =>
   Array.isArray(props.note.pinnedLabels) ? props.note.pinnedLabels.slice(0, MAX_PINNED) : [],
 )
@@ -214,6 +313,204 @@ const createDraft = ref('')
 const editingTabId = ref(null)
 const tabDraft = ref('')
 const GHOST_TAB = 'add your label'
+
+const liveCreateQuery = computed(() => {
+  if (creating.value) return String(createDraft.value || '').trim()
+  if (editingTabId.value) return String(tabDraft.value || '').trim()
+  return ''
+})
+
+const liveEchoIds = computed(() => {
+  const query = liveCreateQuery.value
+  const ids = new Set()
+  if (!query) return ids
+  for (const item of allLabels.value) {
+    if (!item.text) continue
+    if (editingTabId.value && item.id === editingTabId.value) continue
+    if (isSimilarLabel(query, item.text)) ids.add(item.id)
+  }
+  return ids
+})
+
+const liveCanvasEcho = computed(() => {
+  const query = liveCreateQuery.value
+  if (!query) return false
+  const owner = `n${props.note.id}`
+  return (props.canvasLabels || []).some(
+    (item) => item?.text && item.owner !== owner && isSimilarLabel(query, item.text),
+  )
+})
+
+const liveEmbedHits = ref({})
+let liveEmbedTimer = 0
+let liveEmbedAbort = null
+const shortSuggest = ref('')
+const shortFor = ref('')
+const shortSkip = new Set()
+let shortTimer = 0
+let shortAbort = null
+
+function clearShortSuggest() {
+  shortSuggest.value = ''
+  shortFor.value = ''
+}
+
+function acceptShortSuggest() {
+  if (!shortSuggest.value) return
+  if (creating.value) createDraft.value = shortSuggest.value
+  else if (editingTabId.value) tabDraft.value = shortSuggest.value
+  shortSkip.add(shortSuggest.value)
+  clearShortSuggest()
+}
+
+function skipShortSuggest() {
+  if (shortFor.value) shortSkip.add(shortFor.value)
+  clearShortSuggest()
+}
+
+async function runShortSuggest(text) {
+  if (text !== liveCreateQuery.value || !needsShortLabel(text) || shortSkip.has(text)) return
+  shortAbort?.abort()
+  shortAbort = new AbortController()
+  try {
+    const suggestion = await suggestShortLabel(text, { signal: shortAbort.signal })
+    if (text !== liveCreateQuery.value) return
+    shortSuggest.value = suggestion
+    shortFor.value = suggestion ? text : ''
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+    clearShortSuggest()
+  }
+}
+
+watch(liveCreateQuery, (text) => {
+  window.clearTimeout(shortTimer)
+  shortAbort?.abort()
+  if (!needsShortLabel(text) || shortSkip.has(text)) {
+    clearShortSuggest()
+    return
+  }
+  shortTimer = window.setTimeout(() => {
+    runShortSuggest(text).catch(() => {})
+  }, SHORTEN_PAUSE_MS)
+})
+
+const liveEchoHint = computed(() => {
+  if (allLabels.value.some((item) => item.text && (liveEchoIds.value.has(item.id) || liveEmbedHits.value[item.id]))) {
+    return 'close to an existing label'
+  }
+  return liveCanvasEcho.value ? 'this pattern already appears on another idea' : ''
+})
+
+function isTabEcho(label) {
+  return Boolean(liveEchoIds.value.has(label.id) || liveEmbedHits.value[label.id])
+}
+
+// Tabs run down the right edge until the note is too short, then the highest-ranked
+// ones wrap onto the top edge so rank order still reads clockwise around the note.
+const TAB_GAP = 3 // matches the flex gap in .edge-tabs
+const TAB_INSET = 10 // the column starts this far down, and keeps the same clearance at the bottom
+const TAB_FALLBACK_H = 18 // one-line tab, used until a tab has been measured on the right edge
+
+const rightTabsRef = ref(null)
+const addWrapRef = ref(null)
+const topTabCount = ref(0)
+const plusOnTop = ref(false)
+const tabHeights = new Map() // group id -> height it takes on the right edge
+const tabGroups = computed(() => clusterSimilarLabels(pinnedLabels.value))
+
+const topTabs = computed(() => tabGroups.value.slice(0, topTabCount.value))
+const rightTabs = computed(() => tabGroups.value.slice(topTabCount.value))
+
+/** Right-edge heights only; a tab on the top edge keeps the last height it had on the right. */
+function measureTabs() {
+  const column = rightTabsRef.value
+  if (!column) return
+  for (const el of column.querySelectorAll('[data-tab-id]')) {
+    if (el.offsetHeight) tabHeights.set(el.dataset.tabId, el.offsetHeight)
+  }
+}
+
+function layoutTabs() {
+  if (!noteRef.value || frozen.value) return
+  measureTabs()
+  const list = tabGroups.value
+  const plusHeight = addWrapRef.value?.offsetHeight || 16
+  const room = noteRef.value.offsetHeight - TAB_INSET * 2
+  let count = 0
+  while (count < list.length) {
+    const stack = list.slice(count)
+    const needed =
+      stack.reduce((sum, group) => sum + (tabHeights.get(String(group.id)) || TAB_FALLBACK_H) + TAB_GAP, 0) +
+      plusHeight
+    if (needed <= room) break
+    count += 1
+  }
+  topTabCount.value = count
+  plusOnTop.value = count >= list.length && plusHeight > room
+}
+
+/** Re-run after the DOM settles: a tab returning to the right edge is only measurable once it is there. */
+function relayoutTabs(passes = 2) {
+  layoutTabs()
+  if (passes > 0) nextTick(() => relayoutTabs(passes - 1))
+}
+
+// Pinning, unpinning, folds and edited label text all change how tall the column is.
+watch(tabGroups, () => relayoutTabs(), { deep: true })
+
+function applyLiveEmbedHits(vec) {
+  const hits = {}
+  for (const item of meaningHitsFromVectors(vec, allLabels.value, { excludeId: editingTabId.value })) {
+    hits[item.id] = true
+  }
+  liveEmbedHits.value = hits
+}
+
+async function runLiveEmbed(query) {
+  if (query !== liveCreateQuery.value || !readyForLiveEmbed(query)) return
+  liveEmbedAbort?.abort()
+  liveEmbedAbort = new AbortController()
+  const { signal } = liveEmbedAbort
+  try {
+    const missing = allLabels.value.filter((item) => item.text && !asVector(item.embedding))
+    if (missing.length) {
+      const byText = await embedTexts(missing.map((item) => item.text), { signal })
+      const next = allLabels.value.map((item) => {
+        const vec = byText.get(item.text)
+        return vec && !asVector(item.embedding) ? { ...item, embedding: vec } : item
+      })
+      if (next.some((item, i) => item !== allLabels.value[i])) setLabels(next)
+    }
+    let vec = cachedDraftVector(query)
+    if (!vec) {
+      const byText = await embedTexts([query], { signal })
+      vec = byText.get(query)
+      if (vec) rememberDraftVector(query, vec)
+    }
+    if (!vec || query !== liveCreateQuery.value) return
+    applyLiveEmbedHits(vec)
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+  }
+}
+
+watch(liveCreateQuery, (query) => {
+  window.clearTimeout(liveEmbedTimer)
+  liveEmbedAbort?.abort()
+  if (!readyForLiveEmbed(query)) {
+    liveEmbedHits.value = {}
+    return
+  }
+  const cached = cachedDraftVector(query)
+  if (cached) {
+    applyLiveEmbedHits(cached)
+    return
+  }
+  liveEmbedTimer = window.setTimeout(() => {
+    runLiveEmbed(query).catch(() => {})
+  }, LIVE_EMBED_MS)
+})
 
 /** Caret in: drop the grey hint. Caret out + still empty: hint returns. */
 function onTextFocus() {
@@ -273,7 +570,7 @@ function toggleRationale(e) {
 }
 
 function pinSnapshot(label) {
-  return { id: label.id, text: label.text, kind: label.kind || '', source: label.source }
+  return { id: label.id, text: label.text, kind: label.kind || '', source: label.source, rid: label.rid }
 }
 
 function setPinned(next) {
@@ -308,14 +605,16 @@ function startTabEdit(label) {
 }
 
 function onTabDraftInput(e) {
-  tabDraft.value = clipWords(e.target.value)
+  tabDraft.value = clipUserLabel(e.target.value)
 }
 
 function commitTabEdit(label) {
   if (editingTabId.value !== label.id) return
-  const text = clipWords(tabDraft.value)
+  const text = clipUserLabel(tabDraft.value)
   editingTabId.value = null
   tabDraft.value = ''
+  liveEmbedHits.value = {}
+  clearShortSuggest()
   if (!text || text === label.text) return
   setPinned(
     pinnedLabels.value.map((item) => (item.id === label.id ? { ...item, text, source: 'user' } : item)),
@@ -351,14 +650,16 @@ function beginCreateTab(e) {
 }
 
 function onCreateInput(e) {
-  createDraft.value = clipWords(e.target.value)
+  createDraft.value = clipUserLabel(e.target.value)
 }
 
 function commitCreate() {
   if (!creating.value) return
-  const text = clipWords(createDraft.value)
+  const text = clipUserLabel(createDraft.value)
   creating.value = false
   createDraft.value = ''
+  liveEmbedHits.value = {}
+  clearShortSuggest()
   if (!text) return
   const chip = { id: nextLabelId(), text, kind: '', source: 'user' }
   setLabels([...allLabels.value, chip])
@@ -386,6 +687,13 @@ function onNoteMouseDown(e) {
   if (e.button !== 0) return
   if (frozen.value) return
   if (e.target.closest('.toolbar') || e.target.closest('.resize-handle') || e.target.closest('.mag-point') || e.target.closest('.fold-btn') || e.target.closest('.edge-add-wrap') || e.target.closest('.tab-del')) return
+  // While typing, the caret owns the pointer so text can be selected by dragging.
+  if (editing.value && e.target.closest('.note-text')) {
+    e.stopPropagation()
+    colorOpen.value = false
+    didDrag = false
+    return
+  }
   e.stopPropagation()
   const alreadySelected = props.selected
   activate()
@@ -615,45 +923,115 @@ function onMagMouseUp(e, side) {
       />
     </template>
 
-    <!-- File-folder tabs on the right edge. + always offers a human tab (hover = feedforward). -->
-    <div v-if="!frozen" class="edge-tabs">
-      <span
-        v-for="label in pinnedLabels"
-        :key="label.id"
-        class="edge-tab"
-        :class="label.source === 'user' ? 'user' : 'ai'"
-      >
-        <input
-          v-if="editingTabId === label.id"
-          :id="`tab-edit-${note.id}-${label.id}`"
-          class="tab-input"
-          :value="tabDraft"
-          maxlength="96"
-          @input="onTabDraftInput"
-          @keydown="onTabEditKeydown($event, label)"
-          @blur="commitTabEdit(label)"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop
-        />
-        <span
-          v-else
-          class="tab-label"
-          title="Click to edit"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop="startTabEdit(label)"
-        >{{ label.text }}</span>
-        <button
-          type="button"
-          class="tab-del"
-          title="Take off the note"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop="unpinLabel(label, $event)"
-        >×</button>
-      </span>
+    <!-- Overflow row: highest-ranked tabs the right edge cannot hold, laid out along the top edge. -->
+    <div v-if="!frozen && topTabs.length" class="edge-tabs-top">
       <div
+        v-for="group in topTabs"
+        :key="group.id"
+        class="tab-pair"
+        :class="{ linked: group.members.length > 1 }"
+      >
+        <span
+          v-for="label in group.members"
+          :key="label.id"
+          class="edge-tab"
+          :class="[label.source === 'user' ? 'user' : 'ai', { echo: isTabEcho(label) }]"
+          :title="isTabEcho(label) ? 'close to an existing label' : undefined"
+        >
+          <input
+            v-if="editingTabId === label.id"
+            :id="`tab-edit-${note.id}-${label.id}`"
+            class="tab-input"
+            :value="tabDraft"
+            :maxlength="MAX_USER_LABEL_CHARS"
+            @input="onTabDraftInput"
+            @keydown="onTabEditKeydown($event, label)"
+            @blur="commitTabEdit(label)"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop
+          />
+          <span
+            v-else
+            class="tab-label"
+            :title="isTabEcho(label) ? 'close to an existing label' : 'Click to edit'"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="startTabEdit(label)"
+          >{{ label.text }}</span>
+          <span
+            v-if="recurrence(label) > 1"
+            class="tab-badge"
+            :title="`this rationale is behind ${recurrence(label)} ideas`"
+          >×{{ recurrence(label) }}</span>
+          <button
+            type="button"
+            class="tab-del"
+            title="Take off the note"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="unpinLabel(label, $event)"
+          >×</button>
+        </span>
+        <span v-if="groupPatternHint(group)" class="tab-same-hint">{{ groupPatternHint(group) }}</span>
+      </div>
+    </div>
+
+    <!-- File-folder tabs on the right edge. + always offers a human tab (hover = feedforward). -->
+    <div v-if="!frozen" ref="rightTabsRef" class="edge-tabs" :class="{ 'plus-top': plusOnTop }">
+      <div
+        v-for="group in rightTabs"
+        :key="group.id"
+        :data-tab-id="group.id"
+        class="tab-pair"
+        :class="{ linked: group.members.length > 1 }"
+      >
+        <span
+          v-for="label in group.members"
+          :key="label.id"
+          class="edge-tab"
+          :class="[label.source === 'user' ? 'user' : 'ai', { echo: isTabEcho(label) }]"
+          :title="isTabEcho(label) ? 'close to an existing label' : undefined"
+        >
+          <input
+            v-if="editingTabId === label.id"
+            :id="`tab-edit-${note.id}-${label.id}`"
+            class="tab-input"
+            :value="tabDraft"
+            :maxlength="MAX_USER_LABEL_CHARS"
+            @input="onTabDraftInput"
+            @keydown="onTabEditKeydown($event, label)"
+            @blur="commitTabEdit(label)"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop
+          />
+          <span
+            v-else
+            class="tab-label"
+            :title="isTabEcho(label) ? 'close to an existing label' : 'Click to edit'"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="startTabEdit(label)"
+          >{{ label.text }}</span>
+          <span
+            v-if="recurrence(label) > 1"
+            class="tab-badge"
+            :title="`this rationale is behind ${recurrence(label)} ideas`"
+          >×{{ recurrence(label) }}</span>
+          <button
+            type="button"
+            class="tab-del"
+            title="Take off the note"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="unpinLabel(label, $event)"
+          >×</button>
+        </span>
+        <span v-if="groupPatternHint(group)" class="tab-same-hint">{{ groupPatternHint(group) }}</span>
+      </div>
+      <div
+        ref="addWrapRef"
         class="edge-add-wrap"
         @pointerdown.stop
         @mousedown.stop
@@ -665,7 +1043,7 @@ function onMagMouseUp(e, side) {
             :id="`tab-new-${note.id}`"
             class="tab-input"
             :value="createDraft"
-            maxlength="96"
+            :maxlength="MAX_USER_LABEL_CHARS"
             placeholder="rationale label of this idea"
             @input="onCreateInput"
             @keydown="onCreateKeydown"
@@ -673,6 +1051,12 @@ function onMagMouseUp(e, side) {
             @click.stop
           />
         </span>
+        <span v-if="liveEchoHint" class="tab-echo-hint">{{ liveEchoHint }}</span>
+        <div v-if="shortSuggest" class="tab-shorten">
+          <span>{{ shortSuggest }}</span>
+          <button type="button" @mousedown.prevent="acceptShortSuggest">use</button>
+          <button type="button" @mousedown.prevent="skipShortSuggest">keep mine</button>
+        </div>
         <span v-else-if="addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
         <button
           type="button"
@@ -687,12 +1071,12 @@ function onMagMouseUp(e, side) {
     <span
       v-if="showPlaceholder"
       class="note-placeholder"
-      :style="{ color: placeholderColor }"
+      :style="{ color: placeholderColor, fontSize: `${ideaFontPx}px` }"
     >{{ PLACEHOLDER }}</span>
     <div
       ref="textRef"
       class="note-text"
-      :style="{ color: textColor }"
+      :style="{ color: textColor, fontSize: `${ideaFontPx}px` }"
       :contenteditable="Boolean(editing && !frozen)"
       spellcheck="false"
       @input="onTextInput"
@@ -1024,6 +1408,43 @@ function onMagMouseUp(e, side) {
   z-index: 2;
 }
 
+/* Only reachable below the minimum note size: the + has no room left on the right edge. */
+.edge-tabs.plus-top {
+  left: auto;
+  right: 4px;
+  top: auto;
+  bottom: calc(100% + 2px);
+}
+
+/* Anchored at its bottom so extra rows grow upward, never into the note. */
+.edge-tabs-top {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% - 4px);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 3px;
+  z-index: 2;
+}
+
+.edge-tabs-top .tab-pair {
+  align-items: flex-end;
+}
+
+/* Shrink to share the note's width, and only wrap to a second row when that is not enough. */
+.edge-tabs-top .edge-tab {
+  flex: 0 1 auto;
+  min-width: 60px;
+  padding: 2px 5px;
+  border-radius: 3px 3px 0 0;
+  border-left-width: 1px; /* border colour still comes from the .ai / .user shorthand */
+  border-left-style: solid;
+  border-bottom-width: 0;
+  box-shadow: 1px -1px 3px rgba(0, 0, 0, 0.18);
+}
+
 .edge-tab {
   box-sizing: border-box;
   display: inline-flex;
@@ -1058,6 +1479,49 @@ function onMagMouseUp(e, side) {
   color: #5b4a12;
 }
 
+.edge-tab.echo {
+  animation: echo-breathe 2.2s ease-in-out infinite;
+}
+
+.edge-tab.ai.echo {
+  animation-name: echo-breathe-ai;
+}
+
+.edge-tab.user.echo {
+  animation-name: echo-breathe-user;
+}
+
+@keyframes echo-breathe-ai {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.4), 1px 1px 3px rgba(0, 0, 0, 0.18);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(147, 197, 253, 0.95), 1px 1px 3px rgba(0, 0, 0, 0.18);
+  }
+}
+
+@keyframes echo-breathe-user {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.4), 1px 1px 3px rgba(0, 0, 0, 0.18);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(253, 230, 138, 0.95), 1px 1px 3px rgba(0, 0, 0, 0.18);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .edge-tab.ai.echo {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.9), 1px 1px 3px rgba(0, 0, 0, 0.18);
+  }
+  .edge-tab.user.echo {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.9), 1px 1px 3px rgba(0, 0, 0, 0.18);
+  }
+}
+
 .edge-tab.ghost {
   position: absolute;
   left: calc(100% + 2px);
@@ -1084,6 +1548,7 @@ function onMagMouseUp(e, side) {
   top: 50%;
   transform: translateY(-50%);
   z-index: 3;
+  max-width: 220px;
   border-radius: 3px;
 }
 
@@ -1109,6 +1574,46 @@ function onMagMouseUp(e, side) {
   min-width: 0;
   flex: 1;
   cursor: text;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.tab-pair {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  gap: 2px;
+  width: max-content;
+}
+
+.tab-pair.linked {
+  align-items: center;
+}
+
+.tab-same-hint {
+  align-self: center;
+  max-width: 92px;
+  padding: 0 4px;
+  color: rgba(255, 255, 255, 0.55);
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 8px;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+}
+
+/* Recurrence, not authorship: the tab colour already says who wrote it. */
+.tab-badge {
+  flex-shrink: 0;
+  align-self: center;
+  padding: 0 3px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.22);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 12px;
 }
 
 .tab-del {
@@ -1140,6 +1645,47 @@ function onMagMouseUp(e, side) {
   align-self: flex-start;
   width: max-content;
   margin-top: 3px;
+}
+
+.tab-shorten {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: calc(50% + 34px);
+  z-index: 4;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  width: max-content;
+  max-width: 200px;
+  color: #78716c;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.tab-shorten button {
+  padding: 0 4px;
+  border: 0;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.55);
+  color: #44403c;
+  cursor: pointer;
+  font: inherit;
+}
+
+.tab-echo-hint {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: calc(50% + 18px);
+  z-index: 4;
+  width: max-content;
+  max-width: 180px;
+  color: #ca8a04;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+  pointer-events: none;
 }
 
 .edge-add {
@@ -1179,6 +1725,7 @@ function onMagMouseUp(e, side) {
 
 .note.editing .note-text {
   cursor: text;
+  user-select: text;
 }
 
 .mag-point {

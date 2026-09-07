@@ -4,10 +4,40 @@
   Enter generates (costs an API call). Empty input never generates.
 -->
 <script setup>
-import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { clipWords, generateRationaleLabels } from '../api/rationale'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import {
+  asVector,
+  assessReflection,
+  cachedDraftVector,
+  clipUserLabel,
+  clipWords,
+  confirmLabelMeaning,
+  embedTexts,
+  MAX_USER_LABEL_CHARS,
+  needsShortLabel,
+  SHORTEN_PAUSE_MS,
+  suggestShortLabel,
+  generateRationaleLabels,
+  isSimilarLabel,
+  clusterSimilarLabels,
+  pairPatternHint,
+  LabelVectorIndex,
+  lexicalMeaningHits,
+  LIVE_EMBED_MS,
+  meaningHitsFromVectors,
+  NOT_SURE_LABEL,
+  NOT_SURE_RID,
+  readyForLiveEmbed,
+  rememberDraftVector,
+  sameWording,
+} from '../api/rationale'
 
 const MAX_PINNED = 3
+
+/** Canvas-scoped rationale identity; labels sharing a rid are the same reasoning. */
+function newRid() {
+  return `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`
+}
 
 const props = defineProps({
   target: { type: String, default: 'generic' }, // generic | note | relation
@@ -17,6 +47,10 @@ const props = defineProps({
   pinned: { type: Array, default: null }, // labels on the note; null = local (playground)
   savedInput: { type: String, default: '' },
   savedLabels: { type: Array, default: null },
+  knownLabels: { type: Array, default: () => [] }, // [{ ref, text }] across the canvas, for reuse detection
+  ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
+  patternStats: { type: Object, default: () => ({}) }, // repeating wording across the canvas
+  canvasLabels: { type: Array, default: () => [] }, // [{ text, rid, owner }]
   placeholder: { type: String, default: 'Tell me about this idea…' },
   presetLabels: { type: Array, default: () => [] }, // chips shown on open so the user can skip writing
   actionLabel: { type: String, default: '' }, // optional extra button, e.g. "just abandon it"
@@ -29,6 +63,7 @@ const input = ref(props.savedInput || '')
 const labels = ref([])
 const loading = ref(false)
 const error = ref('')
+const errorCode = ref('')
 const source = ref('') // 'api' | ''
 const editingId = ref(null)
 const editingZone = ref(null) // which copy of the chip holds the caret
@@ -38,10 +73,14 @@ const localPinned = ref([])
 const draggingId = ref(null) // label being dragged between the two sections
 const dragOrigin = ref(null) // 'pool' | 'chosen' — decides re-rank vs pin/unpin
 const chosenHot = ref(false) // chosen zone is a live drop target
+const pendingMerges = ref([]) // reuse hits awaiting a yes / no from the person
+// Last text that actually reached the model. Empty means the next Enter is a first generate.
+const lastGenerated = ref('')
 
 const fieldRef = ref(null)
 
 let abortGenerate = null
+let abortEcho = new AbortController()
 let nextLabelId = 1
 let hydrating = true
 let fieldObserver = null
@@ -54,6 +93,12 @@ function fromSaved(item, fallbackSource) {
     text: source === 'user' ? String(item.text || '').trim() : clipWords(item.text),
     kind: item.kind || '',
     source,
+    rid: item.rid || newRid(),
+    count: Number(item.count) > 0 ? Number(item.count) : 1,
+    occurrences: Array.isArray(item.occurrences) ? item.occurrences : [],
+    embedding: asVector(item.embedding),
+    echo: Boolean(item.echo),
+    echoSource: Boolean(item.echoSource),
   }
 }
 
@@ -68,6 +113,7 @@ if (Array.isArray(props.savedLabels) && props.savedLabels.length) {
   const maxId = labels.value.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
   nextLabelId = maxId + 1
   if (labels.value.some((item) => item.source === 'ai')) source.value = 'api'
+  lastGenerated.value = String(props.savedInput || '').trim()
 } else {
   labels.value = seedPresets()
   const maxId = labels.value.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
@@ -85,6 +131,7 @@ function autoGrow() {
 
 onMounted(() => {
   autoGrow()
+  refreshAllUserEchoes()
   if (!fieldRef.value) return
   fieldWidth = fieldRef.value.offsetWidth
   fieldObserver = new ResizeObserver((entries) => {
@@ -98,6 +145,11 @@ onMounted(() => {
 
 onUnmounted(() => {
   abortGenerate?.abort()
+  abortEcho?.abort()
+  liveEmbedAbort?.abort()
+  window.clearTimeout(liveEmbedTimer)
+  shortAbort?.abort()
+  window.clearTimeout(shortTimer)
   fieldObserver?.disconnect()
 })
 
@@ -109,6 +161,12 @@ function emitRationale() {
       text: item.text,
       kind: item.kind || '',
       source: item.source,
+      rid: item.rid,
+      count: item.count || 1,
+      occurrences: item.occurrences || [],
+      embedding: asVector(item.embedding),
+      echo: Boolean(item.echo),
+      echoSource: Boolean(item.echoSource),
     })),
     source: source.value,
   })
@@ -116,18 +174,10 @@ function emitRationale() {
 
 hydrating = false
 
-watch(input, (value) => {
+// Clearing the field never clears labels: the pool is the record of everything generated.
+watch(input, () => {
   nextTick(autoGrow) // covers programmatic changes, not just typing
   if (hydrating) return
-  if (!value.trim()) {
-    const presets = seedPresets()
-    labels.value = presets
-    source.value = ''
-    error.value = ''
-    editingId.value = null
-    draft.value = ''
-    if (!presets.length) setPinned([])
-  }
   emitRationale()
 })
 
@@ -135,9 +185,23 @@ watch(
   () => props.savedLabels,
   (list) => {
     if (!Array.isArray(list)) return
-    labels.value = list.map((item) => fromSaved(item, 'ai'))
-    const maxId = labels.value.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
+    const incoming = list.map((item) => fromSaved(item, 'ai'))
+    const maxId = incoming.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0)
     nextLabelId = Math.max(nextLabelId, maxId + 1)
+    const unchanged =
+      incoming.length === labels.value.length &&
+      incoming.every((item) =>
+        labels.value.some((cur) => cur.id === item.id && cur.text === item.text && cur.source === item.source),
+      )
+    if (unchanged) {
+      for (const item of incoming) {
+        const cur = labels.value.find((row) => row.id === item.id)
+        if (cur && !asVector(cur.embedding) && asVector(item.embedding)) cur.embedding = item.embedding
+      }
+      return
+    }
+    labels.value = incoming
+    if (!hydrating) refreshAllUserEchoes()
   },
   { deep: true },
 )
@@ -167,9 +231,249 @@ function isPinned(label) {
 }
 
 function chipTitle(label) {
+  if (isEchoSource(label) || isEchoHit(label)) return echoHint.value || 'close to an existing label'
   if (isPinned(label)) return 'already chosen — drag it back down to take it off'
   if (currentPinned().length >= MAX_PINNED) return '3 already chosen — drag one out first'
   return 'click to edit · drag to rank or to choose'
+}
+
+const chosenGroups = computed(() => clusterSimilarLabels(currentPinned()))
+const poolGroups = computed(() => clusterSimilarLabels(visibleLabels()))
+
+const echoHit = ref({})
+const echoUser = ref({})
+const echoByQuery = new Map()
+const vectorIndex = new LabelVectorIndex()
+
+function paintEchoes() {
+  const hits = {}
+  const sources = {}
+  for (const [uid, ids] of echoByQuery) {
+    if (!ids.length) continue
+    sources[uid] = true
+    for (const id of ids) hits[id] = true
+  }
+  echoHit.value = hits
+  echoUser.value = sources
+  for (const label of labels.value) {
+    label.echo = Boolean(hits[label.id] || sources[label.id])
+    label.echoSource = Boolean(sources[label.id])
+  }
+}
+
+/** Only the label being created / edited — never the reflection field. */
+function liveQueryText() {
+  if (!editingId.value) return ''
+  return String(draft.value || '').trim()
+}
+
+const liveHits = computed(() => {
+  const query = liveQueryText()
+  const hits = {}
+  if (!query) return hits
+  for (const label of labels.value) {
+    if (!label.text) continue
+    if (editingId.value && label.id === editingId.value) continue
+    if (isSimilarLabel(query, label.text)) hits[label.id] = true
+  }
+  return hits
+})
+
+const liveEmbedHits = ref({})
+let liveEmbedTimer = 0
+let liveEmbedAbort = null
+const shortSuggest = ref('')
+const shortFor = ref('')
+const shortSkip = new Set()
+let shortTimer = 0
+let shortAbort = null
+
+function applyLiveEmbedHits(query, vec) {
+  const hits = {}
+  for (const item of meaningHitsFromVectors(vec, labels.value, { excludeId: editingId.value })) {
+    hits[item.id] = true
+  }
+  liveEmbedHits.value = hits
+}
+
+async function runLiveEmbed(query) {
+  if (query !== liveQueryText() || !readyForLiveEmbed(query)) return
+  liveEmbedAbort?.abort()
+  liveEmbedAbort = new AbortController()
+  const { signal } = liveEmbedAbort
+  try {
+    const pool = labels.value.filter((item) => item.text)
+    await ensureIndexed(pool, { signal })
+    let vec = cachedDraftVector(query)
+    if (!vec) {
+      const byText = await embedTexts([query], { signal })
+      vec = byText.get(query)
+      if (vec) rememberDraftVector(query, vec)
+    }
+    if (!vec || query !== liveQueryText()) return
+    applyLiveEmbedHits(query, vec)
+    notify()
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+  }
+}
+
+watch(
+  () => liveQueryText(),
+  (query) => {
+    window.clearTimeout(liveEmbedTimer)
+    liveEmbedAbort?.abort()
+    if (!readyForLiveEmbed(query)) {
+      liveEmbedHits.value = {}
+      return
+    }
+    const cached = cachedDraftVector(query)
+    if (cached) {
+      applyLiveEmbedHits(query, cached)
+      return
+    }
+    liveEmbedTimer = window.setTimeout(() => {
+      runLiveEmbed(query).catch(() => {})
+    }, LIVE_EMBED_MS)
+  },
+)
+
+function isEchoHit(label) {
+  if (!editingId.value) return false
+  return Boolean(liveHits.value[label.id] || liveEmbedHits.value[label.id])
+}
+
+function isEchoSource(label) {
+  if (echoUser.value[label.id]) return true
+  if (editingId.value !== label.id) return false
+  return labels.value.some((item) => item.id !== label.id && (liveHits.value[item.id] || liveEmbedHits.value[item.id]))
+}
+
+const echoHint = computed(() => {
+  if (!editingId.value) return ''
+  const hasHit = labels.value.some(
+    (label) =>
+      label.id !== editingId.value &&
+      label.text &&
+      (liveHits.value[label.id] || liveEmbedHits.value[label.id]),
+  )
+  if (hasHit) return 'close to an existing label'
+  const query = liveQueryText()
+  if (!query) return ''
+  const localRids = new Set(labels.value.map((item) => item.rid).filter(Boolean))
+  const elsewhere = (props.canvasLabels || []).some(
+    (item) => item?.text && !localRids.has(item.rid) && isSimilarLabel(query, item.text),
+  )
+  return elsewhere ? 'this pattern already appears on another idea' : ''
+})
+
+/** Write-time: embed rows that lack a vector, then upsert into HNSW (no full rebuild). */
+async function ensureIndexed(items, signal) {
+  const missing = items.filter((item) => item?.text && !asVector(item.embedding))
+  if (missing.length) {
+    const byText = await embedTexts(missing.map((item) => item.text), { signal })
+    for (const item of missing) {
+      const vec = byText.get(item.text)
+      if (vec) item.embedding = vec
+    }
+  }
+  const live = new Set()
+  for (const item of items) {
+    if (!item?.text) continue
+    live.add(String(item.id))
+    vectorIndex.upsert(item.id, item.embedding, item.text)
+  }
+  for (const id of vectorIndex.ids()) {
+    if (!live.has(id)) vectorIndex.remove(id)
+  }
+}
+
+function echoId(ref) {
+  const asNum = Number(ref)
+  if (Number.isFinite(asNum) && String(asNum) === String(ref)) return asNum
+  return String(ref)
+}
+
+function mergeMeaningHits(...lists) {
+  const seen = new Set()
+  const out = []
+  for (const list of lists) {
+    for (const item of list || []) {
+      const ref = String(item?.ref || '')
+      if (!ref || seen.has(ref)) continue
+      seen.add(ref)
+      out.push(item)
+      if (out.length >= 3) return out
+    }
+  }
+  return out
+}
+
+/**
+ * Paint wording matches immediately. Embeddings / the model may add more;
+ * they must not wipe a match that wording or cosine already found.
+ */
+async function refreshMeaningEchoes(queryLabel) {
+  if (!queryLabel?.text) {
+    echoByQuery.delete(queryLabel?.id)
+    paintEchoes()
+    return
+  }
+  const { signal } = abortEcho || {}
+  const pool = labels.value.filter((item) => item.text)
+  const lexical = lexicalMeaningHits(queryLabel.text, pool, queryLabel.id)
+  if (lexical.length) {
+    echoByQuery.set(queryLabel.id, lexical.map((item) => echoId(item.ref)))
+  } else {
+    echoByQuery.delete(queryLabel.id)
+  }
+  paintEchoes()
+  notify()
+
+  try {
+    await ensureIndexed(pool, { signal })
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+  }
+  const queryVec = asVector(queryLabel.embedding)
+  const neighbours = queryVec
+    ? vectorIndex.query(queryVec, { excludeId: queryLabel.id })
+    : []
+  const fallback = mergeMeaningHits(lexical, neighbours)
+  if (!fallback.length) {
+    echoByQuery.delete(queryLabel.id)
+    paintEchoes()
+    notify()
+    return
+  }
+  if (fallback.length) echoByQuery.set(queryLabel.id, fallback.map((item) => echoId(item.ref)))
+  paintEchoes()
+  notify()
+  if (!fallback.length) return
+  try {
+    const matches = await confirmLabelMeaning(queryLabel.text, fallback, { signal })
+    const allowed = new Set(fallback.map((item) => String(item.ref)))
+    const confirmed = matches
+      .map((ref) => String(ref))
+      .filter((ref) => allowed.has(ref))
+      .map(echoId)
+    if (confirmed.length) echoByQuery.set(queryLabel.id, confirmed)
+    paintEchoes()
+    notify()
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+    paintEchoes()
+  }
+}
+
+function refreshPoolEchoes() {
+  for (const label of labels.value) {
+    if (label.text) refreshMeaningEchoes(label).catch(() => {})
+  }
+}
+
+function refreshAllUserEchoes() {
+  refreshPoolEchoes()
 }
 
 /** Drag-and-drop is the only way a label gets onto the note. */
@@ -312,7 +616,22 @@ function toChip(item, origin) {
     text: clipWords(item.text),
     kind: item.kind || '',
     source: origin,
+    rid: item.rid || newRid(),
+    count: 1,
+    occurrences: [],
+    embedding: asVector(item.embedding),
   }
+}
+
+/** idk / don't know / hmm: one yellow chip, no API call. */
+function applyUnsureLabel() {
+  const existing = labels.value.find((item) => item.rid === NOT_SURE_RID || sameWording(item.text, NOT_SURE_LABEL))
+  if (existing) {
+    existing.count = (existing.count || 1) + 1
+    existing.rid = existing.rid || NOT_SURE_RID
+    return
+  }
+  labels.value = [...labels.value, toChip({ text: NOT_SURE_LABEL, kind: 'question', rid: NOT_SURE_RID }, 'user')]
 }
 
 /** Enter in the field: generate only when the person typed a rationale. */
@@ -326,35 +645,129 @@ function onFieldKeydown(e) {
 async function generate() {
   const text = input.value.trim()
   if (loading.value) return
-  if (!text) {
-    if (!seedPresets().length) {
-      labels.value = []
-      source.value = ''
-      error.value = ''
-    }
+  if (!text) return
+
+  // Local gate: junk or a near-copy never reaches OpenAI. Can't-articulate
+  // stamps a fixed "not sure" chip instead of spending a prompt.
+  const verdict = assessReflection(text, lastGenerated.value)
+  if (!verdict.ok) {
+    error.value = verdict.message
+    errorCode.value = verdict.code || ''
+    return
+  }
+  if (verdict.preset) {
+    applyUnsureLabel()
+    lastGenerated.value = text
+    error.value = ''
+    errorCode.value = ''
+    editingId.value = null
+    notify()
+    if (props.completeOnGenerate) emit('complete')
     return
   }
 
   abortGenerate?.abort()
   abortGenerate = new AbortController()
   error.value = ''
+  errorCode.value = ''
   loading.value = true
   try {
-    const data = await generateRationaleLabels(text, props.target, { signal: abortGenerate.signal })
-    labels.value = data.labels.map((item) => toChip(item, 'ai'))
+    const data = await generateRationaleLabels(text, props.target, {
+      known: props.knownLabels,
+      previous: lastGenerated.value,
+      signal: abortGenerate.signal,
+    })
+
+    // The model points at an existing rationale with same_as instead of coining a near-duplicate.
+    // Those are proposals only — nothing merges until the person confirms it.
+    pendingMerges.value = data.labels
+      .filter((item) => item.sameAs)
+      .map((item) => ({
+        rid: item.sameAs,
+        kind: item.kind || '',
+        phrasing: item.phrasing || '',
+        existing: knownText(item.sameAs),
+        inPool: labels.value.some((label) => label.rid === item.sameAs),
+      }))
+      .filter((merge) => merge.existing)
+
+    // Each round appends to the pool; earlier labels and the current top 3 stay put.
+    const fresh = data.labels
+      .filter((item) => !item.sameAs)
+      .map((item) => toChip(item, 'ai'))
+      .filter((chip) => chip.text && !labels.value.some((item) => sameWording(item.text, chip.text)))
+    labels.value = [...labels.value, ...fresh]
     source.value = 'api'
+    lastGenerated.value = text
     editingId.value = null
-    setPinned([]) // nothing reaches the note until the person drags it up
     notify()
+    refreshAllUserEchoes()
     if (props.completeOnGenerate) emit('complete')
   } catch (err) {
     if (err?.code === 'cancelled') return
     error.value = err.message || "Couldn't generate labels. Try enter again."
+    errorCode.value = err?.code || ''
     emit('error', error.value)
     throw err
   } finally {
     loading.value = false
   }
+}
+
+function knownText(rid) {
+  return props.knownLabels.find((item) => item.ref === rid)?.text || ''
+}
+
+/** How many ideas / relations invoke this rationale. 2+ is what the chip badge reports. */
+function recurrence(label) {
+  return Number(props.ridOwners?.[label?.rid]) || 0
+}
+
+function labelPattern(label) {
+  return props.patternStats?.byRid?.[label?.rid] || null
+}
+
+function groupPatternHint(group) {
+  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
+  return pairPatternHint(group.members.length, stats)
+}
+
+function dropMerge(index) {
+  pendingMerges.value = pendingMerges.value.filter((_, i) => i !== index)
+}
+
+/**
+ * Confirmed reuse. The existing wording always survives; the AI's phrasing is filed as an
+ * occurrence so the merge stays auditable. Already in this pool = a repeat on the same idea,
+ * so it only bumps the count. Otherwise this idea joins an existing rationale.
+ */
+function acceptMerge(index) {
+  const merge = pendingMerges.value[index]
+  if (!merge) return
+  const occurrence = { at: new Date().toISOString(), phrasing: merge.phrasing }
+  const existing = labels.value.find((item) => item.rid === merge.rid)
+  if (existing) {
+    existing.count = (existing.count || 1) + 1
+    existing.occurrences = [...(existing.occurrences || []), occurrence]
+  } else {
+    const chip = toChip({ text: merge.existing, kind: merge.kind, rid: merge.rid }, 'ai')
+    chip.occurrences = [occurrence]
+    labels.value = [...labels.value, chip]
+  }
+  dropMerge(index)
+  notify()
+}
+
+/** Refused reuse: the AI's wording becomes its own rationale with its own identity. */
+function rejectMerge(index) {
+  const merge = pendingMerges.value[index]
+  if (!merge) return
+  const text = merge.phrasing || merge.existing
+  if (text && !labels.value.some((item) => sameWording(item.text, text))) {
+    labels.value = [...labels.value, toChip({ text, kind: merge.kind }, 'ai')]
+  }
+  dropMerge(index)
+  notify()
 }
 
 function startEdit(label, zone = 'pool') {
@@ -370,12 +783,60 @@ function startEdit(label, zone = 'pool') {
 }
 
 function onDraftInput(e) {
-  draft.value = clipWords(e.target.value)
+  draft.value = clipUserLabel(e.target.value)
 }
+
+function clearShortSuggest() {
+  shortSuggest.value = ''
+  shortFor.value = ''
+}
+
+function acceptShortSuggest() {
+  if (!shortSuggest.value || !editingId.value) return
+  draft.value = shortSuggest.value
+  shortSkip.add(shortSuggest.value)
+  clearShortSuggest()
+}
+
+function skipShortSuggest() {
+  if (shortFor.value) shortSkip.add(shortFor.value)
+  clearShortSuggest()
+}
+
+async function runShortSuggest(text) {
+  if (!editingId.value || text !== clipUserLabel(draft.value) || !needsShortLabel(text)) return
+  if (shortSkip.has(text)) return
+  shortAbort?.abort()
+  shortAbort = new AbortController()
+  try {
+    const suggestion = await suggestShortLabel(text, { signal: shortAbort.signal })
+    if (text !== clipUserLabel(draft.value) || !editingId.value) return
+    shortSuggest.value = suggestion
+    shortFor.value = suggestion ? text : ''
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+    clearShortSuggest()
+  }
+}
+
+watch(
+  () => (editingId.value ? clipUserLabel(draft.value) : ''),
+  (text) => {
+    window.clearTimeout(shortTimer)
+    shortAbort?.abort()
+    if (!needsShortLabel(text) || shortSkip.has(text)) {
+      clearShortSuggest()
+      return
+    }
+    shortTimer = window.setTimeout(() => {
+      runShortSuggest(text).catch(() => {})
+    }, SHORTEN_PAUSE_MS)
+  },
+)
 
 /** Any text change makes the label human-authored, which turns it yellow. */
 function applyEdit(id, rawText, allowDelete) {
-  const text = clipWords(rawText)
+  const text = clipUserLabel(rawText)
   const poolItem = labels.value.find((item) => item.id === id)
   const pinnedItem = currentPinned().find((item) => item.id === id)
   if (!text) {
@@ -389,6 +850,7 @@ function applyEdit(id, rawText, allowDelete) {
   if (poolItem) {
     poolItem.text = text
     poolItem.source = source
+    if (text !== previous) poolItem.embedding = null
   }
   if (pinnedItem) {
     setPinned(currentPinned().map((item) => (item.id === id ? { ...item, text, source } : item)))
@@ -401,7 +863,11 @@ function commitEdit(label) {
   editingId.value = null
   editingZone.value = null
   draft.value = ''
+  shortSuggest.value = ''
+  liveEmbedHits.value = {}
   notify()
+  const poolItem = labels.value.find((item) => item.id === label.id)
+  if (poolItem?.text) ensureIndexed([poolItem]).catch(() => {})
 }
 
 function removeLabel(label, e) {
@@ -412,6 +878,9 @@ function removeLabel(label, e) {
     draft.value = ''
   }
   labels.value = labels.value.filter((item) => item.id !== label.id)
+  echoByQuery.delete(label.id)
+  vectorIndex.remove(label.id)
+  paintEchoes()
   if (currentPinned().some((item) => item.id === label.id || item.text === label.text)) {
     setPinned(currentPinned().filter((item) => item.id !== label.id && item.text !== label.text))
   }
@@ -441,6 +910,7 @@ function startAdd() {
 
 function dismissError() {
   error.value = ''
+  errorCode.value = ''
 }
 
 function onAction() {
@@ -470,12 +940,27 @@ defineExpose({ generate, input, labels })
     <p v-if="loading" class="status">generating…</p>
     <div v-else-if="error" class="banner" role="alert">
       <p>{{ error }}</p>
-      <p class="banner-hint">press enter to try again</p>
+      <p class="banner-hint" v-if="errorCode !== 'not_distinguishable'">press enter to try again</p>
       <button type="button" class="btn tiny ghost" @click="dismissError">dismiss</button>
     </div>
 
-    <!-- Both label sections only exist once there is a reflection to label. -->
-    <template v-if="visibleLabels().length && !loading">
+    <!-- Reuse proposals: the AI thinks it just restated a rationale you already have. -->
+    <div v-for="(merge, i) in pendingMerges" :key="merge.rid" class="merge-ask">
+      <p class="merge-line">
+        <span class="merge-new">{{ merge.phrasing || 'this reason' }}</span>
+        looks like a repeat of
+        <span class="merge-old">{{ merge.existing }}</span>
+      </p>
+      <div class="merge-actions">
+        <button type="button" class="btn tiny" @click="acceptMerge(i)">
+          {{ merge.inPool ? 'same one' : 'use that label' }}
+        </button>
+        <button type="button" class="btn tiny ghost" @click="rejectMerge(i)">keep separate</button>
+      </div>
+    </div>
+
+    <!-- Both sections stay put across rounds; a new generate appends to the pool. -->
+    <template v-if="visibleLabels().length">
       <div class="section">
         <span class="section-label">top 3 chosen</span>
         <div
@@ -485,46 +970,60 @@ defineExpose({ generate, input, labels })
           @dragleave="onChosenDragLeave"
           @drop="onChosenDrop"
         >
-          <span
-            v-for="label in currentPinned()"
-            :key="label.id"
-            class="chip selected"
-            :class="{
-              ai: label.source === 'ai',
-              user: label.source === 'user',
-              editing: editingId === label.id && editingZone === 'chosen',
-              dragging: draggingId === label.id,
-            }"
-            :draggable="!(editingId === label.id && editingZone === 'chosen')"
-            title="click to edit · drag to re-rank · drag back down to take it off"
-            @dragstart="onDragStart($event, label, 'chosen')"
-            @dragover="onChosenChipDragOver($event, label)"
-            @dragend="onDragEnd"
+          <div
+            v-for="group in chosenGroups"
+            :key="group.id"
+            class="chip-pair"
+            :class="{ linked: group.members.length > 1 }"
           >
-            <input
-              v-if="editingId === label.id && editingZone === 'chosen'"
-              :id="`${idPrefix}-chosen-edit-${label.id}`"
-              class="chip-input"
-              :value="draft"
-              maxlength="96"
-              @input="onDraftInput"
-              @keydown="onEditKeydown($event, label)"
-              @blur="commitEdit(label)"
-            />
-            <button
-              v-else
-              type="button"
-              class="chip-text"
-              @click="startEdit(label, 'chosen')"
-            >{{ label.text }}</button>
-            <button
-              type="button"
-              class="chip-del"
-              title="Take off the note"
-              @mousedown.stop
-              @click.stop="unpin(label)"
-            >×</button>
-          </span>
+            <span
+              v-for="label in group.members"
+              :key="label.id"
+              class="chip selected"
+              :class="{
+                ai: label.source === 'ai',
+                user: label.source === 'user',
+                editing: editingId === label.id && editingZone === 'chosen',
+                dragging: draggingId === label.id,
+                echo: isEchoHit(label),
+              }"
+              :draggable="!(editingId === label.id && editingZone === 'chosen')"
+              :title="chipTitle(label)"
+              @dragstart="onDragStart($event, label, 'chosen')"
+              @dragover="onChosenChipDragOver($event, label)"
+              @dragend="onDragEnd"
+            >
+              <input
+                v-if="editingId === label.id && editingZone === 'chosen'"
+                :id="`${idPrefix}-chosen-edit-${label.id}`"
+                class="chip-input"
+                :value="draft"
+                :maxlength="MAX_USER_LABEL_CHARS"
+                @input="onDraftInput"
+                @keydown="onEditKeydown($event, label)"
+                @blur="commitEdit(label)"
+              />
+              <button
+                v-else
+                type="button"
+                class="chip-text"
+                @click="startEdit(label, 'chosen')"
+              >{{ label.text }}</button>
+              <span
+                v-if="recurrence(label) > 1"
+                class="chip-badge"
+                :title="`this rationale is behind ${recurrence(label)} ideas`"
+              >×{{ recurrence(label) }}</span>
+              <button
+                type="button"
+                class="chip-del"
+                title="Take off the note"
+                @mousedown.stop
+                @click.stop="unpin(label)"
+              >×</button>
+            </span>
+            <span v-if="groupPatternHint(group)" class="same-hint">{{ groupPatternHint(group) }}</span>
+          </div>
           <span v-if="!currentPinned().length" class="zone-empty">drag your top 3 here</span>
         </div>
         <span v-if="pinLimitHint" class="hint warn">3 already chosen — drag one out first</span>
@@ -534,49 +1033,64 @@ defineExpose({ generate, input, labels })
         <span class="section-label">all rationale labels</span>
         <span class="hint">drag to rank them, then drag your top 3 up · blue is generated by ai</span>
         <div class="zone pool" @dragover="onPoolDragOver" @drop="onPoolDrop">
-          <span
-            v-for="label in visibleLabels()"
-            :key="label.id"
-            class="chip"
-            :class="{
-              editing: editingId === label.id && editingZone === 'pool',
-              ai: label.source === 'ai',
-              user: label.source === 'user',
-              chosen: isPinned(label),
-              dragging: draggingId === label.id,
-            }"
-            :draggable="!(editingId === label.id && editingZone === 'pool')"
-            @dragstart="onDragStart($event, label, 'pool')"
-            @dragover="onPoolChipDragOver($event, label)"
-            @dragend="onDragEnd"
+          <div
+            v-for="group in poolGroups"
+            :key="group.id"
+            class="chip-pair"
+            :class="{ linked: group.members.length > 1 }"
           >
-            <input
-              v-if="editingId === label.id && editingZone === 'pool'"
-              :id="`${idPrefix}-pool-edit-${label.id}`"
-              class="chip-input"
-              :value="draft"
-              maxlength="96"
-              @input="onDraftInput"
-              @keydown="onEditKeydown($event, label)"
-              @blur="commitEdit(label)"
-            />
-            <button
-              v-else
-              type="button"
-              class="chip-text"
+            <span
+              v-for="label in group.members"
+              :key="label.id"
+              class="chip"
+              :class="{
+                editing: editingId === label.id && editingZone === 'pool',
+                ai: label.source === 'ai',
+                user: label.source === 'user',
+                chosen: isPinned(label),
+                dragging: draggingId === label.id,
+                echo: isEchoHit(label),
+              }"
+              :draggable="!(editingId === label.id && editingZone === 'pool')"
               :title="chipTitle(label)"
-              @click="startEdit(label)"
+              @dragstart="onDragStart($event, label, 'pool')"
+              @dragover="onPoolChipDragOver($event, label)"
+              @dragend="onDragEnd"
             >
-              {{ label.text || '…' }}
-            </button>
-            <button
-              type="button"
-              class="chip-del"
-              title="Delete label"
-              @mousedown.stop
-              @click.stop="removeLabel(label, $event)"
-            >×</button>
-          </span>
+              <input
+                v-if="editingId === label.id && editingZone === 'pool'"
+                :id="`${idPrefix}-pool-edit-${label.id}`"
+                class="chip-input"
+                :value="draft"
+                :maxlength="MAX_USER_LABEL_CHARS"
+                @input="onDraftInput"
+                @keydown="onEditKeydown($event, label)"
+                @blur="commitEdit(label)"
+              />
+              <button
+                v-else
+                type="button"
+                class="chip-text"
+                :title="chipTitle(label)"
+                @click="startEdit(label)"
+              >
+                {{ label.text || '…' }}
+              </button>
+              <span
+                v-if="recurrence(label) > 1"
+                class="chip-badge"
+                :title="`this rationale is behind ${recurrence(label)} ideas`"
+              >×{{ recurrence(label) }}</span>
+              <button
+                type="button"
+                class="chip-del"
+                title="Delete label"
+                @mousedown.stop
+                @click.stop="removeLabel(label, $event)"
+              >×</button>
+            </span>
+            <span v-if="groupPatternHint(group)" class="same-hint">{{ groupPatternHint(group) }}</span>
+          </div>
           <button
             type="button"
             class="add"
@@ -585,6 +1099,12 @@ defineExpose({ generate, input, labels })
           >
             +
           </button>
+        </div>
+        <span v-if="editingId && echoHint" class="hint echo-hint">{{ echoHint }}</span>
+        <div v-if="editingId && shortSuggest" class="shorten-ask">
+          <span class="shorten-text">{{ shortSuggest }}</span>
+          <button type="button" class="btn tiny" @mousedown.prevent="acceptShortSuggest">use</button>
+          <button type="button" class="btn tiny ghost" @mousedown.prevent="skipShortSuggest">keep mine</button>
         </div>
       </div>
     </template>
@@ -722,6 +1242,60 @@ textarea::placeholder {
   color: rgba(255, 255, 255, 0.35);
 }
 
+.merge-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.merge-line {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.merge-new,
+.merge-old {
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.merge-new {
+  background: rgba(147, 197, 253, 0.18);
+  color: #bfdbfe;
+}
+
+.merge-old {
+  background: rgba(147, 197, 253, 0.32);
+  color: #dbeafe;
+}
+
+.merge-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* Recurrence, not authorship: colour already says who wrote the label. */
+.chip-badge {
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: 2px;
+  padding: 0 4px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.22);
+  color: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  letter-spacing: 0.02em;
+}
+
 .section {
   display: flex;
   flex-direction: column;
@@ -771,6 +1345,28 @@ textarea::placeholder {
   color: rgba(252, 165, 165, 0.8);
 }
 
+.hint.echo-hint {
+  font-size: 10px;
+  line-height: 1.35;
+  letter-spacing: 0.02em;
+  color: #fbbf24;
+}
+
+.shorten-ask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.shorten-text {
+  max-width: 100%;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;
@@ -792,6 +1388,10 @@ textarea::placeholder {
   opacity: 0.4;
 }
 
+.chip.chosen.echo {
+  opacity: 1;
+}
+
 .chip.editing {
   cursor: text;
 }
@@ -804,6 +1404,50 @@ textarea::placeholder {
 .chip.user {
   background: rgba(253, 230, 138, 0.16);
   border-color: rgba(253, 230, 138, 0.48);
+}
+
+/* Existing match only: keep chip colour, pulse a ring in that same hue. */
+.chip.echo {
+  animation: echo-breathe 2.2s ease-in-out infinite;
+}
+
+.chip.ai.echo {
+  animation-name: echo-breathe-ai;
+}
+
+.chip.user.echo {
+  animation-name: echo-breathe-user;
+}
+
+@keyframes echo-breathe-ai {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(147, 197, 253, 0.95);
+  }
+}
+
+@keyframes echo-breathe-user {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(253, 230, 138, 0.95);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chip.ai.echo {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.85);
+  }
+  .chip.user.echo {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.85);
+  }
 }
 
 .chip.editing.ai {
@@ -828,6 +1472,33 @@ textarea::placeholder {
 
 .chip-text {
   cursor: text;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-align: left;
+  max-width: 180px;
+}
+
+.chip-pair {
+  display: contents;
+}
+
+.chip-pair.linked {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.same-hint {
+  flex-shrink: 0;
+  color: rgba(255, 255, 255, 0.38);
+  font-size: 10px;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
 .chip-del {

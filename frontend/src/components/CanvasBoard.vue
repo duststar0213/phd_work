@@ -5,6 +5,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
+import { patternStatsFromLabels } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
 import RationaleModule from './RationaleModule.vue'
@@ -467,6 +468,88 @@ function selectNote(id) {
   selectedConnId.value = null
 }
 
+/**
+ * A rid is a canvas-scoped rationale identity: two labels sharing one are the same
+ * reasoning, whichever note they sit on. Random so any module can mint one on its own.
+ */
+function newRid() {
+  return `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`
+}
+
+function withRids(labels) {
+  return (Array.isArray(labels) ? labels : []).map((item) =>
+    item?.rid ? item : { ...item, rid: newRid() },
+  )
+}
+
+/** Pins are snapshots of pool labels, so they inherit the pool's rid rather than a new one. */
+function linkPinRids(pins, pool) {
+  return (Array.isArray(pins) ? pins : []).map((pin) => {
+    if (pin?.rid) return pin
+    const match = pool.find((item) => item.id === pin?.id || item.text === pin?.text)
+    return { ...pin, rid: match?.rid || newRid() }
+  })
+}
+
+/** Canvas records written before rids existed still need one. */
+function hydrateRids(owner) {
+  owner.rationaleLabels = withRids(owner.rationaleLabels)
+  owner.abandonLabels = withRids(owner.abandonLabels)
+  owner.pinnedLabels = linkPinRids(owner.pinnedLabels, owner.rationaleLabels)
+  owner.abandonPinned = linkPinRids(owner.abandonPinned, owner.abandonLabels)
+  return owner
+}
+
+/** One entry per rationale identity — the list the model checks before coining a new label. */
+const labelInventory = computed(() => {
+  const byRid = new Map()
+  const add = (label) => {
+    const text = String(label?.text || '').trim()
+    if (!label?.rid || !text || byRid.has(label.rid)) return
+    byRid.set(label.rid, { ref: label.rid, text })
+  }
+  for (const note of notes.value) (note.rationaleLabels || []).forEach(add)
+  for (const conn of connections.value) (conn.rationaleLabels || []).forEach(add)
+  return [...byRid.values()]
+})
+
+/** How many distinct ideas / relations invoke each rationale; 2 or more is what the badge reports. */
+const ridOwners = computed(() => {
+  const owners = new Map()
+  const track = (key, labels) => {
+    for (const label of labels || []) {
+      if (!label?.rid) continue
+      if (!owners.has(label.rid)) owners.set(label.rid, new Set())
+      owners.get(label.rid).add(key)
+    }
+  }
+  for (const note of notes.value) track(`n${note.id}`, note.rationaleLabels)
+  for (const conn of connections.value) track(`c${conn.id}`, conn.rationaleLabels)
+  const counts = {}
+  for (const [rid, keys] of owners) counts[rid] = keys.size
+  return counts
+})
+
+/** Every rationale phrasing on the canvas — same note and other notes — for repeating patterns. */
+const canvasLabels = computed(() => {
+  const rows = []
+  for (const note of notes.value) {
+    for (const label of note.rationaleLabels || []) {
+      if (!String(label?.text || '').trim()) continue
+      rows.push({ id: label.id, rid: label.rid, text: label.text, owner: `n${note.id}` })
+    }
+  }
+  for (const conn of connections.value) {
+    for (const label of conn.rationaleLabels || []) {
+      if (!String(label?.text || '').trim()) continue
+      rows.push({ id: label.id, rid: label.rid, text: label.text, owner: `c${conn.id}` })
+    }
+  }
+  return rows
+})
+
+const patternStats = computed(() => patternStatsFromLabels(canvasLabels.value))
+
 /** Keep up to 3 labels attached to the side of a note. */
 function setPinnedLabels(id, pinned) {
   const note = notes.value.find((n) => n.id === id)
@@ -484,7 +567,7 @@ function updateLabels(id, labels) {
     .map((pin) => {
       const match = note.rationaleLabels.find((item) => item.id === pin.id)
       return match
-        ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source }
+        ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source, rid: match.rid }
         : pin
     })
     .filter((pin) => ids.has(pin.id))
@@ -733,7 +816,7 @@ function updateRelationLabels(id, labels) {
     .map((pin) => {
       const match = conn.rationaleLabels.find((item) => item.id === pin.id)
       return match
-        ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source }
+        ? { id: match.id, text: match.text, kind: match.kind || '', source: match.source, rid: match.rid }
         : pin
     })
     .filter((pin) => ids.has(pin.id))
@@ -938,9 +1021,9 @@ onMounted(async () => {
         loaded.width = loaded.frozenWidth ?? loaded.width
         loaded.height = loaded.frozenHeight ?? loaded.height
       }
-      return loaded
+      return hydrateRids(loaded)
     })
-    connections.value = (Array.isArray(data.connections) ? data.connections : []).map((c) => ({
+    connections.value = (Array.isArray(data.connections) ? data.connections : []).map((c) => hydrateRids({
       id: c.id,
       fromId: c.fromId,
       fromSide: c.fromSide,
@@ -1058,6 +1141,9 @@ onUnmounted(() => {
           <RelationMarker
             :connection="line"
             :open="Boolean(line.rationaleOpen)"
+            :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
             :selected="selectedConnId === line.id && !line.abandoned"
             :abandoned="Boolean(line.abandoned)"
             @open-rationale="openRelationRationale(line.id)"
@@ -1075,6 +1161,9 @@ onUnmounted(() => {
             :mag-outset="MAG_OUTSET"
             :drafting="!!draft"
             :draft-from-id="draft?.fromId ?? null"
+            :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
             @move="moveNote"
             @text-change="changeText"
             @select="selectNote"
@@ -1108,6 +1197,10 @@ onUnmounted(() => {
               :pinned="note.abandonPinned || []"
               :saved-input="note.abandonText || ''"
               :saved-labels="note.abandonLabels || []"
+              :known-labels="labelInventory"
+              :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
               :preset-labels="[presetAbandonLabel(note.id)]"
               placeholder="Tell me why abandon this idea…"
               action-label="just abandon it"
@@ -1136,6 +1229,10 @@ onUnmounted(() => {
               :pinned="note.pinnedLabels || []"
               :saved-input="note.rationaleText || ''"
               :saved-labels="note.rationaleLabels || []"
+              :known-labels="labelInventory"
+              :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
               @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
               @rationale-change="(payload) => updateRationale(note.id, payload)"
               @labels="() => logEvent('labels_generated', { noteId: note.id })"
@@ -1160,6 +1257,10 @@ onUnmounted(() => {
             :pinned="line.abandonPinned || []"
             :saved-input="line.abandonText || ''"
             :saved-labels="line.abandonLabels || []"
+            :known-labels="labelInventory"
+            :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
             :preset-labels="[presetAbandonLabel(`rel-${line.id}`)]"
             placeholder="Tell me why abandon this relation…"
             action-label="just abandon it"
@@ -1191,6 +1292,10 @@ onUnmounted(() => {
             :pinned="line.pinnedLabels || []"
             :saved-input="line.rationaleText || ''"
             :saved-labels="line.rationaleLabels || []"
+            :known-labels="labelInventory"
+            :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
             placeholder="Tell me about how they relates…"
             @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
             @rationale-change="(payload) => updateRelationRationale(line.id, payload)"
@@ -1223,6 +1328,7 @@ onUnmounted(() => {
           <polyline points="16 17 21 12 16 7" />
           <line x1="21" x2="9" y1="12" y2="12" />
         </svg>
+        <span class="btn-label">log-out</span>
       </button>
 
       <!-- FigJam-style tool well: sticky note only -->
@@ -1232,10 +1338,11 @@ onUnmounted(() => {
           type="button"
           class="tool-btn"
           :class="{ active: stickyActive }"
-          title="Sticky note (N)"
+          title="Create idea (N)"
           @click="toggleTool('sticky')"
         >
           <StickyNoteIcon :size="28" />
+          <span class="btn-label">create idea</span>
         </button>
       </div>
 
@@ -1337,7 +1444,6 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   width: max-content;
-  height: 56px;
   padding: 6px;
   background: #2c2c2c;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -1350,12 +1456,13 @@ onUnmounted(() => {
   position: absolute;
   top: 20px;
   right: 20px;
-  width: 40px;
-  height: 40px;
+  min-width: 52px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 0;
+  gap: 3px;
+  padding: 7px 8px 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
   background: #2c2c2c;
@@ -1371,18 +1478,28 @@ onUnmounted(() => {
 }
 
 .tool-btn {
-  width: 44px;
-  height: 44px;
+  min-width: 60px;
   border-radius: 8px;
   border: 1.5px solid transparent;
   background: transparent;
   cursor: pointer;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 4px;
   color: rgba(255, 255, 255, 0.7);
   transition: all 0.14s ease;
-  padding: 0;
+  padding: 7px 10px 6px;
+}
+
+.btn-label {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  color: inherit;
 }
 
 .tool-btn:hover {

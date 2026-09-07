@@ -7,6 +7,7 @@ From backend/:
 Writes (gitignored):
   data/export/all.json          full dump (canvas + events)
   data/export/notes.csv         one row per sticky note (Excel / Numbers)
+  data/export/rationales.csv    one row per rationale identity, with recurrence
   data/export/events.csv        process log
   data/export/by_email/*.json   one file per participant
 """
@@ -40,6 +41,16 @@ NOTE_FIELDS = [
     "connection_count",
 ]
 EVENT_FIELDS = ["email", "ts", "type", "payload"]
+RATIONALE_FIELDS = [
+    "email",
+    "rid",
+    "text",
+    "source",
+    "idea_count",  # distinct notes / relations invoking this rationale
+    "occurrence_count",  # times it resurfaced, including repeats on one idea
+    "owners",
+    "phrasings",  # wordings the AI proposed that were merged into this one
+]
 
 
 def safe_name(email: str) -> str:
@@ -97,6 +108,49 @@ def note_rows(people: list[dict]) -> list[dict]:
     return rows
 
 
+def rationale_rows(people: list[dict]) -> list[dict]:
+    """One row per rationale identity: what recurred, where, and in whose words."""
+    rows = []
+    for person in people:
+        canvas = person.get("canvas") or {}
+        by_rid: dict[str, dict] = {}
+        owners = [("note", item) for item in canvas.get("notes") or []]
+        owners += [("relation", item) for item in canvas.get("connections") or []]
+        for kind, owner in owners:
+            if not isinstance(owner, dict):
+                continue
+            key = f"{kind}:{owner.get('id', '')}"
+            for label in owner.get("rationaleLabels") or []:
+                if not isinstance(label, dict) or not label.get("rid"):
+                    continue
+                entry = by_rid.setdefault(
+                    label["rid"],
+                    {"text": "", "source": "", "owners": [], "occurrences": 0, "phrasings": []},
+                )
+                entry["text"] = entry["text"] or str(label.get("text") or "")
+                entry["source"] = entry["source"] or str(label.get("source") or "")
+                entry["owners"].append(key)
+                entry["occurrences"] += max(1, int(label.get("count") or 1))
+                for hit in label.get("occurrences") or []:
+                    phrasing = str((hit or {}).get("phrasing") or "").strip()
+                    if phrasing:
+                        entry["phrasings"].append(phrasing)
+        for rid, entry in by_rid.items():
+            rows.append(
+                {
+                    "email": person["email"],
+                    "rid": rid,
+                    "text": entry["text"],
+                    "source": entry["source"],
+                    "idea_count": len(set(entry["owners"])),
+                    "occurrence_count": entry["occurrences"],
+                    "owners": " | ".join(sorted(set(entry["owners"]))),
+                    "phrasings": " | ".join(entry["phrasings"]),
+                }
+            )
+    return rows
+
+
 def event_rows(people: list[dict]) -> list[dict]:
     rows = []
     for person in people:
@@ -133,6 +187,7 @@ def main() -> None:
     )
     write_csv(EXPORT_DIR / "notes.csv", note_rows(people), NOTE_FIELDS)
     write_csv(EXPORT_DIR / "events.csv", event_rows(people), EVENT_FIELDS)
+    write_csv(EXPORT_DIR / "rationales.csv", rationale_rows(people), RATIONALE_FIELDS)
     for person in people:
         name = safe_name(person.get("email") or "unknown")
         (by_email / f"{name}.json").write_text(
@@ -142,6 +197,7 @@ def main() -> None:
 
     print(f"{len(people)} participants → {EXPORT_DIR}")
     print(f"  notes table: {EXPORT_DIR / 'notes.csv'}")
+    print(f"  rationales:  {EXPORT_DIR / 'rationales.csv'}")
     print(f"  events log:  {EXPORT_DIR / 'events.csv'}")
     print(f"  full dump:   {EXPORT_DIR / 'all.json'}")
     print(f"  per person:  {by_email}")

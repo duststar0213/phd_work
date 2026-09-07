@@ -3,8 +3,24 @@
   sitting on the curve. Click + opens (or, if already open, adds a human tab).
 -->
 <script setup>
-import { computed, nextTick, ref } from 'vue'
-import { clipWords } from '../api/rationale'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import {
+  asVector,
+  cachedDraftVector,
+  clipUserLabel,
+  clusterSimilarLabels,
+  pairPatternHint,
+  embedTexts,
+  isSimilarLabel,
+  LIVE_EMBED_MS,
+  MAX_USER_LABEL_CHARS,
+  needsShortLabel,
+  SHORTEN_PAUSE_MS,
+  suggestShortLabel,
+  meaningHitsFromVectors,
+  readyForLiveEmbed,
+  rememberDraftVector,
+} from '../api/rationale'
 
 const MAX_PINNED = 3
 const GHOST_TAB = 'add your label'
@@ -14,7 +30,24 @@ const props = defineProps({
   open: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
   abandoned: { type: Boolean, default: false },
+  ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
+  patternStats: { type: Object, default: () => ({}) },
+  canvasLabels: { type: Array, default: () => [] },
 })
+
+/** How many ideas share this rationale. 2+ earns a badge on the tab. */
+function recurrence(label) {
+  return Number(props.ridOwners?.[label?.rid]) || 0
+}
+
+function labelPattern(label) {
+  return props.patternStats?.byRid?.[label?.rid] || null
+}
+
+function groupPatternHint(group) {
+  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
+  return pairPatternHint(group.members.length, stats)
+}
 
 const emit = defineEmits(['toggle-rationale', 'open-rationale', 'pin-change', 'labels-change'])
 
@@ -32,8 +65,162 @@ const allLabels = computed(() =>
   Array.isArray(props.connection.rationaleLabels) ? props.connection.rationaleLabels : [],
 )
 
+const liveCreateQuery = computed(() => {
+  if (creating.value) return String(createDraft.value || '').trim()
+  if (editingTabId.value) return String(tabDraft.value || '').trim()
+  return ''
+})
+
+const liveEchoIds = computed(() => {
+  const query = liveCreateQuery.value
+  const ids = new Set()
+  if (!query) return ids
+  for (const item of allLabels.value) {
+    if (!item.text) continue
+    if (editingTabId.value && item.id === editingTabId.value) continue
+    if (isSimilarLabel(query, item.text)) ids.add(item.id)
+  }
+  return ids
+})
+
+const liveCanvasEcho = computed(() => {
+  const query = liveCreateQuery.value
+  if (!query) return false
+  const owner = `c${props.connection.id}`
+  return (props.canvasLabels || []).some(
+    (item) => item?.text && item.owner !== owner && isSimilarLabel(query, item.text),
+  )
+})
+
+const liveEmbedHits = ref({})
+let liveEmbedTimer = 0
+let liveEmbedAbort = null
+const shortSuggest = ref('')
+const shortFor = ref('')
+const shortSkip = new Set()
+let shortTimer = 0
+let shortAbort = null
+
+function clearShortSuggest() {
+  shortSuggest.value = ''
+  shortFor.value = ''
+}
+
+function acceptShortSuggest() {
+  if (!shortSuggest.value) return
+  if (creating.value) createDraft.value = shortSuggest.value
+  else if (editingTabId.value) tabDraft.value = shortSuggest.value
+  shortSkip.add(shortSuggest.value)
+  clearShortSuggest()
+}
+
+function skipShortSuggest() {
+  if (shortFor.value) shortSkip.add(shortFor.value)
+  clearShortSuggest()
+}
+
+async function runShortSuggest(text) {
+  if (text !== liveCreateQuery.value || !needsShortLabel(text) || shortSkip.has(text)) return
+  shortAbort?.abort()
+  shortAbort = new AbortController()
+  try {
+    const suggestion = await suggestShortLabel(text, { signal: shortAbort.signal })
+    if (text !== liveCreateQuery.value) return
+    shortSuggest.value = suggestion
+    shortFor.value = suggestion ? text : ''
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+    clearShortSuggest()
+  }
+}
+
+watch(liveCreateQuery, (text) => {
+  window.clearTimeout(shortTimer)
+  shortAbort?.abort()
+  if (!needsShortLabel(text) || shortSkip.has(text)) {
+    clearShortSuggest()
+    return
+  }
+  shortTimer = window.setTimeout(() => {
+    runShortSuggest(text).catch(() => {})
+  }, SHORTEN_PAUSE_MS)
+})
+
+const liveEchoHint = computed(() => {
+  if (allLabels.value.some((item) => item.text && (liveEchoIds.value.has(item.id) || liveEmbedHits.value[item.id]))) {
+    return 'close to an existing label'
+  }
+  return liveCanvasEcho.value ? 'this pattern already appears on another idea' : ''
+})
+
+function isTabEcho(label) {
+  return Boolean(liveEchoIds.value.has(label.id) || liveEmbedHits.value[label.id])
+}
+
+const tabGroups = computed(() => clusterSimilarLabels(pinnedLabels.value))
+
+function applyLiveEmbedHits(vec) {
+  const hits = {}
+  for (const item of meaningHitsFromVectors(vec, allLabels.value, { excludeId: editingTabId.value })) {
+    hits[item.id] = true
+  }
+  liveEmbedHits.value = hits
+}
+
+async function runLiveEmbed(query) {
+  if (query !== liveCreateQuery.value || !readyForLiveEmbed(query)) return
+  liveEmbedAbort?.abort()
+  liveEmbedAbort = new AbortController()
+  const { signal } = liveEmbedAbort
+  try {
+    const missing = allLabels.value.filter((item) => item.text && !asVector(item.embedding))
+    if (missing.length) {
+      const byText = await embedTexts(missing.map((item) => item.text), { signal })
+      const next = allLabels.value.map((item) => {
+        const vec = byText.get(item.text)
+        return vec && !asVector(item.embedding) ? { ...item, embedding: vec } : item
+      })
+      if (next.some((item, i) => item !== allLabels.value[i])) setLabels(next)
+    }
+    let vec = cachedDraftVector(query)
+    if (!vec) {
+      const byText = await embedTexts([query], { signal })
+      vec = byText.get(query)
+      if (vec) rememberDraftVector(query, vec)
+    }
+    if (!vec || query !== liveCreateQuery.value) return
+    applyLiveEmbedHits(vec)
+  } catch (err) {
+    if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+  }
+}
+
+watch(liveCreateQuery, (query) => {
+  window.clearTimeout(liveEmbedTimer)
+  liveEmbedAbort?.abort()
+  if (!readyForLiveEmbed(query)) {
+    liveEmbedHits.value = {}
+    return
+  }
+  const cached = cachedDraftVector(query)
+  if (cached) {
+    applyLiveEmbedHits(cached)
+    return
+  }
+  liveEmbedTimer = window.setTimeout(() => {
+    runLiveEmbed(query).catch(() => {})
+  }, LIVE_EMBED_MS)
+})
+
+onUnmounted(() => {
+  liveEmbedAbort?.abort()
+  window.clearTimeout(liveEmbedTimer)
+  shortAbort?.abort()
+  window.clearTimeout(shortTimer)
+})
+
 function pinSnapshot(label) {
-  return { id: label.id, text: label.text, kind: label.kind || '', source: label.source }
+  return { id: label.id, text: label.text, kind: label.kind || '', source: label.source, rid: label.rid }
 }
 
 function setPinned(next) {
@@ -67,14 +254,16 @@ function startTabEdit(label) {
 }
 
 function onTabDraftInput(e) {
-  tabDraft.value = clipWords(e.target.value)
+  tabDraft.value = clipUserLabel(e.target.value)
 }
 
 function commitTabEdit(label) {
   if (editingTabId.value !== label.id) return
-  const text = clipWords(tabDraft.value)
+  const text = clipUserLabel(tabDraft.value)
   editingTabId.value = null
   tabDraft.value = ''
+  liveEmbedHits.value = {}
+  clearShortSuggest()
   if (!text || text === label.text) return
   setPinned(
     pinnedLabels.value.map((item) => (item.id === label.id ? { ...item, text, source: 'user' } : item)),
@@ -118,14 +307,16 @@ function beginCreateTab() {
 }
 
 function onCreateInput(e) {
-  createDraft.value = clipWords(e.target.value)
+  createDraft.value = clipUserLabel(e.target.value)
 }
 
 function commitCreate() {
   if (!creating.value) return
-  const text = clipWords(createDraft.value)
+  const text = clipUserLabel(createDraft.value)
   creating.value = false
   createDraft.value = ''
+  liveEmbedHits.value = {}
+  clearShortSuggest()
   if (!text) return
   const chip = { id: nextLabelId(), text, kind: '', source: 'user' }
   setLabels([...allLabels.value, chip])
@@ -158,40 +349,54 @@ function onCreateKeydown(e) {
     @mousedown.stop
     @click.stop
   >
-    <div v-if="pinnedLabels.length" class="tab-stack">
-      <span
-        v-for="label in pinnedLabels"
-        :key="label.id"
-        class="edge-tab"
-        :class="label.source === 'user' ? 'user' : 'ai'"
+    <div v-if="tabGroups.length" class="tab-stack">
+      <div
+        v-for="group in tabGroups"
+        :key="group.id"
+        class="tab-pair"
+        :class="{ linked: group.members.length > 1 }"
       >
-        <input
-          v-if="editingTabId === label.id"
-          :id="`rel-tab-edit-${connection.id}-${label.id}`"
-          class="tab-input"
-          :value="tabDraft"
-          maxlength="96"
-          @input="onTabDraftInput"
-          @keydown="onTabEditKeydown($event, label)"
-          @blur="commitTabEdit(label)"
-          @click.stop
-        />
         <span
-          v-else
-          class="tab-label"
-          title="Click to edit"
-          @click.stop="startTabEdit(label)"
-        >{{ label.text }}</span>
-        <button
-          v-if="!abandoned"
-          type="button"
-          class="tab-del"
-          title="Take off the line"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop="unpinLabel(label, $event)"
-        >×</button>
-      </span>
+          v-for="label in group.members"
+          :key="label.id"
+          class="edge-tab"
+          :class="[label.source === 'user' ? 'user' : 'ai', { echo: isTabEcho(label) }]"
+          :title="isTabEcho(label) ? 'close to an existing label' : undefined"
+        >
+          <input
+            v-if="editingTabId === label.id"
+            :id="`rel-tab-edit-${connection.id}-${label.id}`"
+            class="tab-input"
+            :value="tabDraft"
+            :maxlength="MAX_USER_LABEL_CHARS"
+            @input="onTabDraftInput"
+            @keydown="onTabEditKeydown($event, label)"
+            @blur="commitTabEdit(label)"
+            @click.stop
+          />
+          <span
+            v-else
+            class="tab-label"
+            title="Click to edit"
+            @click.stop="startTabEdit(label)"
+          >{{ label.text }}</span>
+          <span
+            v-if="recurrence(label) > 1"
+            class="tab-badge"
+            :title="`this rationale is behind ${recurrence(label)} ideas`"
+          >×{{ recurrence(label) }}</span>
+          <button
+            v-if="!abandoned"
+            type="button"
+            class="tab-del"
+            title="Take off the line"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="unpinLabel(label, $event)"
+          >×</button>
+        </span>
+        <span v-if="groupPatternHint(group)" class="tab-same-hint">{{ groupPatternHint(group) }}</span>
+      </div>
     </div>
     <button
       v-if="open && !abandoned"
@@ -215,7 +420,7 @@ function onCreateKeydown(e) {
           :id="`rel-tab-new-${connection.id}`"
           class="tab-input"
           :value="createDraft"
-          maxlength="96"
+          :maxlength="MAX_USER_LABEL_CHARS"
           placeholder="rationale label of this link"
           @input="onCreateInput"
           @keydown="onCreateKeydown"
@@ -223,6 +428,12 @@ function onCreateKeydown(e) {
           @click.stop
         />
       </span>
+      <span v-if="liveEchoHint" class="tab-echo-hint">{{ liveEchoHint }}</span>
+      <div v-if="shortSuggest" class="tab-shorten">
+        <span>{{ shortSuggest }}</span>
+        <button type="button" @mousedown.prevent="acceptShortSuggest">use</button>
+        <button type="button" @mousedown.prevent="skipShortSuggest">keep mine</button>
+      </div>
       <span v-else-if="addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
       <button
         type="button"
@@ -291,6 +502,49 @@ function onCreateKeydown(e) {
   color: #5b4a12;
 }
 
+.edge-tab.echo {
+  animation: echo-breathe 2.2s ease-in-out infinite;
+}
+
+.edge-tab.ai.echo {
+  animation-name: echo-breathe-ai;
+}
+
+.edge-tab.user.echo {
+  animation-name: echo-breathe-user;
+}
+
+@keyframes echo-breathe-ai {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(147, 197, 253, 0.95);
+  }
+}
+
+@keyframes echo-breathe-user {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(253, 230, 138, 0.95);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .edge-tab.ai.echo {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.9);
+  }
+  .edge-tab.user.echo {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(253, 230, 138, 0.9);
+  }
+}
+
 .edge-tab.ghost {
   position: absolute;
   left: calc(100% + 6px);
@@ -340,6 +594,40 @@ function onCreateKeydown(e) {
   min-width: 0;
   flex: 1;
   cursor: text;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.tab-pair {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 2px;
+  width: max-content;
+}
+
+.tab-same-hint {
+  max-width: 92px;
+  padding: 0 4px;
+  color: rgba(255, 255, 255, 0.5);
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 8px;
+  line-height: 1.2;
+}
+
+/* Recurrence, not authorship: the tab colour already says who wrote it. */
+.tab-badge {
+  flex-shrink: 0;
+  align-self: center;
+  padding: 0 3px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.22);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 12px;
 }
 
 .tab-del {
@@ -367,6 +655,48 @@ function onCreateKeydown(e) {
   position: relative;
   display: flex;
   align-items: center;
+}
+
+.tab-shorten {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: calc(50% + 16px);
+  z-index: 4;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  width: max-content;
+  max-width: 200px;
+  color: #78716c;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.tab-shorten button {
+  padding: 0 4px;
+  border: 0;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.55);
+  color: #44403c;
+  cursor: pointer;
+  font: inherit;
+}
+
+.tab-echo-hint {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  z-index: 4;
+  width: max-content;
+  max-width: 180px;
+  transform: translateY(-50%);
+  color: #ca8a04;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+  pointer-events: none;
 }
 
 .edge-fold,
