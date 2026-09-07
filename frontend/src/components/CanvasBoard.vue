@@ -5,13 +5,14 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
-import { patternStatsFromLabels, embedTexts, cosine, asVector } from '../api/rationale'
+import { patternStatsFromLabels, embedTexts, cosine, asVector, suggestLinks } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
 import SearchIcon from './SearchIcon.vue'
 import RationaleModule from './RationaleModule.vue'
 import RelationMarker from './RelationMarker.vue'
-import { SEARCH_TEST_PACKS } from '../data/searchTestPacks'
+import { SEARCH_TEST_PACKS, SEARCH_TEST_TOPIC } from '../data/searchTestPacks'
+import { createCanvasHistory } from '../history'
 
 const props = defineProps({
   username: { type: String, default: '' },
@@ -140,7 +141,21 @@ const searchVecCache = new Map() // blob -> vector; one embed per unique note te
 const isDev = import.meta.env.DEV
 const searchTestHint = ref('')
 const clearArmed = ref(false)
+const canUndo = ref(false)
+const canRedo = ref(false)
+const historyEpoch = ref(0)
+const history = createCanvasHistory({
+  onChange(undoable, redoable) {
+    canUndo.value = undoable
+    canRedo.value = redoable
+  },
+})
+const suggestSourceId = ref(null)
+const suggestedLinks = ref([]) // [{ key, fromId, fromSide, toId, toSide, why, picked }]
+const suggestLoading = ref(false)
+const suggestError = ref('')
 let searchTestPackCursor = 0
+let suggestAbort = null
 
 let nextId = 1
 let nextConnId = 1
@@ -231,6 +246,21 @@ const draftPath = computed(() => {
   return connectorPath(from.x, from.y, draft.value.fromSide, draft.value.x, draft.value.y, 'left')
 })
 
+const renderedSuggestions = computed(() =>
+  suggestedLinks.value.map((link) => {
+    const from = magPos(link.fromId, link.fromSide)
+    const to = magPos(link.toId, link.toSide)
+    return {
+      ...link,
+      d: connectorPath(from.x, from.y, link.fromSide, to.x, to.y, link.toSide),
+      mid: connectorPoint(from.x, from.y, link.fromSide, to.x, to.y, link.toSide, 0.5),
+    }
+  }),
+)
+
+const suggestPickedCount = computed(() => suggestedLinks.value.filter((link) => link.picked).length)
+const suggestTargetIds = computed(() => new Set(suggestedLinks.value.map((link) => link.toId)))
+
 const searchHitIds = computed(() => new Set(searchHits.value.map((item) => item.id)))
 const searchPickedIds = computed(() => new Set(searchPicked.value))
 const searchDimActive = computed(() => searchHits.value.length > 0)
@@ -285,9 +315,155 @@ function closeSearch() {
   searchTestHint.value = ''
 }
 
+function clearSuggestions() {
+  suggestAbort?.abort()
+  suggestAbort = null
+  suggestSourceId.value = null
+  suggestedLinks.value = []
+  suggestLoading.value = false
+  suggestError.value = ''
+}
+
+function noteSuggestPayload(note) {
+  return {
+    id: String(note.id),
+    text: String(note.text || '').trim().slice(0, 2000),
+    labels: (note.pinnedLabels || [])
+      .map((item) => String(item?.text || '').trim())
+      .filter(Boolean)
+      .slice(0, 3),
+  }
+}
+
+function alreadyLinked(a, b) {
+  return connections.value.some(
+    (c) =>
+      !isRelationAbandoned(c) &&
+      ((c.fromId === a && c.toId === b) || (c.fromId === b && c.toId === a)),
+  )
+}
+
+/** Pick mag-point sides so a suggested curve leaves toward the other note. */
+function pickConnectSides(fromNote, toNote) {
+  const from = noteSize(fromNote)
+  const to = noteSize(toNote)
+  const dx = toNote.x + to.width / 2 - (fromNote.x + from.width / 2)
+  const dy = toNote.y + to.height / 2 - (fromNote.y + from.height / 2)
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0 ? ['right', 'left'] : ['left', 'right']
+  }
+  return dy >= 0 ? ['bottom', 'top'] : ['top', 'bottom']
+}
+
+async function suggestRelations(id) {
+  const source = notes.value.find((n) => n.id === id)
+  if (!source || isNoteFrozen(source)) return
+  const payload = noteSuggestPayload(source)
+  if (!payload.text && !payload.labels.length) {
+    suggestSourceId.value = id
+    suggestedLinks.value = []
+    suggestError.value = 'write an idea or pin a label first'
+    return
+  }
+  const candidates = notes.value.filter(
+    (note) =>
+      note.id !== id &&
+      !isAbandoned(note) &&
+      !note.abandonOpen &&
+      !alreadyLinked(id, note.id) &&
+      (String(note.text || '').trim() || (note.pinnedLabels || []).some((item) => String(item?.text || '').trim())),
+  )
+  if (!candidates.length) {
+    suggestSourceId.value = id
+    suggestedLinks.value = []
+    suggestError.value = 'no other ideas to link yet'
+    return
+  }
+
+  suggestAbort?.abort()
+  suggestAbort = new AbortController()
+  const signal = suggestAbort.signal
+  suggestSourceId.value = id
+  suggestedLinks.value = []
+  suggestError.value = ''
+  suggestLoading.value = true
+  selectedId.value = id
+  selectedConnId.value = null
+  logEvent('suggest_relations', { noteId: id, candidates: candidates.length }).catch(() => {})
+
+  try {
+    const result = await suggestLinks(
+      payload,
+      candidates.slice(0, 40).map(noteSuggestPayload),
+      { signal },
+    )
+    if (signal.aborted) return
+    const byId = new Map(candidates.map((note) => [String(note.id), note]))
+    suggestedLinks.value = result.links
+      .map((link) => {
+        const target = byId.get(String(link.id))
+        if (!target) return null
+        const [fromSide, toSide] = pickConnectSides(source, target)
+        return {
+          key: `${id}-${target.id}`,
+          fromId: id,
+          fromSide,
+          toId: target.id,
+          toSide,
+          why: link.why || 'related ideas',
+          picked: false,
+        }
+      })
+      .filter(Boolean)
+    if (!suggestedLinks.value.length) {
+      suggestError.value = 'no close relations from this idea and its labels'
+    }
+  } catch (err) {
+    if (signal.aborted || err?.code === 'cancelled') return
+    suggestError.value = err?.message || "couldn't suggest relations"
+  } finally {
+    if (!signal.aborted) suggestLoading.value = false
+  }
+}
+
+function toggleSuggestedLink(key) {
+  suggestedLinks.value = suggestedLinks.value.map((link) =>
+    link.key === key ? { ...link, picked: !link.picked } : link,
+  )
+}
+
+function keepSuggestedLinks() {
+  const source = notes.value.find((n) => n.id === suggestSourceId.value)
+  const picked = suggestedLinks.value.filter((link) => link.picked)
+  if (!source || !picked.length) return
+  const additions = []
+  for (const link of picked) {
+    const target = notes.value.find((n) => n.id === link.toId)
+    if (!target || isNoteFrozen(target) || alreadyLinked(link.fromId, link.toId)) continue
+    additions.push({
+      id: nextConnId++,
+      fromId: link.fromId,
+      fromSide: link.fromSide,
+      toId: link.toId,
+      toSide: link.toSide,
+      ...emptyRelation(),
+      rationaleText: link.why || '',
+    })
+  }
+  if (additions.length) {
+    connections.value = [...connections.value, ...additions]
+    logEvent('suggest_relations_kept', {
+      noteId: source.id,
+      kept: additions.map((item) => item.toId),
+    }).catch(() => {})
+  }
+  clearSuggestions()
+}
+
 function clearBoard() {
   clearArmed.value = false
   closeSearch()
+  clearSuggestions()
   clearConnectDrag()
   notes.value = []
   connections.value = []
@@ -332,41 +508,110 @@ function samplePoolLabels(pins) {
     }))
 }
 
-/** DEV only: append the next sample pack. Search still embeds whatever is live. */
+function noteBox(note) {
+  return {
+    x: note.x,
+    y: note.y,
+    w: note.width ?? 168,
+    h: note.height ?? 168,
+  }
+}
+
+function boxesOverlap(a, b, gap) {
+  return !(a.x + a.w + gap < b.x || b.x + b.w + gap < a.x || a.y + a.h + gap < b.y || b.y + b.h + gap < a.y)
+}
+
+/** New sample cluster sits beside existing notes, never on a tidy grid. */
+function sampleClusterOrigin() {
+  const s = scale.value || 1
+  if (!notes.value.length) {
+    return {
+      x: (BOARD_PAD - panRef.x) / s + 36 + Math.random() * 90,
+      y: (BOARD_PAD - panRef.y) / s + 48 + Math.random() * 70,
+    }
+  }
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const note of notes.value) {
+    const box = noteBox(note)
+    minX = Math.min(minX, box.x)
+    minY = Math.min(minY, box.y)
+    maxX = Math.max(maxX, box.x + box.w)
+    maxY = Math.max(maxY, box.y + box.h)
+  }
+  if (Math.random() < 0.55) {
+    return { x: maxX + 80 + Math.random() * 90, y: minY + Math.random() * 140 }
+  }
+  return { x: minX + Math.random() * 160, y: maxY + 80 + Math.random() * 90 }
+}
+
+function placeSampleNotes(count) {
+  const gap = 56
+  const occupied = notes.value.map(noteBox)
+  const origin = sampleClusterOrigin()
+  const gold = Math.PI * (3 - Math.sqrt(5))
+  const slots = []
+  for (let i = 0; i < count; i++) {
+    const w = 176 + Math.round(Math.random() * 40)
+    const h = 150 + Math.round(Math.random() * 36)
+    let slot = null
+    for (let attempt = 0; attempt < 70; attempt++) {
+      const k = i + attempt * 0.19
+      const radius = 54 + Math.sqrt(k + 1) * (88 + Math.random() * 46)
+      const angle = k * gold + (Math.random() - 0.5) * 0.9
+      const next = {
+        x: origin.x + Math.cos(angle) * radius + (Math.random() - 0.5) * 56,
+        y: origin.y + Math.sin(angle) * radius * 0.7 + (Math.random() - 0.5) * 48,
+        w,
+        h,
+      }
+      const hit = occupied.concat(slots).some((box) => boxesOverlap(next, box, gap))
+      if (!hit) {
+        slot = next
+        break
+      }
+    }
+    if (!slot) {
+      const right = occupied.concat(slots).reduce((max, box) => Math.max(max, box.x + box.w), origin.x)
+      slot = { x: right + gap + Math.random() * 24, y: origin.y + (Math.random() - 0.5) * 110, w, h }
+    }
+    slots.push(slot)
+  }
+  return slots
+}
+
+/** DEV only: append the next sample pack. Loose scatter, no overlap with what is already there. */
 function addSearchTestPack() {
   if (!isDev || !SEARCH_TEST_PACKS.length) return
   const pack = SEARCH_TEST_PACKS[searchTestPackCursor % SEARCH_TEST_PACKS.length]
   searchTestPackCursor += 1
-  const s = scale.value
-  const originX = (BOARD_PAD - panRef.x) / s
-  const originY = (BOARD_PAD - panRef.y) / s
-  const cols = 4
-  const cellW = 220
-  const cellH = 200
-  const offset = notes.value.length
+  const slots = placeSampleNotes(pack.ideas.length)
   for (const [i, idea] of pack.ideas.entries()) {
     const id = nextId++
-    const col = (offset + i) % cols
-    const row = Math.floor((offset + i) / cols)
+    const slot = slots[i]
+    const pool = samplePoolLabels(idea.pins)
+    const pinned = idea.pinTop ? pool.slice(0, Math.min(2, pool.length)).map((item) => ({ ...item })) : []
     notes.value.push(
       hydrateRids({
         id,
-        x: originX + col * cellW + ((offset + i) % 3) * 10,
-        y: originY + row * cellH + ((offset + i) % 2) * 12,
+        x: slot.x,
+        y: slot.y,
         text: idea.text,
-        color: NOTE_COLORS[(id - 1) % NOTE_COLORS.length],
-        width: 200,
-        height: 168,
+        color: NOTE_COLORS[(id + Math.floor(Math.random() * NOTE_COLORS.length)) % NOTE_COLORS.length],
+        width: slot.w,
+        height: slot.h,
         ...emptyNoteMeta(),
         rationaleOpen: false,
         rationaleText: idea.rationale || '',
-        rationaleLabels: samplePoolLabels(idea.pins),
-        pinnedLabels: [],
+        rationaleLabels: pool,
+        pinnedLabels: pinned,
       }),
     )
   }
-  searchTestHint.value = `added “${pack.id}” (${pack.ideas.length}) · try “${pack.tryQuery}”, then add another pack and search again`
-  logEvent('search_test_pack', { pack: pack.id, added: pack.ideas.length, total: notes.value.length }).catch(() => {})
+  searchTestHint.value = `test samples · ${SEARCH_TEST_TOPIC} · added “${pack.id}” (${pack.ideas.length})`
+  logEvent('search_test_pack', { pack: pack.id, topic: SEARCH_TEST_TOPIC, added: pack.ideas.length, total: notes.value.length }).catch(() => {})
 }
 
 function toggleSearch() {
@@ -1059,8 +1304,59 @@ function isTypingTarget(el) {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
 }
 
-/** Esc: drop draft, then cancel tool / deselect. N: toggle sticky tool. */
+function historyState() {
+  return {
+    notes: notes.value,
+    connections: connections.value,
+    nextId,
+    nextConnId,
+  }
+}
+
+function applyHistory(snap) {
+  notes.value = Array.isArray(snap.notes) ? snap.notes : []
+  connections.value = Array.isArray(snap.connections) ? snap.connections : []
+  nextId = Number(snap.nextId) > 0 ? Number(snap.nextId) : 1
+  nextConnId = Number(snap.nextConnId) > 0 ? Number(snap.nextConnId) : 1
+  if (!notes.value.some((n) => n.id === selectedId.value)) selectedId.value = null
+  if (!connections.value.some((c) => c.id === selectedConnId.value)) selectedConnId.value = null
+  draft.value = null
+  metrics.value = {}
+  historyEpoch.value += 1
+  searchVecCache.clear()
+}
+
+function undoCanvas() {
+  history.undo(historyState, applyHistory)
+}
+
+function redoCanvas() {
+  history.redo(historyState, applyHistory)
+}
+
+function onHistoryPointerDown() {
+  history.pointerDown()
+}
+
+function onHistoryPointerUp() {
+  history.pointerUp()
+}
+
+function isUndoRedoKey(e) {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return false
+  const key = String(e.key || '').toLowerCase()
+  return key === 'z' || key === 'y'
+}
+
+/** Esc: drop draft, then cancel tool / deselect. N: toggle sticky tool. ⌘Z / ⌘⇧Z undo/redo even while typing. */
 function onKeydown(e) {
+  if (isUndoRedoKey(e)) {
+    e.preventDefault()
+    const key = String(e.key || '').toLowerCase()
+    if (key === 'y' || (key === 'z' && e.shiftKey)) redoCanvas()
+    else undoCanvas()
+    return
+  }
   const typing = isTypingTarget(e.target)
   if (e.key === 'Escape') {
     if (clearArmed.value) {
@@ -1069,6 +1365,10 @@ function onKeydown(e) {
     }
     if (searchOpen.value) {
       closeSearch()
+      return
+    }
+    if (suggestedLinks.value.length || suggestLoading.value || suggestError.value) {
+      clearSuggestions()
       return
     }
     if (draft.value) {
@@ -1176,9 +1476,12 @@ async function signOut() {
   emit('signed-out')
 }
 
-/** Register / drop keyboard shortcuts (N, Esc). Load this participant's canvas. */
+/** Register / drop keyboard shortcuts (N, Esc, undo). Load this participant's canvas. */
 onMounted(async () => {
-  window.addEventListener('keydown', onKeydown)
+  window.addEventListener('keydown', onKeydown, true)
+  window.addEventListener('pointerdown', onHistoryPointerDown, true)
+  window.addEventListener('pointerup', onHistoryPointerUp, true)
+  window.addEventListener('pointercancel', onHistoryPointerUp, true)
   wheelTarget = canvasRef.value
   wheelTarget?.addEventListener('wheel', onWheel, { passive: false })
   try {
@@ -1241,20 +1544,32 @@ onMounted(async () => {
     notes.value = []
   }
   loaded = true
+  history.seed(historyState())
+  history.setReady(true)
   await nextTick()
   window.addEventListener('resize', onWindowResize)
-  watch(notes, scheduleSave, { deep: true })
-  watch(connections, scheduleSave, { deep: true })
+  watch(
+    [notes, connections],
+    () => {
+      scheduleSave()
+      history.noteChange(historyState())
+    },
+    { deep: true },
+  )
   watch(pan, scheduleSave, { deep: true })
 })
 
 onUnmounted(() => {
-  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('keydown', onKeydown, true)
+  window.removeEventListener('pointerdown', onHistoryPointerDown, true)
+  window.removeEventListener('pointerup', onHistoryPointerUp, true)
+  window.removeEventListener('pointercancel', onHistoryPointerUp, true)
   window.removeEventListener('resize', onWindowResize)
   wheelTarget?.removeEventListener('wheel', onWheel)
   wheelTarget = null
   clearConnectDrag()
   clearTimeout(saveTimer)
+  suggestAbort?.abort()
 })
 </script>
 
@@ -1317,6 +1632,27 @@ onUnmounted(() => {
             stroke-linecap="round"
             stroke-dasharray="6 5"
           />
+          <g v-for="line in renderedSuggestions" :key="`sug-${line.key}`">
+            <path
+              class="connector-hit suggest-hit"
+              :d="line.d"
+              fill="none"
+              stroke="transparent"
+              stroke-width="18"
+              stroke-linecap="round"
+              @mousedown.stop.prevent="toggleSuggestedLink(line.key)"
+            />
+            <path
+              class="suggest-line"
+              :class="{ picked: line.picked }"
+              :d="line.d"
+              fill="none"
+              :stroke="line.picked ? '#2563eb' : '#b45309'"
+              :stroke-width="line.picked ? 3 : 2.5"
+              stroke-linecap="round"
+              :stroke-dasharray="line.picked ? '9 5' : '7 6'"
+            />
+          </g>
         </svg>
         <div
           v-for="line in renderedConnections"
@@ -1346,6 +1682,29 @@ onUnmounted(() => {
             @labels-change="(labels) => updateRelationLabels(line.id, labels)"
           />
         </div>
+        <div
+          v-for="line in renderedSuggestions"
+          :key="`sug-chip-${line.key}`"
+          class="suggest-wrap"
+          :style="{
+            left: `${line.mid.x}px`,
+            top: `${line.mid.y}px`,
+            zIndex: 24,
+          }"
+          @pointerdown.stop
+          @mousedown.stop
+        >
+          <button
+            type="button"
+            class="suggest-pick"
+            :class="{ on: line.picked }"
+            :title="line.picked ? 'Unselect this suggested link' : 'Select this suggested link'"
+            @click.stop="toggleSuggestedLink(line.key)"
+          >
+            <span class="suggest-check" :class="{ on: line.picked }" />
+            <span class="suggest-why">{{ line.why }}</span>
+          </button>
+        </div>
         <template v-for="note in notes" :key="note.id">
           <StickyNoteCard
             :note="note"
@@ -1361,6 +1720,9 @@ onUnmounted(() => {
             :search-hit="searchHitIds.has(note.id)"
             :search-picked="searchPickedIds.has(note.id)"
             :search-dim="searchDimActive"
+            :suggesting="suggestLoading && suggestSourceId === note.id"
+            :suggest-hit="suggestTargetIds.has(note.id)"
+            :suggest-picked="suggestedLinks.some((link) => link.toId === note.id && link.picked)"
             @move="moveNote"
             @text-change="changeText"
             @select="selectNote"
@@ -1370,7 +1732,7 @@ onUnmounted(() => {
             @connect-start="onConnectStart"
             @connect-end="onConnectEnd"
             @request-connect="toggleTool('connect')"
-            @suggest-relations="(id) => logEvent('suggest_relations', { noteId: id })"
+            @suggest-relations="suggestRelations"
             @request-delete="requestDeleteNote"
             @toggle-rationale="toggleRationale"
             @open-rationale="openRationale"
@@ -1387,7 +1749,7 @@ onUnmounted(() => {
             @click.stop
           >
             <RationaleModule
-              :key="`abandon-${note.id}`"
+              :key="`abandon-${note.id}-${historyEpoch}`"
               compact
               target="note"
               :idea="note.text"
@@ -1419,7 +1781,7 @@ onUnmounted(() => {
             @click.stop
           >
             <RationaleModule
-              :key="note.id"
+              :key="`${note.id}-${historyEpoch}`"
               compact
               target="note"
               :idea="note.text"
@@ -1447,7 +1809,7 @@ onUnmounted(() => {
             @click.stop
           >
           <RationaleModule
-            :key="`rel-abandon-${line.id}`"
+            :key="`rel-abandon-${line.id}-${historyEpoch}`"
             compact
             target="relation"
             :idea="relationIdea(line)"
@@ -1482,7 +1844,7 @@ onUnmounted(() => {
           @click.stop
         >
           <RationaleModule
-            :key="`rel-${line.id}`"
+            :key="`rel-${line.id}-${historyEpoch}`"
             compact
             target="relation"
             :idea="relationIdea(line)"
@@ -1502,8 +1864,71 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- Account: floating clear + logout -->
+      <!-- DEV test seed — delete this block when the study no longer needs it. -->
+      <div v-if="isDev" class="test-bar" @mousedown.stop @click.stop>
+        <span class="test-tag">test only</span>
+        <button
+          type="button"
+          class="test-btn"
+          title="Temporary seed: same heat-neighbourhood topic, scattered, no overlap"
+          @click="addSearchTestPack"
+        >
+          <span class="sample-plus">+</span>
+          <span class="btn-label">add samples</span>
+        </button>
+        <span v-if="searchTestHint" class="test-hint">{{ searchTestHint }}</span>
+      </div>
+
+      <!-- Account: floating undo / redo / clear / logout -->
       <div class="account-bar" @mousedown.stop @click.stop>
+        <button
+          type="button"
+          class="logout-btn"
+          title="Undo (⌘Z)"
+          :disabled="!canUndo"
+          @click="undoCanvas"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M3 7v6h6" />
+            <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13" />
+          </svg>
+          <span class="btn-label">undo</span>
+        </button>
+        <button
+          type="button"
+          class="logout-btn"
+          title="Redo (⌘⇧Z)"
+          :disabled="!canRedo"
+          @click="redoCanvas"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M21 7v6h-6" />
+            <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6.7 3L21 13" />
+          </svg>
+          <span class="btn-label">redo</span>
+        </button>
         <button
           type="button"
           class="logout-btn"
@@ -1557,8 +1982,30 @@ onUnmounted(() => {
       <!-- FigJam-style tool well: sticky note only -->
       <div class="bottom-bar" @mousedown.stop @click.stop>
         <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
-        <div v-else-if="searchTestHint" class="hint">{{ searchTestHint }}</div>
+        <div v-else-if="suggestError" class="hint">{{ suggestError }}</div>
+        <div v-else-if="suggestLoading" class="hint">looking for related ideas…</div>
+        <div v-else-if="suggestedLinks.length" class="hint">dashed = suggested · click to choose one or more</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
+        <button
+          v-if="suggestedLinks.length"
+          type="button"
+          class="tool-btn"
+          :disabled="!suggestPickedCount"
+          title="Keep the selected suggested links"
+          @click="keepSuggestedLinks"
+        >
+          <span class="sample-plus">✓</span>
+          <span class="btn-label">keep {{ suggestPickedCount }}</span>
+        </button>
+        <button
+          v-if="suggestedLinks.length || suggestError"
+          type="button"
+          class="tool-btn"
+          title="Dismiss suggestions"
+          @click="clearSuggestions"
+        >
+          <span class="btn-label">dismiss</span>
+        </button>
         <button
           type="button"
           class="tool-btn"
@@ -1617,16 +2064,6 @@ onUnmounted(() => {
             <span class="btn-label">{{ searchLoading ? 'looking…' : 'look up' }}</span>
           </button>
         </div>
-        <button
-          v-if="isDev"
-          type="button"
-          class="tool-btn"
-          title="DEV: append a sample pack. Look-up embeds whatever is on this board, not this file."
-          @click="addSearchTestPack"
-        >
-          <span class="sample-plus">+</span>
-          <span class="btn-label">add samples</span>
-        </button>
       </div>
     </div>
   </div>
@@ -1681,6 +2118,68 @@ onUnmounted(() => {
   cursor: default;
 }
 
+.suggest-hit {
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.suggest-wrap {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  z-index: 24;
+}
+
+.suggest-pick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  margin: 0;
+  padding: 5px 8px;
+  border: 1px dashed #b45309;
+  border-radius: 999px;
+  background: var(--chrome);
+  color: var(--ink);
+  box-shadow: 0 8px 20px rgba(44, 40, 31, 0.12);
+  cursor: pointer;
+}
+
+.suggest-pick.on {
+  border-style: solid;
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.suggest-check {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+}
+
+.suggest-check.on {
+  border-color: #2563eb;
+  background: #2563eb;
+  box-shadow: inset 0 0 0 2px var(--chrome);
+}
+
+.suggest-why {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--ink-muted);
+}
+
+.suggest-pick.on .suggest-why {
+  color: #1d4ed8;
+}
+
 .relation-wrap.abandoned {
   pointer-events: none;
 }
@@ -1698,6 +2197,7 @@ onUnmounted(() => {
 
 .notes-layer > :deep(.note),
 .relation-wrap,
+.suggest-wrap,
 .rationale-dock {
   pointer-events: auto;
 }
@@ -1746,6 +2246,58 @@ onUnmounted(() => {
   z-index: 30;
 }
 
+.test-bar {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 30;
+  max-width: min(420px, calc(100% - 280px));
+}
+
+.test-tag {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #9a3412;
+  background: #ffedd5;
+  border: 1px dashed #c2410c;
+  border-radius: 6px;
+  padding: 3px 6px;
+  white-space: nowrap;
+}
+
+.test-btn {
+  min-width: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 7px 10px 6px;
+  border: 1px dashed #c2410c;
+  border-radius: 10px;
+  background: #fff7ed;
+  color: #9a3412;
+  cursor: pointer;
+  box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
+}
+
+.test-btn:hover {
+  background: #ffedd5;
+  color: #7c2d12;
+}
+
+.test-hint {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--ink-muted);
+}
+
 .logout-btn {
   min-width: 52px;
   display: flex;
@@ -1760,6 +2312,16 @@ onUnmounted(() => {
   color: var(--ink-muted);
   cursor: pointer;
   box-shadow: 0 10px 32px rgba(44, 40, 31, 0.12);
+}
+
+.logout-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.logout-btn:disabled:hover {
+  color: var(--ink-muted);
+  background: var(--chrome);
 }
 
 .logout-btn:hover {
@@ -1807,6 +2369,16 @@ onUnmounted(() => {
   border-color: rgba(180, 83, 9, 0.45);
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.tool-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.tool-btn:disabled:hover {
+  background: transparent;
+  color: var(--ink-muted);
 }
 
 .sample-plus {

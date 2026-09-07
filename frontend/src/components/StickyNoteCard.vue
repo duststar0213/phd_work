@@ -47,6 +47,9 @@ const props = defineProps({
   searchHit: { type: Boolean, default: false },
   searchPicked: { type: Boolean, default: false },
   searchDim: { type: Boolean, default: false },
+  suggesting: { type: Boolean, default: false },
+  suggestHit: { type: Boolean, default: false },
+  suggestPicked: { type: Boolean, default: false },
 })
 
 /** How many ideas share this rationale. 2+ earns a badge on the tab. */
@@ -300,7 +303,12 @@ function fitIdeaText() {
 
 watch(
   () => [props.note.width, props.note.height, props.note.text],
-  () => nextTick(fitIdeaText),
+  () => {
+    const el = textRef.value
+    const next = props.note.text ?? ''
+    if (el && el.innerText !== next) el.innerText = next
+    nextTick(fitIdeaText)
+  },
 )
 
 const pinnedLabels = computed(() =>
@@ -858,6 +866,8 @@ function onMagMouseUp(e, side) {
       'search-hit': searchHit && !frozen,
       'search-picked': searchPicked && !frozen,
       'search-dim': searchDim && !searchHit && !searchPicked && !frozen,
+      'suggest-hit': suggestHit && !suggestPicked && !frozen,
+      'suggest-picked': suggestPicked && !frozen,
     }"
     :style="{
       left: `${note.x}px`,
@@ -907,7 +917,9 @@ function onMagMouseUp(e, side) {
         <button
           class="color-btn suggest-btn"
           type="button"
-          title="Suggest relations (AI)"
+          :class="{ busy: suggesting }"
+          :disabled="suggesting"
+          :title="suggesting ? 'Looking for related ideas…' : 'Suggest relations (AI)'"
           @click="requestSuggest"
         >
           <SuggestRelationIcon :size="18" />
@@ -1189,6 +1201,20 @@ function onMagMouseUp(e, side) {
     0 8px 24px rgba(37, 99, 235, 0.22);
 }
 
+.note.suggest-hit {
+  z-index: 21;
+  box-shadow:
+    0 0 0 2px #b45309,
+    0 8px 24px rgba(180, 83, 9, 0.18);
+}
+
+.note.suggest-picked {
+  z-index: 22;
+  box-shadow:
+    0 0 0 2.5px #2563eb,
+    0 8px 24px rgba(37, 99, 235, 0.22);
+}
+
 .note.search-dim {
   opacity: 0.28;
 }
@@ -1331,6 +1357,13 @@ function onMagMouseUp(e, side) {
 }
 
 .suggest-btn:hover {
+  color: var(--accent);
+}
+
+.suggest-btn.busy,
+.suggest-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
   color: var(--accent);
 }
 

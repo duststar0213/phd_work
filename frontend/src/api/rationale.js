@@ -80,6 +80,42 @@ export async function generateRationaleLabels(text, target = 'generic', options 
   return { labels, model: data.model || '' }
 }
 
+/**
+ * POST /api/suggest-links. Source + candidates are { id, text, labels[] }.
+ * Labels should be the pinned top-3. Returns [{ id, why }].
+ */
+export async function suggestLinks(source, candidates, options = {}) {
+  const response = await fetchWithTimeout(
+    '/api/suggest-links',
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, candidates }),
+      signal: options.signal,
+    },
+    REQUEST_TIMEOUT_MS,
+  )
+  const data = await readJson(response)
+  if (!response.ok) throw toApiError(response.status, data)
+  const allowed = new Set((Array.isArray(candidates) ? candidates : []).map((item) => String(item?.id ?? '')))
+  const links = (Array.isArray(data.links) ? data.links : [])
+    .map((item) => ({
+      id: String(item?.id ?? '').trim(),
+      why: String(item?.why || '').trim(),
+    }))
+    .filter((item) => item.id && allowed.has(item.id))
+  const seen = new Set()
+  return {
+    links: links.filter((item) => {
+      if (seen.has(item.id)) return false
+      seen.add(item.id)
+      return true
+    }).slice(0, 5),
+    model: data.model || '',
+  }
+}
+
 export const MEANING_TOP_K = 3
 export const COSINE_THRESHOLD = 0.4
 export const LIVE_EMBED_MS = 350

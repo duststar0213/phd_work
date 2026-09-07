@@ -194,6 +194,20 @@ watch(input, () => {
 })
 
 watch(
+  () => props.savedInput,
+  (value) => {
+    const next = value || ''
+    if (input.value === next) return
+    hydrating = true
+    input.value = next
+    nextTick(() => {
+      hydrating = false
+      autoGrow()
+    })
+  },
+)
+
+watch(
   () => props.savedLabels,
   (list) => {
     if (!Array.isArray(list)) return

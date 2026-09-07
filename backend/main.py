@@ -81,7 +81,25 @@ Rules:
 - same language as the input
 - if it is already short enough, return it unchanged
 """
+SUGGEST_LINKS_PROMPT = """You suggest which other sticky-note ideas should be linked to one source idea.
+
+Return JSON only:
+{"links":[{"id":"<candidate id>","why":"..."}]}
+
+Rules:
+- Judge from idea text AND the selected (pinned) rationale labels
+- Suggest a link only when the two ideas share a meaningful design relation
+  (same goal, complementary parts, tension, constraint, alternative, cause-effect, same user need)
+- Prefer candidates whose selected labels overlap in meaning with the source labels
+- Do not suggest weak, generic, or "everything is related" links
+- 1 to 5 links, or {"links":[]} if none are warranted
+- "id" must be one of the candidate ids; never invent ids; never repeat an id
+- "why" is at most 12 words, same language as the ideas, naming the relation
+- no chatbot tone, no markdown
+"""
 MAX_KNOWN_LABELS = 40  # caps prompt size; the newest labels are the ones worth matching
+MAX_SUGGEST_LINKS = 5
+MAX_SUGGEST_WHY_WORDS = 12
 MIN_RATIONALE_CHARS = 1
 OPENAI_TIMEOUT_S = 30.0
 MAX_LABEL_WORDS = 10
@@ -201,6 +219,17 @@ class MeaningRequest(BaseModel):
 
 class ShortenRequest(BaseModel):
     text: str = Field(min_length=1, max_length=400)
+
+
+class SuggestIdea(BaseModel):
+    id: str = Field(min_length=1, max_length=32)
+    text: str = Field(default="", max_length=2000)
+    labels: list[str] = Field(default_factory=list, max_length=3)
+
+
+class SuggestLinksRequest(BaseModel):
+    source: SuggestIdea
+    candidates: list[SuggestIdea] = Field(min_length=1, max_length=40)
 
 
 def clear_local_proxies() -> None:
@@ -723,6 +752,87 @@ async def shorten_label(req: ShortenRequest):
     if not kept_wording(source, suggestion):
         suggestion = ""
     return {"text": suggestion, "model": model}
+
+
+def parse_suggest_links(raw: str, allowed_ids: set[str]) -> list[dict]:
+    """Parse model JSON into [{id, why}, ...] using only candidate ids we sent."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise api_error(502, "bad_model_json", "The AI returned no usable links. Try again.") from exc
+
+    items = data.get("links") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+
+    links = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        link_id = str(item.get("id", "")).strip()
+        if not link_id or link_id not in allowed_ids or link_id in seen:
+            continue
+        seen.add(link_id)
+        why = clip_words(str(item.get("why", "")).strip(), MAX_SUGGEST_WHY_WORDS)
+        links.append({"id": link_id, "why": why})
+        if len(links) >= MAX_SUGGEST_LINKS:
+            break
+    return links
+
+
+def idea_block(item: SuggestIdea) -> str:
+    labels = [str(label).strip() for label in item.labels if str(label).strip()][:3]
+    label_line = " | ".join(label[:200] for label in labels) if labels else "(none)"
+    idea = str(item.text or "").strip() or "(empty idea)"
+    return f"id: {item.id}\nidea: {idea}\nselected labels: {label_line}"
+
+
+@app.post("/api/suggest-links")
+async def suggest_links(req: SuggestLinksRequest):
+    """Suggest dashed relations from one idea + its pinned labels to other ideas."""
+    source_text = str(req.source.text or "").strip()
+    source_labels = [str(label).strip() for label in req.source.labels if str(label).strip()]
+    if not source_text and not source_labels:
+        raise api_error(
+            400,
+            "too_short",
+            "Write an idea or pin a label first so suggestions have something to go on.",
+        )
+
+    allowed_ids = {item.id for item in req.candidates if item.id != req.source.id}
+    if not allowed_ids:
+        return {"links": [], "model": ""}
+
+    listing = "\n\n".join(idea_block(item) for item in req.candidates if item.id in allowed_ids)
+    user_content = f"source idea\n{idea_block(req.source)}\n\ncandidate ideas\n{listing}"
+
+    client = get_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SUGGEST_LINKS_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=280,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise openai_http_error(exc) from exc
+
+    content = response.choices[0].message.content
+    if not content:
+        return {"links": [], "model": model}
+    return {"links": parse_suggest_links(content, allowed_ids), "model": model}
 
 
 @app.post("/api/rationale-labels")
