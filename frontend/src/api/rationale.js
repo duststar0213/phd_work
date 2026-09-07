@@ -999,7 +999,7 @@ export function patternStatsFromLabels(rows) {
   const byRid = {}
   for (const group of groups) {
     const owners = new Set(group.members.map((item) => item.owner).filter(Boolean))
-    const stats = { owners: owners.size, phrases: group.members.length }
+    const stats = { owners: owners.size, phrases: group.members.length, ownerKeys: [...owners] }
     if (stats.owners < 2 && stats.phrases < 2) continue
     for (const item of group.members) {
       if (!item?.rid) continue
@@ -1025,6 +1025,13 @@ export function pairPatternHint(memberCount, stats) {
   const across = patternAppearsHint(stats)
   if (local && across) return `${local} · ${across}`
   return local || across
+}
+
+/** Shorter copy for the thin strip beside a note tab. */
+export function tabPatternHint(memberCount, stats) {
+  const n = Number(stats?.owners) || 0
+  if (n >= 2) return n === 2 ? 'on 2 ideas' : `on ${n} ideas`
+  return sameMeaningHint(memberCount)
 }
 
 /** Lexical neighbours for the highlight path when cosine is empty or too strict. */

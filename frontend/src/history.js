@@ -40,7 +40,7 @@ export function createCanvasHistory(options = {}) {
       coalescing = true
       notify()
     }
-    pending = state
+    pending = clone(state)
     window.clearTimeout(timer)
     if (!pointerGesture) {
       timer = window.setTimeout(flush, 400)
@@ -81,8 +81,10 @@ export function createCanvasHistory(options = {}) {
       applying = true
       apply(clone(snap))
       baseline = clone(snap)
-      applying = false
-      notify()
+      queueMicrotask(() => {
+        applying = false
+        notify()
+      })
       return true
     },
     redo(getState, apply) {
@@ -96,8 +98,10 @@ export function createCanvasHistory(options = {}) {
       applying = true
       apply(clone(snap))
       baseline = clone(snap)
-      applying = false
-      notify()
+      queueMicrotask(() => {
+        applying = false
+        notify()
+      })
       return true
     },
     isApplying() {

@@ -51,13 +51,14 @@ const props = defineProps({
   ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
   patternStats: { type: Object, default: () => ({}) }, // repeating wording across the canvas
   canvasLabels: { type: Array, default: () => [] }, // [{ text, rid, owner }]
+  ownerDirectory: { type: Object, default: () => ({}) }, // n12 / c3 -> { key, kind, id, title }
   placeholder: { type: String, default: 'Tell me about this idea…' },
   presetLabels: { type: Array, default: () => [] }, // chips shown on open so the user can skip writing
   actionLabel: { type: String, default: '' }, // optional extra button, e.g. "just abandon it"
   completeOnGenerate: { type: Boolean, default: false }, // emit complete after a successful Enter generate
 })
 
-const emit = defineEmits(['labels', 'error', 'pin-change', 'rationale-change', 'action', 'complete'])
+const emit = defineEmits(['labels', 'error', 'pin-change', 'rationale-change', 'action', 'complete', 'inspect-pattern'])
 
 const input = ref(props.savedInput || '')
 const labels = ref([])
@@ -757,6 +758,18 @@ function groupPatternHint(group) {
   return pairPatternHint(group.members.length, stats)
 }
 
+function patternPlaces(group) {
+  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
+  const keys = Array.isArray(stats?.ownerKeys) ? stats.ownerKeys : []
+  return keys.map((key) => props.ownerDirectory?.[key]).filter((item) => item?.title)
+}
+
+function togglePatternPlaces(group) {
+  const places = patternPlaces(group)
+  if (places.length < 2) return
+  emit('inspect-pattern', places)
+}
+
 function dropMerge(index) {
   pendingMerges.value = pendingMerges.value.filter((_, i) => i !== index)
 }
@@ -1047,7 +1060,15 @@ defineExpose({ generate, input, labels })
                 @click.stop="unpin(label)"
               >×</button>
             </span>
-            <span v-if="groupPatternHint(group)" class="same-hint">{{ groupPatternHint(group) }}</span>
+            <div v-if="groupPatternHint(group)" class="pattern-block">
+              <button
+                type="button"
+                class="same-hint"
+                :class="{ live: patternPlaces(group).length > 1 }"
+                :title="patternPlaces(group).length > 1 ? 'Bring those ideas nearby' : ''"
+                @click.stop="togglePatternPlaces(group)"
+              >{{ groupPatternHint(group) }}</button>
+            </div>
           </div>
           <span v-if="!currentPinned().length" class="zone-empty">drag your top 3 here</span>
         </div>
@@ -1114,7 +1135,15 @@ defineExpose({ generate, input, labels })
                 @click.stop="removeLabel(label, $event)"
               >×</button>
             </span>
-            <span v-if="groupPatternHint(group)" class="same-hint">{{ groupPatternHint(group) }}</span>
+            <div v-if="groupPatternHint(group)" class="pattern-block">
+              <button
+                type="button"
+                class="same-hint"
+                :class="{ live: patternPlaces(group).length > 1 }"
+                :title="patternPlaces(group).length > 1 ? 'Bring those ideas nearby' : ''"
+                @click.stop="togglePatternPlaces(group)"
+              >{{ groupPatternHint(group) }}</button>
+            </div>
           </div>
           <button
             type="button"
@@ -1150,6 +1179,9 @@ defineExpose({ generate, input, labels })
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .field {
@@ -1196,6 +1228,10 @@ textarea::placeholder {
   line-height: 1.4;
   letter-spacing: 0.03em;
   color: var(--ink-faint);
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .btn {
@@ -1325,6 +1361,7 @@ textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 
 .section-label {
@@ -1340,6 +1377,7 @@ textarea::placeholder {
   flex-wrap: wrap;
   align-items: flex-start;
   gap: 8px;
+  min-width: 0;
   min-height: 34px;
   padding: 6px;
   border-radius: 8px;
@@ -1502,28 +1540,85 @@ textarea::placeholder {
   -webkit-box-orient: vertical;
   overflow: hidden;
   text-align: left;
-  max-width: 180px;
+  max-width: min(180px, 100%);
 }
 
 .chip-pair {
-  display: contents;
-}
-
-.chip-pair.linked {
-  display: inline-flex;
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 4px 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pattern-block {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
   max-width: 100%;
 }
 
 .same-hint {
-  flex-shrink: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--ink-faint);
+  font: inherit;
   font-size: 10px;
-  line-height: 1.3;
+  line-height: 1.35;
   letter-spacing: 0.02em;
-  white-space: nowrap;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+.same-hint.live {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.same-hint.live:hover,
+.same-hint.open {
+  color: var(--accent);
+}
+
+.pattern-places {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pattern-place {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.pattern-place:hover {
+  color: var(--accent);
 }
 
 .chip-del {

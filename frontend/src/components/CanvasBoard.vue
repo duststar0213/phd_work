@@ -190,12 +190,20 @@ function noteSize(note) {
   }
 }
 
+function liveNotePos(note) {
+  if (!note) return { x: 0, y: 0 }
+  const visitor = patternGather.value?.visitors.find((item) => item.id === note.id)
+  if (visitor) return { x: visitor.to.x, y: visitor.to.y }
+  return { x: note.x, y: note.y }
+}
+
 /** Rationale panel sits under the note and matches its current width. */
 function rationaleStyle(note) {
   const { width, height } = noteSize(note)
+  const pos = liveNotePos(note)
   return {
-    left: `${note.x}px`,
-    top: `${note.y + height + RATIONALE_GAP}px`,
+    left: `${pos.x}px`,
+    top: `${pos.y + height + RATIONALE_GAP}px`,
     width: `${width}px`,
     zIndex: selectedId.value === note.id ? 19 : 1,
   }
@@ -204,13 +212,14 @@ function rationaleStyle(note) {
 function magPos(noteId, side) {
   const note = notes.value.find((n) => n.id === noteId)
   if (!note) return { x: 0, y: 0 }
+  const pos = liveNotePos(note)
   const size = metrics.value[noteId]
   const w = size?.width ?? note.width ?? 168
   const h = size?.height ?? note.height ?? 168
-  if (side === 'top') return { x: note.x + w / 2, y: note.y - MAG_OUTSET }
-  if (side === 'right') return { x: note.x + w + MAG_OUTSET, y: note.y + h / 2 }
-  if (side === 'bottom') return { x: note.x + w / 2, y: note.y + h + MAG_OUTSET }
-  return { x: note.x - MAG_OUTSET, y: note.y + h / 2 }
+  if (side === 'top') return { x: pos.x + w / 2, y: pos.y - MAG_OUTSET }
+  if (side === 'right') return { x: pos.x + w + MAG_OUTSET, y: pos.y + h / 2 }
+  if (side === 'bottom') return { x: pos.x + w / 2, y: pos.y + h + MAG_OUTSET }
+  return { x: pos.x - MAG_OUTSET, y: pos.y + h / 2 }
 }
 
 /** Map a mouse event to canvas coordinates (accounts for pan). */
@@ -464,6 +473,7 @@ function clearBoard() {
   clearArmed.value = false
   closeSearch()
   clearSuggestions()
+  patternGather.value = null
   clearConnectDrag()
   notes.value = []
   connections.value = []
@@ -803,6 +813,7 @@ function resetToIdle() {
   if (activeTool.value === 'connect') activeTool.value = null
   selectedId.value = null
   selectedConnId.value = null
+  if (patternGather.value) endPatternGather(false)
   const el = document.activeElement
   if (el instanceof HTMLElement && (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
     el.blur()
@@ -871,6 +882,11 @@ function onCanvasClick(e) {
 
 /** Nudge a note after a drag. */
 function moveNote(id, dx, dy) {
+  const visitor = patternGather.value?.visitors.find((item) => item.id === id)
+  if (visitor) {
+    visitor.to = { x: visitor.to.x + dx, y: visitor.to.y + dy }
+    return
+  }
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
   note.x += dx
@@ -907,6 +923,12 @@ function selectNote(id) {
   if (isAbandoned(note)) return
   selectedId.value = id
   selectedConnId.value = null
+}
+
+/** Tick the checkbox on a gathered idea. Looking at the card does not keep it. */
+function toggleGatherPick(id) {
+  const visitor = patternGather.value?.visitors.find((item) => item.id === id)
+  if (visitor) visitor.picked = !visitor.picked
 }
 
 /**
@@ -990,6 +1012,296 @@ const canvasLabels = computed(() => {
 })
 
 const patternStats = computed(() => patternStatsFromLabels(canvasLabels.value))
+
+/** Resolve n12 / c3 owner keys to titles so a pattern hint can list the ideas. */
+const ownerDirectory = computed(() => {
+  const dir = {}
+  for (const note of notes.value) {
+    dir[`n${note.id}`] = {
+      key: `n${note.id}`,
+      kind: 'note',
+      id: note.id,
+      title: String(note.text || '').trim() || 'untitled idea',
+    }
+  }
+  for (const conn of connections.value) {
+    dir[`c${conn.id}`] = {
+      key: `c${conn.id}`,
+      kind: 'relation',
+      id: conn.id,
+      title: relationIdea(conn),
+    }
+  }
+  return dir
+})
+
+/** Preview: ideas linked by overlapping patterns compact into one suggested group. */
+const patternGather = ref(null) // { sourceId, memberKey, visitors: [{ id, title, from, to, picked }] }
+const patternAnimatingIds = ref(new Set())
+let patternAnimTimer = 0
+const patternHitIds = computed(() => new Set((patternGather.value?.visitors || []).map((item) => item.id)))
+const patternPickedIds = computed(
+  () => new Set((patternGather.value?.visitors || []).filter((item) => item.picked).map((item) => item.id)),
+)
+const patternDimActive = computed(() => Boolean(patternGather.value))
+const patternPickedCount = computed(() => (patternGather.value?.visitors || []).filter((item) => item.picked).length)
+
+function memberSetKey(ids) {
+  return [...ids].map(Number).sort((a, b) => a - b).join(',')
+}
+
+/** Pairwise pattern links only — so A–B and A–C become one group without swallowing every 5-idea cluster. */
+function pairwisePatternAdjacency() {
+  const edges = new Map()
+  const add = (a, b) => {
+    if (a === b) return
+    if (!edges.has(a)) edges.set(a, new Set())
+    edges.get(a).add(b)
+  }
+  for (const stats of Object.values(patternStats.value?.byRid || {})) {
+    const ids = [...new Set(
+      (stats.ownerKeys || [])
+        .filter((key) => String(key).startsWith('n'))
+        .map((key) => Number(String(key).slice(1)))
+        .filter((id) => Number.isFinite(id)),
+    )]
+    if (ids.length !== 2) continue
+    add(ids[0], ids[1])
+    add(ids[1], ids[0])
+  }
+  return edges
+}
+
+function expandPatternNeighborhood(seedIds) {
+  const seeds = [...new Set(seedIds.filter((id) => id != null))]
+  const adj = pairwisePatternAdjacency()
+  const seen = new Set(seeds)
+  const queue = [...seeds]
+  while (queue.length && seen.size < 6) {
+    const id = queue.shift()
+    for (const next of adj.get(id) || []) {
+      if (seen.has(next)) continue
+      seen.add(next)
+      queue.push(next)
+      if (seen.size >= 6) break
+    }
+  }
+  return [...seen]
+}
+
+function groupSpread(memberNotes) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const note of memberNotes) {
+    const size = noteSize(note)
+    minX = Math.min(minX, note.x)
+    minY = Math.min(minY, note.y)
+    maxX = Math.max(maxX, note.x + size.width)
+    maxY = Math.max(maxY, note.y + size.height)
+  }
+  return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY }
+}
+
+/** Compact grid centred on the group's current midpoint — not on whoever was clicked. */
+function placeCluster(memberNotes) {
+  const gap = 32
+  const n = memberNotes.length
+  const cols = n <= 3 ? n : Math.ceil(Math.sqrt(n))
+  const rows = Math.ceil(n / cols)
+  const sizes = memberNotes.map((note) => noteSize(note))
+  const colW = Array(cols).fill(0)
+  const rowH = Array(rows).fill(0)
+  for (let i = 0; i < n; i++) {
+    const c = i % cols
+    const r = Math.floor(i / cols)
+    colW[c] = Math.max(colW[c], sizes[i].width)
+    rowH[r] = Math.max(rowH[r], sizes[i].height)
+  }
+  const gridW = colW.reduce((sum, w) => sum + w, 0) + gap * Math.max(0, cols - 1)
+  const gridH = rowH.reduce((sum, h) => sum + h, 0) + gap * Math.max(0, rows - 1)
+  let cx = 0
+  let cy = 0
+  for (const note of memberNotes) {
+    const size = noteSize(note)
+    cx += note.x + size.width / 2
+    cy += note.y + size.height / 2
+  }
+  cx /= n
+  cy /= n
+  const slots = []
+  let y = cy - gridH / 2
+  for (let r = 0; r < rows; r++) {
+    let x = cx - gridW / 2
+    for (let c = 0; c < cols; c++) {
+      const i = r * cols + c
+      if (i >= n) break
+      const size = sizes[i]
+      slots.push({
+        x: x + (colW[c] - size.width) / 2,
+        y: y + (rowH[r] - size.height) / 2,
+        w: size.width,
+        h: size.height,
+      })
+      x += colW[c] + gap
+    }
+    y += rowH[r] + gap
+  }
+  return slots
+}
+
+function clusterSlots(memberNotes) {
+  const compact = placeCluster(memberNotes)
+  const now = groupSpread(memberNotes)
+  const compactW = Math.max(...compact.map((slot) => slot.x + slot.w)) - Math.min(...compact.map((slot) => slot.x))
+  const compactH = Math.max(...compact.map((slot) => slot.y + slot.h)) - Math.min(...compact.map((slot) => slot.y))
+  if (now.w <= compactW + 96 && now.h <= compactH + 96) {
+    return memberNotes.map((note) => {
+      const size = noteSize(note)
+      return { x: note.x, y: note.y, w: size.width, h: size.height }
+    })
+  }
+  return compact
+}
+
+function panToSlots(slots) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const slot of slots) {
+    minX = Math.min(minX, slot.x)
+    minY = Math.min(minY, slot.y)
+    maxX = Math.max(maxX, slot.x + slot.w)
+    maxY = Math.max(maxY, slot.y + slot.h)
+  }
+  const { w, h } = viewSize()
+  const s = scale.value
+  panRef.x = w / 2 - ((minX + maxX) / 2) * s
+  panRef.y = h / 2 - ((minY + maxY) / 2) * s
+  applyPan()
+}
+
+const patternFrameStyle = computed(() => {
+  const gather = patternGather.value
+  if (!gather?.visitors.length) return null
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const visitor of gather.visitors) {
+    const note = notes.value.find((item) => item.id === visitor.id)
+    if (!note) continue
+    const pos = liveNotePos(note)
+    const size = noteSize(note)
+    minX = Math.min(minX, pos.x)
+    minY = Math.min(minY, pos.y)
+    maxX = Math.max(maxX, pos.x + size.width)
+    maxY = Math.max(maxY, pos.y + size.height)
+  }
+  if (!Number.isFinite(minX)) return null
+  const pad = 20
+  return {
+    left: `${minX - pad}px`,
+    top: `${minY - pad}px`,
+    width: `${maxX - minX + pad * 2}px`,
+    height: `${maxY - minY + pad * 2}px`,
+  }
+})
+
+function flashPatternAnim(ids) {
+  window.clearTimeout(patternAnimTimer)
+  patternAnimatingIds.value = new Set(ids)
+  patternAnimTimer = window.setTimeout(() => {
+    patternAnimatingIds.value = new Set()
+    patternAnimTimer = 0
+  }, 420)
+}
+
+function endPatternGather(keepPicked) {
+  const gather = patternGather.value
+  if (!gather) return
+  const keptIds = new Set()
+  if (keepPicked) {
+    const keep = gather.visitors.filter((item) => item.picked)
+    for (const visitor of keep) {
+      const note = notes.value.find((item) => item.id === visitor.id)
+      if (!note) continue
+      note.x = visitor.to.x
+      note.y = visitor.to.y
+      keptIds.add(visitor.id)
+    }
+    if (keep.length) {
+      logEvent('pattern_kept_nearby', {
+        sourceId: gather.sourceId,
+        kept: keep.map((item) => item.id),
+      }).catch(() => {})
+    }
+  }
+  const returning = gather.visitors.filter((item) => !keptIds.has(item.id)).map((item) => item.id)
+  patternGather.value = null
+  if (returning.length) flashPatternAnim(returning)
+}
+
+function clearPatternHits() {
+  endPatternGather(false)
+}
+
+function inspectPattern(places, sourceId) {
+  const incoming = Array.isArray(places) ? places : []
+  const seedIds = incoming.filter((item) => item.kind === 'note').map((item) => item.id)
+  if (sourceId != null) seedIds.push(sourceId)
+  if (!seedIds.length) {
+    endPatternGather(false)
+    return
+  }
+  const memberIds = expandPatternNeighborhood(seedIds)
+  const memberNotes = memberIds
+    .map((id) => notes.value.find((note) => note.id === id))
+    .filter((note) => note && !isNoteFrozen(note) && !isAbandoned(note))
+    .sort((a, b) => a.id - b.id)
+  if (memberNotes.length < 2) {
+    endPatternGather(false)
+    return
+  }
+  const key = memberSetKey(memberNotes.map((note) => note.id))
+  if (patternGather.value?.memberKey === key) {
+    if (patternGather.value.sourceId === sourceId) {
+      endPatternGather(false)
+      return
+    }
+    patternGather.value.sourceId = sourceId
+    selectedId.value = sourceId
+    return
+  }
+  endPatternGather(false)
+  const slots = clusterSlots(memberNotes)
+  patternGather.value = {
+    sourceId,
+    memberKey: key,
+    visitors: memberNotes.map((note, i) => ({
+      id: note.id,
+      title: String(note.text || '').trim() || 'untitled idea',
+      from: { x: note.x, y: note.y },
+      to: { x: slots[i].x, y: slots[i].y },
+      picked: false,
+    })),
+  }
+  selectedId.value = sourceId
+  selectedConnId.value = null
+  panToSlots(slots)
+  logEvent('pattern_gather', { sourceId, visitors: memberNotes.map((item) => item.id) }).catch(() => {})
+}
+
+function keepPatternGroup() {
+  const gather = patternGather.value
+  if (!gather) return
+  if (!gather.visitors.some((item) => item.picked)) {
+    for (const visitor of gather.visitors) visitor.picked = true
+  }
+  endPatternGather(true)
+}
 
 /** Keep up to 3 labels attached to the side of a note. */
 function setPinnedLabels(id, pinned) {
@@ -1367,6 +1679,10 @@ function onKeydown(e) {
       closeSearch()
       return
     }
+    if (patternGather.value) {
+      endPatternGather(false)
+      return
+    }
     if (suggestedLinks.value.length || suggestLoading.value || suggestError.value) {
       clearSuggestions()
       return
@@ -1569,6 +1885,7 @@ onUnmounted(() => {
   wheelTarget = null
   clearConnectDrag()
   clearTimeout(saveTimer)
+  window.clearTimeout(patternAnimTimer)
   suggestAbort?.abort()
 })
 </script>
@@ -1654,6 +1971,9 @@ onUnmounted(() => {
             />
           </g>
         </svg>
+        <div v-if="patternFrameStyle" class="pattern-frame" :style="patternFrameStyle">
+          <span class="pattern-frame-label">suggested group</span>
+        </div>
         <div
           v-for="line in renderedConnections"
           :key="`rel-${line.id}`"
@@ -1674,12 +1994,14 @@ onUnmounted(() => {
             :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
+            :owner-directory="ownerDirectory"
             :selected="selectedConnId === line.id && !line.abandoned"
             :abandoned="Boolean(line.abandoned)"
             @open-rationale="openRelationRationale(line.id)"
             @toggle-rationale="toggleRelationRationale(line.id)"
             @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
             @labels-change="(labels) => updateRelationLabels(line.id, labels)"
+            @inspect-pattern="(places) => inspectPattern(places, line.fromId)"
           />
         </div>
         <div
@@ -1717,15 +2039,20 @@ onUnmounted(() => {
             :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
-            :search-hit="searchHitIds.has(note.id)"
-            :search-picked="searchPickedIds.has(note.id)"
-            :search-dim="searchDimActive"
+            :owner-directory="ownerDirectory"
+            :display-x="liveNotePos(note).x"
+            :display-y="liveNotePos(note).y"
+            :gathering="patternHitIds.has(note.id) || patternAnimatingIds.has(note.id)"
+            :search-hit="searchHitIds.has(note.id) || patternHitIds.has(note.id)"
+            :search-picked="searchPickedIds.has(note.id) || patternPickedIds.has(note.id)"
+            :search-dim="searchDimActive || patternDimActive"
             :suggesting="suggestLoading && suggestSourceId === note.id"
             :suggest-hit="suggestTargetIds.has(note.id)"
             :suggest-picked="suggestedLinks.some((link) => link.toId === note.id && link.picked)"
             @move="moveNote"
             @text-change="changeText"
             @select="selectNote"
+            @toggle-gather="toggleGatherPick"
             @color-change="changeColor"
             @resize="resizeNote"
             @metrics="setMetrics"
@@ -1738,6 +2065,7 @@ onUnmounted(() => {
             @open-rationale="openRationale"
             @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
             @labels-change="(labels) => updateLabels(note.id, labels)"
+            @inspect-pattern="(places) => inspectPattern(places, note.id)"
             @revive="reviveNote"
           />
           <div
@@ -1761,6 +2089,7 @@ onUnmounted(() => {
               :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
+            :owner-directory="ownerDirectory"
               :preset-labels="[presetAbandonLabel(note.id)]"
               placeholder="Tell me why abandon this idea…"
               action-label="just abandon it"
@@ -1768,6 +2097,7 @@ onUnmounted(() => {
               @pin-change="(pinned) => setAbandonPinned(note.id, pinned)"
               @rationale-change="(payload) => updateAbandonRationale(note.id, payload)"
               @labels="() => logEvent('abandon_labels_generated', { noteId: note.id })"
+              @inspect-pattern="(places) => inspectPattern(places, note.id)"
               @action="confirmAbandon(note.id)"
               @complete="confirmAbandon(note.id)"
             />
@@ -1793,9 +2123,11 @@ onUnmounted(() => {
               :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
+            :owner-directory="ownerDirectory"
               @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
               @rationale-change="(payload) => updateRationale(note.id, payload)"
               @labels="() => logEvent('labels_generated', { noteId: note.id })"
+              @inspect-pattern="(places) => inspectPattern(places, note.id)"
             />
           </div>
         </template>
@@ -1821,6 +2153,7 @@ onUnmounted(() => {
             :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
+            :owner-directory="ownerDirectory"
             :preset-labels="[presetAbandonLabel(`rel-${line.id}`)]"
             placeholder="Tell me why abandon this relation…"
             action-label="just abandon it"
@@ -1828,6 +2161,7 @@ onUnmounted(() => {
             @pin-change="(pinned) => setRelationAbandonPinned(line.id, pinned)"
             @rationale-change="(payload) => updateRelationAbandonRationale(line.id, payload)"
             @labels="() => logEvent('relation_abandon_labels_generated', { connectionId: line.id })"
+            @inspect-pattern="(places) => inspectPattern(places, line.fromId)"
             @action="confirmAbandonRelation(line.id)"
             @complete="confirmAbandonRelation(line.id)"
           />
@@ -1856,10 +2190,12 @@ onUnmounted(() => {
             :rid-owners="ridOwners"
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
+            :owner-directory="ownerDirectory"
             placeholder="Tell me about how they relates…"
             @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
             @rationale-change="(payload) => updateRelationRationale(line.id, payload)"
             @labels="() => logEvent('labels_generated', { connectionId: line.id })"
+            @inspect-pattern="(places) => inspectPattern(places, line.fromId)"
           />
         </div>
       </div>
@@ -1985,6 +2321,7 @@ onUnmounted(() => {
         <div v-else-if="suggestError" class="hint">{{ suggestError }}</div>
         <div v-else-if="suggestLoading" class="hint">looking for related ideas…</div>
         <div v-else-if="suggestedLinks.length" class="hint">dashed = suggested · click to choose one or more</div>
+        <div v-else-if="patternGather" class="hint">dashed frame = suggested group · tick a subset or keep group · esc cancels</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
         <button
           v-if="suggestedLinks.length"
@@ -2005,6 +2342,25 @@ onUnmounted(() => {
           @click="clearSuggestions"
         >
           <span class="btn-label">dismiss</span>
+        </button>
+        <button
+          v-if="patternGather"
+          type="button"
+          class="tool-btn"
+          :title="patternPickedCount ? 'Keep the ticked ideas in the group' : 'Keep the suggested group together'"
+          @click="keepPatternGroup"
+        >
+          <span class="sample-plus">✓</span>
+          <span class="btn-label">{{ patternPickedCount ? `keep ${patternPickedCount}` : 'keep group' }}</span>
+        </button>
+        <button
+          v-if="patternGather"
+          type="button"
+          class="tool-btn"
+          title="Send every gathered idea back"
+          @click="endPatternGather(false)"
+        >
+          <span class="btn-label">put back</span>
         </button>
         <button
           type="button"
@@ -2195,6 +2551,26 @@ onUnmounted(() => {
   pointer-events: none;
 }
 
+.pattern-frame {
+  position: absolute;
+  z-index: 0;
+  pointer-events: none;
+  border: 1.5px dashed #b45309;
+  border-radius: 18px;
+  background: rgba(180, 83, 9, 0.05);
+}
+
+.pattern-frame-label {
+  position: absolute;
+  top: -16px;
+  left: 10px;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: #b45309;
+  white-space: nowrap;
+}
+
 .notes-layer > :deep(.note),
 .relation-wrap,
 .suggest-wrap,
@@ -2211,6 +2587,8 @@ onUnmounted(() => {
 .rationale-dock {
   position: absolute;
   box-sizing: border-box;
+  min-width: 0;
+  overflow: hidden;
   padding: 10px;
   background: var(--chrome);
   border: 1px solid var(--line);

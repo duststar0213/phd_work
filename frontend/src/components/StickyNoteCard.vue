@@ -9,7 +9,7 @@ import {
   cachedDraftVector,
   clipUserLabel,
   clusterSimilarLabels,
-  pairPatternHint,
+  tabPatternHint,
   embedTexts,
   isSimilarLabel,
   LIVE_EMBED_MS,
@@ -44,6 +44,10 @@ const props = defineProps({
   ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
   patternStats: { type: Object, default: () => ({}) },
   canvasLabels: { type: Array, default: () => [] },
+  ownerDirectory: { type: Object, default: () => ({}) },
+  displayX: { type: Number, default: null },
+  displayY: { type: Number, default: null },
+  gathering: { type: Boolean, default: false },
   searchHit: { type: Boolean, default: false },
   searchPicked: { type: Boolean, default: false },
   searchDim: { type: Boolean, default: false },
@@ -61,12 +65,20 @@ function labelPattern(label) {
   return props.patternStats?.byRid?.[label?.rid] || null
 }
 
+const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect', 'suggestRelations', 'requestDelete', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive', 'inspect-pattern', 'toggle-gather'])
+
 function groupPatternHint(group) {
   const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
-  return pairPatternHint(group.members.length, stats)
+  return tabPatternHint(group.members.length, stats)
 }
 
-const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect', 'suggestRelations', 'requestDelete', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive'])
+function inspectGroupPattern(group) {
+  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
+  const keys = Array.isArray(stats?.ownerKeys) ? stats.ownerKeys : []
+  const places = keys.map((key) => props.ownerDirectory?.[key]).filter((item) => item?.title)
+  if (places.length < 2) return
+  emit('inspect-pattern', places)
+}
 
 const textRef = ref(null)
 const noteRef = ref(null)
@@ -707,13 +719,13 @@ function onNoteMouseDown(e) {
     e.stopPropagation()
     return
   }
-  if (e.target.closest('.toolbar') || e.target.closest('.resize-handle') || e.target.closest('.mag-point') || e.target.closest('.fold-btn') || e.target.closest('.edge-add-wrap') || e.target.closest('.tab-del')) return
+  if (e.target.closest('.toolbar') || e.target.closest('.resize-handle') || e.target.closest('.mag-point') || e.target.closest('.fold-btn') || e.target.closest('.edge-add-wrap') || e.target.closest('.tab-del') || e.target.closest('.gather-check')) return
   e.stopPropagation()
   const alreadySelected = props.selected
+  const onTab = Boolean(e.target.closest('.edge-tab'))
   activate()
   colorOpen.value = false
   didDrag = false
-  const onTab = Boolean(e.target.closest('.edge-tab'))
   // Shift+drag inside the idea text still selects characters; a normal drag always moves the note.
   const textSelect = Boolean(editing.value && e.shiftKey && e.target.closest('.note-text'))
   if (textSelect) return
@@ -747,7 +759,7 @@ function onNoteMouseDown(e) {
     dragCleanup = null
     dragging.value = false
     if (!didDrag && onTab) emit('openRationale', props.note.id)
-    else if (!didDrag && !onTab && (alreadySelected || !String(props.note.text || '').trim())) startTextEdit()
+    else if (!didDrag && !onTab && !props.gathering && (alreadySelected || !String(props.note.text || '').trim())) startTextEdit()
   }
 
   dragCleanup = onUp
@@ -868,10 +880,11 @@ function onMagMouseUp(e, side) {
       'search-dim': searchDim && !searchHit && !searchPicked && !frozen,
       'suggest-hit': suggestHit && !suggestPicked && !frozen,
       'suggest-picked': suggestPicked && !frozen,
+      gathering: gathering && !dragging && !resizing,
     }"
     :style="{
-      left: `${note.x}px`,
-      top: `${note.y}px`,
+      left: `${displayX ?? note.x}px`,
+      top: `${displayY ?? note.y}px`,
       width: `${note.width ?? 168}px`,
       minHeight: `${note.height ?? 168}px`,
       background: note.color,
@@ -884,6 +897,16 @@ function onMagMouseUp(e, side) {
     @mouseleave="onNoteLeave"
     @contextmenu="onContextMenu"
   >
+    <button
+      v-if="gathering && searchHit"
+      type="button"
+      class="gather-check"
+      :class="{ on: searchPicked }"
+      title="Mark to keep nearby"
+      @pointerdown.stop
+      @mousedown.stop
+      @click.stop="emit('toggle-gather', note.id)"
+    />
     <!-- Hidden while a mag-point drag is in progress so it does not cover the path. -->
     <div v-if="selected && !drafting && !frozen" class="toolbar" @pointerdown.stop @mousedown.stop @click.stop>
       <button
@@ -1015,7 +1038,15 @@ function onMagMouseUp(e, side) {
             @click.stop="unpinLabel(label, $event)"
           >×</button>
         </span>
-        <span v-if="groupPatternHint(group)" class="tab-same-hint">{{ groupPatternHint(group) }}</span>
+        <button
+          v-if="groupPatternHint(group)"
+          type="button"
+          class="tab-same-hint"
+          title="Bring those ideas nearby"
+          @pointerdown.stop
+          @mousedown.stop
+          @click.stop="inspectGroupPattern(group)"
+        >{{ groupPatternHint(group) }}</button>
       </div>
     </div>
 
@@ -1070,7 +1101,15 @@ function onMagMouseUp(e, side) {
             @click.stop="unpinLabel(label, $event)"
           >×</button>
         </span>
-        <span v-if="groupPatternHint(group)" class="tab-same-hint">{{ groupPatternHint(group) }}</span>
+        <button
+          v-if="groupPatternHint(group)"
+          type="button"
+          class="tab-same-hint"
+          title="Bring those ideas nearby"
+          @pointerdown.stop
+          @mousedown.stop
+          @click.stop="inspectGroupPattern(group)"
+        >{{ groupPatternHint(group) }}</button>
       </div>
       <div
         ref="addWrapRef"
@@ -1185,6 +1224,34 @@ function onMagMouseUp(e, side) {
   box-shadow:
     0 0 0 1.5px #2563eb,
     0 8px 24px rgba(44, 40, 31, 0.16);
+}
+
+.note.gathering {
+  transition: left 0.38s ease, top 0.38s ease;
+}
+
+.note.gathering .note-text {
+  padding-left: 36px;
+}
+
+.gather-check {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 8;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1.5px solid #b45309;
+  border-radius: 6px;
+  background: #fffaf3;
+  cursor: pointer;
+}
+
+.gather-check.on {
+  border-color: #2563eb;
+  background: #2563eb;
+  box-shadow: inset 0 0 0 2px #fff;
 }
 
 .note.search-hit {
@@ -1684,12 +1751,23 @@ function onMagMouseUp(e, side) {
 .tab-same-hint {
   align-self: center;
   max-width: 92px;
+  margin: 0;
   padding: 0 4px;
+  border: 0;
+  background: transparent;
   color: var(--ink-faint);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 8px;
-  line-height: 1.2;
+  line-height: 1.25;
   letter-spacing: 0.01em;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.tab-same-hint:hover {
+  color: var(--accent);
 }
 
 /* Recurrence, not authorship: the tab colour already says who wrote it. */

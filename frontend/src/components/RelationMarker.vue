@@ -9,7 +9,7 @@ import {
   cachedDraftVector,
   clipUserLabel,
   clusterSimilarLabels,
-  pairPatternHint,
+  tabPatternHint,
   embedTexts,
   isSimilarLabel,
   LIVE_EMBED_MS,
@@ -33,6 +33,7 @@ const props = defineProps({
   ridOwners: { type: Object, default: () => ({}) }, // rid -> how many ideas / relations invoke it
   patternStats: { type: Object, default: () => ({}) },
   canvasLabels: { type: Array, default: () => [] },
+  ownerDirectory: { type: Object, default: () => ({}) },
 })
 
 /** How many ideas share this rationale. 2+ earns a badge on the tab. */
@@ -44,12 +45,20 @@ function labelPattern(label) {
   return props.patternStats?.byRid?.[label?.rid] || null
 }
 
+const emit = defineEmits(['toggle-rationale', 'open-rationale', 'pin-change', 'labels-change', 'inspect-pattern'])
+
 function groupPatternHint(group) {
   const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
-  return pairPatternHint(group.members.length, stats)
+  return tabPatternHint(group.members.length, stats)
 }
 
-const emit = defineEmits(['toggle-rationale', 'open-rationale', 'pin-change', 'labels-change'])
+function inspectGroupPattern(group) {
+  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
+  const keys = Array.isArray(stats?.ownerKeys) ? stats.ownerKeys : []
+  const places = keys.map((key) => props.ownerDirectory?.[key]).filter((item) => item?.title)
+  if (places.length < 2) return
+  emit('inspect-pattern', places)
+}
 
 const addHover = ref(false)
 const creating = ref(false)
@@ -395,7 +404,15 @@ function onCreateKeydown(e) {
             @click.stop="unpinLabel(label, $event)"
           >×</button>
         </span>
-        <span v-if="groupPatternHint(group)" class="tab-same-hint">{{ groupPatternHint(group) }}</span>
+        <button
+          v-if="groupPatternHint(group)"
+          type="button"
+          class="tab-same-hint"
+          title="Bring those ideas nearby"
+          @pointerdown.stop
+          @mousedown.stop
+          @click.stop="inspectGroupPattern(group)"
+        >{{ groupPatternHint(group) }}</button>
       </div>
     </div>
     <button
@@ -611,11 +628,22 @@ function onCreateKeydown(e) {
 
 .tab-same-hint {
   max-width: 92px;
+  margin: 0;
   padding: 0 4px;
+  border: 0;
+  background: transparent;
   color: var(--ink-faint);
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 8px;
-  line-height: 1.2;
+  line-height: 1.25;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.tab-same-hint:hover {
+  color: var(--accent);
 }
 
 /* Recurrence, not authorship: the tab colour already says who wrote it. */
