@@ -37,8 +37,10 @@ export function demoRationaleLabels(text, target = 'generic') {
  * point at one with `same_as` instead of coining a near-duplicate.
  */
 export async function generateRationaleLabels(text, target = 'generic', options = {}) {
-  const rationale = String(text ?? '').trim()
-  const verdict = assessReflection(rationale, options.previous)
+  const reflection = String(text ?? '').trim()
+  const idea = String(options.idea ?? '').trim()
+  const fingerprint = [idea, reflection].filter(Boolean).join('\n\n')
+  const verdict = assessReflection(fingerprint, options.previous)
   if (!verdict.ok) {
     throw new RationaleApiError(verdict.message, { code: verdict.code, status: 400 })
   }
@@ -56,7 +58,7 @@ export async function generateRationaleLabels(text, target = 'generic', options 
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: rationale, target, known }),
+      body: JSON.stringify({ text: reflection, idea, target, known }),
       signal: options.signal,
     },
     REQUEST_TIMEOUT_MS,
@@ -78,6 +80,43 @@ export async function generateRationaleLabels(text, target = 'generic', options 
   }
 
   return { labels, model: data.model || '' }
+}
+
+/** True when the idea is long enough to possibly contain a why. */
+export function ideaReadyForReflectionDetect(text) {
+  const idea = String(text || '').trim()
+  if (idea.length < 36) return false
+  const tokens = idea.match(/[\p{Script=Han}]|[a-zA-Z0-9']+/gu) || []
+  return tokens.length >= 8
+}
+
+/**
+ * POST /api/detect-reflection. Conservative: true only if the idea already
+ * names a why, not just a proposal.
+ */
+export async function detectEmbeddedReflection(idea, options = {}) {
+  const text = String(idea || '').trim()
+  if (!ideaReadyForReflectionDetect(text)) {
+    return { hasReflection: false, excerpt: '' }
+  }
+  const response = await fetchWithTimeout(
+    '/api/detect-reflection',
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idea: text }),
+      signal: options.signal,
+    },
+    REQUEST_TIMEOUT_MS,
+  )
+  const data = await readJson(response)
+  if (!response.ok) throw toApiError(response.status, data)
+  return {
+    hasReflection: Boolean(data.has_reflection),
+    excerpt: String(data.excerpt || '').trim(),
+    model: data.model || '',
+  }
 }
 
 /**
@@ -1053,7 +1092,55 @@ function normalizeLabel(item) {
   if (!LABEL_KINDS.includes(kind)) kind = 'insight'
   const sameAs = String(item?.same_as ?? item?.sameAs ?? '').trim()
   if (sameAs) return { text: '', kind, sameAs, phrasing: clipWords(String(item?.phrasing ?? '').trim()), embedding: null }
-  return { text, kind, sameAs: '', phrasing: '', embedding: asVector(item?.embedding) }
+  return {
+    text,
+    kind,
+    sameAs: '',
+    phrasing: '',
+    embedding: asVector(item?.embedding),
+  }
+}
+
+/** Same reasoning identity: shared rid, else identical wording. */
+export function sameRationale(a, b) {
+  if (!a || !b) return false
+  if (a.rid && b.rid && a.rid === b.rid) return true
+  const at = String(a.text || '').trim()
+  const bt = String(b.text || '').trim()
+  return Boolean(at && at === bt)
+}
+
+/**
+ * What we actually keep: human-created or human-edited (yellow) labels,
+ * plus whatever is currently in the top 3 — including unmodified AI that was chosen.
+ * Pure AI that was never pinned and never edited is dropped.
+ */
+export function persistedRationaleLabels(labels, pinned = []) {
+  const pool = Array.isArray(labels) ? labels : []
+  const pins = Array.isArray(pinned) ? pinned : []
+  const kept = []
+  const seen = new Set()
+  const keyOf = (item) => {
+    if (item?.rid) return `rid:${item.rid}`
+    if (item?.id != null) return `id:${item.id}`
+    return `t:${String(item?.text || '').trim().toLowerCase()}`
+  }
+  const add = (item) => {
+    const text = String(item?.text || '').trim()
+    if (!text) return
+    const human = item?.source === 'user'
+    const chosen = pins.some((pin) => sameRationale(pin, item))
+    if (!human && !chosen) return
+    const key = keyOf(item)
+    if (seen.has(key)) return
+    seen.add(key)
+    kept.push(item)
+  }
+  for (const item of pool) add(item)
+  for (const pin of pins) {
+    if (!kept.some((item) => sameRationale(item, pin))) add(pin)
+  }
+  return kept
 }
 
 /**
@@ -1071,6 +1158,40 @@ export function sameWording(a, b) {
       .join(' ')
   const left = key(a)
   return Boolean(left) && left === key(b)
+}
+
+/**
+ * Idle tab/chip text: keep a short head and the distinctive tail.
+ * The stored label is unchanged; hover can show `full`.
+ */
+const PREVIEW_MAX_CHARS = 34
+
+export function compactLabelDisplay(text) {
+  const full = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!full) return { preview: '', full: '', compact: false }
+  const words = full.split(/\s+/).filter(Boolean)
+  if (words.length >= 2) {
+    if (words.length <= 6 && full.length <= PREVIEW_MAX_CHARS) {
+      return { preview: full, full, compact: false }
+    }
+    const attempts = [[3, 2], [2, 2], [2, 1]]
+    for (const [headN, tailN] of attempts) {
+      if (words.length <= headN + tailN) continue
+      const preview = `${words.slice(0, headN).join(' ')} … ${words.slice(-tailN).join(' ')}`
+      if (preview.length <= PREVIEW_MAX_CHARS) return { preview, full, compact: true }
+    }
+    return {
+      preview: `${full.slice(0, 12).trim()} … ${full.slice(-10).trim()}`,
+      full,
+      compact: true,
+    }
+  }
+  if (full.length <= 22) return { preview: full, full, compact: false }
+  return {
+    preview: `${full.slice(0, 10).trim()} … ${full.slice(-8).trim()}`,
+    full,
+    compact: true,
+  }
 }
 
 /** Visible tag text: at most ten words. Kind stays in data only. */

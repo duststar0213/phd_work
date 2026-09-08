@@ -1,7 +1,23 @@
 /**
  * Participant session + canvas persistence.
- * Cookies are httpOnly; fetch must send credentials.
+ * Identity and the board live in this browser. The study server is not sent
+ * emails, passwords, canvases, or interaction events.
+ * Cookies are still used only for the invitation-code gate.
  */
+
+import {
+  clearSession,
+  emptyCanvas,
+  getSessionEmail,
+  loadLocalCanvas,
+  loginLocalAccount,
+  LocalAuthError,
+  normalizeEmail,
+  registerLocalAccount,
+  resetLocalPassword,
+  saveLocalCanvas,
+  setSessionEmail,
+} from './localStore'
 
 export class SessionError extends Error {
   constructor(message, { code = 'unknown', status = 0 } = {}) {
@@ -10,6 +26,14 @@ export class SessionError extends Error {
     this.code = code
     this.status = status
   }
+}
+
+function asSessionError(err) {
+  if (err instanceof SessionError) return err
+  if (err instanceof LocalAuthError) {
+    return new SessionError(err.message, { code: err.code })
+  }
+  return new SessionError(err?.message || "Couldn't reach the study server.")
 }
 
 async function api(path, init = {}) {
@@ -47,46 +71,85 @@ export function unlockGate(access) {
   })
 }
 
-export function startSession(email) {
-  return api('/api/auth/start', {
-    method: 'POST',
-    body: JSON.stringify({ email }),
-  })
+export async function startSession(email) {
+  try {
+    const data = await registerLocalAccount(email)
+    if (data.isNew) return { email: data.email, is_new: true, password: data.password }
+    return { email: data.email, is_new: false }
+  } catch (err) {
+    throw asSessionError(err)
+  }
 }
 
-export function login(email, password) {
-  return api('/api/auth/login', {
-    method: 'POST',
-    body: JSON.stringify({ email, password }),
-  })
+export async function login(email, password) {
+  try {
+    const data = await loginLocalAccount(email, password)
+    return { email: data.email }
+  } catch (err) {
+    throw asSessionError(err)
+  }
 }
 
-export function resetPassword(email) {
-  return api('/api/auth/reset', {
-    method: 'POST',
-    body: JSON.stringify({ email }),
-  })
+export async function resetPassword(email) {
+  try {
+    const data = await resetLocalPassword(email)
+    return { email: data.email, password: data.password }
+  } catch (err) {
+    throw asSessionError(err)
+  }
 }
 
 export function logout() {
-  return api('/api/auth/logout', { method: 'POST', body: '{}' })
+  clearSession()
+  return Promise.resolve({ ok: true })
 }
 
-export function fetchMe() {
-  return api('/api/auth/me')
+async function currentEmail() {
+  const local = getSessionEmail()
+  if (local) return local
+  const data = await api('/api/auth/me')
+  const email = normalizeEmail(data.email || data.username || '')
+  setSessionEmail(email)
+  return email
 }
 
-export function fetchCanvas() {
-  return api('/api/canvas')
+export async function fetchMe() {
+  try {
+    const email = await currentEmail()
+    return { email }
+  } catch {
+    throw new SessionError('Please sign in with your email.', { code: 'auth_required', status: 401 })
+  }
+}
+
+async function importServerCanvas() {
+  try {
+    return await api('/api/canvas')
+  } catch {
+    return null
+  }
+}
+
+export async function fetchCanvas() {
+  const email = await currentEmail().catch(() => '')
+  if (!email) throw new SessionError('Please sign in with your email.', { code: 'auth_required', status: 401 })
+  const local = loadLocalCanvas(email)
+  if (local) return local
+  const imported = await importServerCanvas()
+  if (imported && typeof imported === 'object') {
+    saveLocalCanvas(email, imported)
+    return imported
+  }
+  return emptyCanvas()
 }
 
 export function saveCanvas(payload) {
-  return api('/api/canvas', { method: 'PUT', body: JSON.stringify(payload) })
+  const email = getSessionEmail()
+  if (!email) return Promise.reject(new SessionError('Please sign in with your email.', { code: 'auth_required', status: 401 }))
+  saveLocalCanvas(email, payload)
+  return Promise.resolve({ ok: true })
 }
 
-export function logEvent(type, payload = {}) {
-  return api('/api/events', {
-    method: 'POST',
-    body: JSON.stringify({ type, payload }),
-  }).catch(() => {})
+export function logEvent() {
+  return Promise.resolve({ ok: true })
 }

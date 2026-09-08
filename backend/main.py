@@ -50,6 +50,10 @@ Rules:
 - match the language of the input
 - if target is "relation", labels should name why two ideas are linked
 - if target is "note", labels should name the idea's design rationale
+- Read the sticky-note idea FIRST: if it already contains a why (reason, constraint, who it is for, why it matters), use that.
+- Then combine with the reflection field. If reflection is empty, label only from the idea's own why.
+- If the idea is only a proposal with no why, label from the reflection field.
+- Do not invent reasons that are not in the idea or the reflection.
 
 The user message may list labels the designer already has, as "ref | text".
 Before writing a label, check that list. If one of them already expresses the SAME
@@ -95,6 +99,21 @@ Rules:
 - 1 to 5 links, or {"links":[]} if none are warranted
 - "id" must be one of the candidate ids; never invent ids; never repeat an id
 - "why" is at most 12 words, same language as the ideas, naming the relation
+- no chatbot tone, no markdown
+"""
+DETECT_REFLECTION_PROMPT = """You decide whether a sticky-note IDEA already contains design reflection (the why), not only a proposal.
+
+Reflection means a reason, motive, constraint, assumption, worry, tradeoff, who it is for, or why it matters.
+A short title-like proposal with no why is NOT reflection.
+
+Return JSON only:
+{"has_reflection": true|false, "excerpt": "..."}
+
+Rules:
+- be conservative: true only if a reader could extract rationale labels from this text
+- excerpt must be a contiguous phrase copied from the idea, not a rewrite; at most 40 words, or ""
+- if you cannot copy a why phrase from the idea, return has_reflection false
+- same language as the idea
 - no chatbot tone, no markdown
 """
 MAX_KNOWN_LABELS = 40  # caps prompt size; the newest labels are the ones worth matching
@@ -203,7 +222,8 @@ class KnownLabel(BaseModel):
 
 
 class RationaleRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=4000)
+    text: str = Field(default="", max_length=4000)  # reflection field
+    idea: str = Field(default="", max_length=4000)  # sticky-note / relation body
     target: str = Field(default="generic")  # generic | note | relation
     known: list[KnownLabel] = Field(default_factory=list, max_length=200)
 
@@ -230,6 +250,10 @@ class SuggestIdea(BaseModel):
 class SuggestLinksRequest(BaseModel):
     source: SuggestIdea
     candidates: list[SuggestIdea] = Field(min_length=1, max_length=40)
+
+
+class DetectReflectionRequest(BaseModel):
+    idea: str = Field(min_length=1, max_length=4000)
 
 
 def clear_local_proxies() -> None:
@@ -436,7 +460,6 @@ def open_session(person, response: Response, event_type: str) -> None:
     token = auth.new_token()
     db.create_session(person["id"], token)
     db.touch_participant(person["id"])
-    db.add_event(person["id"], event_type, {})
     set_session_cookie(response, token)
 
 
@@ -477,9 +500,6 @@ def reset(req: EmailRequest, response: Response, _gate=Depends(require_gate)):
 
 @app.post("/api/auth/logout")
 def logout(response: Response, token: str | None = Depends(cookie_token)):
-    person = db.participant_for_token(token or "")
-    if person:
-        db.add_event(person["id"], "logout", {})
     if token:
         db.delete_session(token)
     response.delete_cookie(auth.COOKIE_NAME, path="/")
@@ -501,21 +521,13 @@ def get_canvas(person=Depends(require_participant)):
 
 @app.put("/api/canvas")
 def put_canvas(req: CanvasRequest, person=Depends(require_participant)):
-    payload = {
-        "notes": req.notes,
-        "connections": req.connections,
-        "pan": req.pan,
-        "nextId": req.nextId,
-        "nextConnId": req.nextConnId,
-        "scale": req.scale,
-    }
-    db.save_canvas(person["id"], payload)
+    """Study collection is paused: the browser keeps the board, the server does not store it."""
     return {"ok": True, "updated_at": db.utc_now()}
 
 
 @app.post("/api/events")
 def post_event(req: EventRequest, person=Depends(require_participant)):
-    db.add_event(person["id"], req.type.strip()[:64], req.payload)
+    """Study collection is paused: interaction events are not stored."""
     return {"ok": True}
 
 
@@ -599,7 +611,10 @@ def parse_label_payload(raw: str, known_refs: set[str] | None = None) -> list[di
             label_text = phrasing  # unknown ref: keep the reasoning as a fresh label
         if not label_text:
             continue
-        labels.append({"text": clip_words(label_text), "kind": kind})
+        labels.append({
+            "text": clip_words(label_text),
+            "kind": kind,
+        })
     if not labels:
         raise api_error(502, "empty_labels", "The AI returned no labels. Try rephrasing and generate again.")
     return labels[:6]
@@ -835,11 +850,78 @@ async def suggest_links(req: SuggestLinksRequest):
     return {"links": parse_suggest_links(content, allowed_ids), "model": model}
 
 
+def parse_detect_reflection(raw: str) -> dict:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"has_reflection": False, "excerpt": ""}
+    if not isinstance(data, dict):
+        return {"has_reflection": False, "excerpt": ""}
+    excerpt = " ".join(str(data.get("excerpt") or "").split())
+    words = excerpt.split()
+    if len(words) > 40:
+        excerpt = " ".join(words[:40])
+    return {"has_reflection": bool(data.get("has_reflection")), "excerpt": excerpt}
+
+
+def keep_idea_excerpt(idea: str, excerpt: str) -> str:
+    """Only keep an excerpt that is actually copied from the idea."""
+    hay = " ".join(idea.split()).lower()
+    needle = " ".join(excerpt.split()).lower()
+    if needle and needle in hay:
+        return excerpt
+    return ""
+
+
+@app.post("/api/detect-reflection")
+async def detect_reflection(req: DetectReflectionRequest):
+    """Does this idea already contain a why, so the reflection field need not be blank?"""
+    idea = req.idea.strip()
+    if len(idea) < 36:
+        return {"has_reflection": False, "excerpt": "", "model": ""}
+
+    client = get_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": DETECT_REFLECTION_PROMPT},
+                {"role": "user", "content": idea},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=120,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise openai_http_error(exc) from exc
+
+    content = response.choices[0].message.content
+    parsed = parse_detect_reflection(content or "")
+    parsed["excerpt"] = keep_idea_excerpt(idea, parsed.get("excerpt") or "")
+    parsed["model"] = model
+    return parsed
+
+
 @app.post("/api/rationale-labels")
 async def rationale_labels(req: RationaleRequest):
     """Turn a rationale paragraph into short labels (not a chatbot reply)."""
-    text = req.text.strip()
-    if len(text) < MIN_RATIONALE_CHARS:
+    reflection = req.text.strip()
+    idea = (req.idea or "").strip()
+    if not reflection and not idea:
+        raise api_error(
+            400,
+            "too_short",
+            "Write a bit more rationale so the labels can be specific.",
+        )
+    packed = len(reflection) + len(idea)
+    if packed < MIN_RATIONALE_CHARS:
         raise api_error(
             400,
             "too_short",
@@ -852,7 +934,11 @@ async def rationale_labels(req: RationaleRequest):
 
     known = req.known[-MAX_KNOWN_LABELS:]
     known_refs = {item.ref for item in known}
-    user_content = f"target: {target}\n\n{text}"
+    blocks = [f"target: {target}"]
+    if idea:
+        blocks.append(f"sticky-note idea:\n{idea}")
+    blocks.append(f"reflection:\n{reflection or '(empty)'}")
+    user_content = "\n\n".join(blocks)
     if known:
         listing = "\n".join(f"{item.ref} | {item.text}" for item in known)
         user_content = f"{user_content}\n\nlabels the designer already has:\n{listing}"
@@ -866,7 +952,7 @@ async def rationale_labels(req: RationaleRequest):
             ],
             response_format={"type": "json_object"},
             temperature=0.4,
-            max_tokens=300,
+            max_tokens=280,
         )
     except HTTPException:
         raise

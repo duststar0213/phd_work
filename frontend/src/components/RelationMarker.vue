@@ -9,7 +9,6 @@ import {
   cachedDraftVector,
   clipUserLabel,
   clusterSimilarLabels,
-  tabPatternHint,
   embedTexts,
   isSimilarLabel,
   LIVE_EMBED_MS,
@@ -21,6 +20,7 @@ import {
   readyForLiveEmbed,
   rememberDraftVector,
 } from '../api/rationale'
+import LabelPeek from './LabelPeek.vue'
 
 const MAX_PINNED = 3
 const GHOST_TAB = 'add your label'
@@ -36,29 +36,7 @@ const props = defineProps({
   ownerDirectory: { type: Object, default: () => ({}) },
 })
 
-/** How many ideas share this rationale. 2+ earns a badge on the tab. */
-function recurrence(label) {
-  return Number(props.ridOwners?.[label?.rid]) || 0
-}
-
-function labelPattern(label) {
-  return props.patternStats?.byRid?.[label?.rid] || null
-}
-
 const emit = defineEmits(['toggle-rationale', 'open-rationale', 'pin-change', 'labels-change', 'inspect-pattern'])
-
-function groupPatternHint(group) {
-  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
-  return tabPatternHint(group.members.length, stats)
-}
-
-function inspectGroupPattern(group) {
-  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
-  const keys = Array.isArray(stats?.ownerKeys) ? stats.ownerKeys : []
-  const places = keys.map((key) => props.ownerDirectory?.[key]).filter((item) => item?.title)
-  if (places.length < 2) return
-  emit('inspect-pattern', places)
-}
 
 const addHover = ref(false)
 const creating = ref(false)
@@ -245,7 +223,7 @@ function nextLabelId() {
   return max + 1
 }
 
-/** × on a tab only takes the label off the line; it stays in the reflection pool. */
+/** × on a tab takes it off the line. Yellow labels stay saved; unused AI is dropped. */
 function unpinLabel(label, e) {
   e?.preventDefault()
   e?.stopPropagation()
@@ -388,12 +366,7 @@ function onCreateKeydown(e) {
             class="tab-label"
             title="Click to edit"
             @click.stop="startTabEdit(label)"
-          >{{ label.text }}</span>
-          <span
-            v-if="recurrence(label) > 1"
-            class="tab-badge"
-            :title="`this rationale is behind ${recurrence(label)} ideas`"
-          >×{{ recurrence(label) }}</span>
+          ><LabelPeek :text="label.text" prefer="right" /></span>
           <button
             v-if="!abandoned"
             type="button"
@@ -404,22 +377,13 @@ function onCreateKeydown(e) {
             @click.stop="unpinLabel(label, $event)"
           >×</button>
         </span>
-        <button
-          v-if="groupPatternHint(group)"
-          type="button"
-          class="tab-same-hint"
-          title="Bring those ideas nearby"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop="inspectGroupPattern(group)"
-        >{{ groupPatternHint(group) }}</button>
       </div>
     </div>
     <button
       v-if="open && !abandoned"
       type="button"
       class="edge-fold open"
-      title="Hide reflection"
+      title="Hide rationale"
       @click.stop="emit('toggle-rationale')"
     >
       <svg viewBox="0 0 12 8" aria-hidden="true">
@@ -493,7 +457,7 @@ function onCreateKeydown(e) {
   align-items: flex-start;
   gap: 2px;
   width: max-content;
-  max-width: 88px;
+  max-width: 160px;
   padding: 2px 4px 2px 6px;
   border-radius: 3px;
   box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.18);
@@ -592,7 +556,8 @@ function onCreateKeydown(e) {
 
 .edge-tab .tab-input {
   display: block;
-  width: 72px;
+  width: auto;
+  min-width: 72px;
   margin: 0;
   padding: 0;
   border: 0;
@@ -611,9 +576,9 @@ function onCreateKeydown(e) {
   min-width: 0;
   flex: 1;
   cursor: text;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
   overflow: hidden;
 }
 
@@ -624,38 +589,6 @@ function onCreateKeydown(e) {
   align-items: center;
   gap: 2px;
   width: max-content;
-}
-
-.tab-same-hint {
-  max-width: 92px;
-  margin: 0;
-  padding: 0 4px;
-  border: 0;
-  background: transparent;
-  color: var(--ink-faint);
-  font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 8px;
-  line-height: 1.25;
-  text-align: left;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  cursor: pointer;
-}
-
-.tab-same-hint:hover {
-  color: var(--accent);
-}
-
-/* Recurrence, not authorship: the tab colour already says who wrote it. */
-.tab-badge {
-  flex-shrink: 0;
-  align-self: center;
-  padding: 0 3px;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.22);
-  font-size: 8px;
-  font-weight: 700;
-  line-height: 12px;
 }
 
 .tab-del {

@@ -116,8 +116,8 @@ function backToEmail() {
 
       <template v-if="step === 'email'">
         <p class="lede">
-          <template v-if="inviteOnly">Use the email from your invitation.</template>
-          <template v-else>Enter your email. A new address gets a new space and a password to save.</template>
+          <template v-if="inviteOnly">Use the email from your invitation. This browser keeps your canvas for the next visit.</template>
+          <template v-else>Enter your email. A new address gets a password to save. This browser keeps your canvas for the next visit.</template>
         </p>
         <label>
           <span>email</span>
@@ -138,7 +138,7 @@ function backToEmail() {
       </template>
 
       <template v-else>
-        <p class="lede">Save this password now. You will need it the next time you log in. We cannot email it to you.</p>
+        <p class="lede">Save this password now. You will need it the next time you log in on this computer. We cannot email it to you.</p>
         <p class="issued">{{ issued }}</p>
         <button type="button" class="text-btn" @click="copyIssued">
           {{ copied ? 'copied' : 'copy password' }}

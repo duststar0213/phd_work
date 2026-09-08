@@ -5,9 +5,10 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
-import { patternStatsFromLabels, embedTexts, cosine, asVector, suggestLinks } from '../api/rationale'
+import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, clusterSimilarLabels } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
+import GroupIcon from './GroupIcon.vue'
 import SearchIcon from './SearchIcon.vue'
 import RationaleModule from './RationaleModule.vue'
 import RelationMarker from './RelationMarker.vue'
@@ -125,7 +126,9 @@ const connections = ref([]) // { id, fromId, fromSide, toId, toSide } — one ma
 const metrics = ref({}) // noteId -> { width, height } from ResizeObserver
 const selectedId = ref(null)
 const selectedConnId = ref(null)
-const activeTool = ref(null) // null | 'sticky' | 'connect'
+const activeTool = ref(null) // null | 'sticky' | 'connect' | 'group'
+const groupStroke = ref([]) // canvas-space points while the lasso is being drawn
+const groupHint = ref('')
 const draft = ref(null) // in-progress path: { fromId, fromSide, x, y }
 const pan = ref({ x: 0, y: 0 })
 const scale = ref(1)
@@ -167,9 +170,15 @@ const GRID = 28
 const BOARD_PAD = 28
 const SEARCH_THRESHOLD = 0.28
 const SEARCH_MAX = 16
+/** Same fills as AI / human echo labels on sticky-note tabs. */
+const AI_ECHO = '#93c5fd'
+const AI_ECHO_STRONG = '#60a5fa'
+const USER_ECHO = '#fde68a'
 
 const stickyActive = computed(() => activeTool.value === 'sticky') // place-note tool
 const connectActive = computed(() => activeTool.value === 'connect') // mag-point connector tool
+const groupActive = computed(() => activeTool.value === 'group') // freehand lasso group tool
+const magHoverId = ref(null)
 
 /** Moves the notes layer with the canvas pan. Scale stays at 100%. */
 const notesLayerStyle = computed(() => ({
@@ -178,6 +187,8 @@ const notesLayerStyle = computed(() => ({
 
 /** Distance from note edge to mag-point center (must match StickyNoteCard --mag-outset). */
 const MAG_OUTSET = 18
+/** Show another note's mag points when the pen is this close to its box. */
+const MAG_HOVER_PX = 20
 /** Gap under the note so the rationale box sits below the bottom mag point. */
 const RATIONALE_GAP = 28
 
@@ -256,15 +267,17 @@ const draftPath = computed(() => {
 })
 
 const renderedSuggestions = computed(() =>
-  suggestedLinks.value.map((link) => {
-    const from = magPos(link.fromId, link.fromSide)
-    const to = magPos(link.toId, link.toSide)
-    return {
-      ...link,
-      d: connectorPath(from.x, from.y, link.fromSide, to.x, to.y, link.toSide),
-      mid: connectorPoint(from.x, from.y, link.fromSide, to.x, to.y, link.toSide, 0.5),
-    }
-  }),
+  suggestedLinks.value
+    .filter((link) => !alreadyLinked(link.fromId, link.toId))
+    .map((link) => {
+      const from = magPos(link.fromId, link.fromSide)
+      const to = magPos(link.toId, link.toSide)
+      return {
+        ...link,
+        d: connectorPath(from.x, from.y, link.fromSide, to.x, to.y, link.toSide),
+        mid: connectorPoint(from.x, from.y, link.fromSide, to.x, to.y, link.toSide, 0.5),
+      }
+    }),
 )
 
 const suggestPickedCount = computed(() => suggestedLinks.value.filter((link) => link.picked).length)
@@ -274,19 +287,35 @@ const searchHitIds = computed(() => new Set(searchHits.value.map((item) => item.
 const searchPickedIds = computed(() => new Set(searchPicked.value))
 const searchDimActive = computed(() => searchHits.value.length > 0)
 
-/** Arm / disarm a tool. Sticky and connect are mutually exclusive. */
+/** Arm / disarm a tool. Sticky, group, and connect are mutually exclusive. */
 function toggleTool(name) {
-  if (name === 'sticky' && searchOpen.value) closeSearch()
-  activeTool.value = activeTool.value === name ? null : name
+  if ((name === 'sticky' || name === 'group') && searchOpen.value) closeSearch()
+  const next = activeTool.value === name ? null : name
+  if (activeTool.value === 'connect' && next !== 'connect') {
+    clearSuggestions()
+    draft.value = null
+  }
+  if (activeTool.value === 'group' && next !== 'group') clearGroupStroke()
+  if (next === 'group') {
+    if (patternGather.value) endPatternGather(false)
+    groupHint.value = ''
+  }
+  activeTool.value = next
   if (activeTool.value !== 'connect') draft.value = null
 }
 
+function clearGroupStroke() {
+  groupStroke.value = []
+  window.removeEventListener('pointermove', onGroupPointerMove)
+  window.removeEventListener('pointerup', onGroupPointerUp)
+  window.removeEventListener('pointercancel', onGroupPointerUp)
+}
+
 function noteSearchBlob(note) {
-  const pins = (note.pinnedLabels || [])
+  const kept = persistedRationaleLabels(note.rationaleLabels, note.pinnedLabels)
     .map((item) => String(item?.text || '').trim())
     .filter(Boolean)
-    .slice(0, 3)
-  return [note.text, note.rationaleText, ...pins]
+  return [note.text, note.rationaleText, ...kept]
     .map((item) => String(item || '').trim())
     .filter(Boolean)
     .join('\n')
@@ -362,6 +391,21 @@ function pickConnectSides(fromNote, toNote) {
     return dx >= 0 ? ['right', 'left'] : ['left', 'right']
   }
   return dy >= 0 ? ['bottom', 'top'] : ['top', 'bottom']
+}
+
+/** One toolbar action: mag-point drawing plus AI dashed suggestions from this idea. */
+function onRelationTool(id) {
+  if (connectActive.value && suggestSourceId.value === id) {
+    activeTool.value = null
+    clearSuggestions()
+    draft.value = null
+    return
+  }
+  if (activeTool.value === 'sticky') activeTool.value = null
+  activeTool.value = 'connect'
+  selectedId.value = id
+  selectedConnId.value = null
+  suggestRelations(id)
 }
 
 async function suggestRelations(id) {
@@ -631,6 +675,8 @@ function toggleSearch() {
   }
   activeTool.value = null
   draft.value = null
+  clearGroupStroke()
+  groupHint.value = ''
   searchOpen.value = true
   searchError.value = ''
   nextTick(() => searchInputRef.value?.focus())
@@ -755,12 +801,46 @@ function onWheel(e) {
   applyPan()
 }
 
+function distanceToNoteEdge(px, py, note) {
+  const pos = liveNotePos(note)
+  const { width, height } = noteSize(note)
+  const left = pos.x
+  const top = pos.y
+  const right = pos.x + width
+  const bottom = pos.y + height
+  const dx = Math.max(left - px, 0, px - right)
+  const dy = Math.max(top - py, 0, py - bottom)
+  return Math.hypot(dx, dy)
+}
+
+/** Closest other idea whose edge is within MAG_HOVER_PX of the pen. */
+function nearestConnectNote(px, py, fromId) {
+  let bestId = null
+  let bestD = Infinity
+  for (const note of notes.value) {
+    if (note.id === fromId || isNoteFrozen(note) || isAbandoned(note)) continue
+    const d = distanceToNoteEdge(px, py, note)
+    if (d < bestD) {
+      bestD = d
+      bestId = note.id
+    }
+  }
+  return bestD <= MAG_HOVER_PX ? bestId : null
+}
+
+function noteShowsMag(note) {
+  if (!connectActive.value || isNoteFrozen(note) || isAbandoned(note)) return false
+  if (selectedId.value === note.id) return true
+  return Boolean(draft.value) && magHoverId.value === note.id
+}
+
 /** Drop window listeners used while rubber-banding a connector. */
 function clearConnectDrag() {
   if (connectMove) window.removeEventListener('mousemove', connectMove)
   if (connectUp) window.removeEventListener('mouseup', connectUp)
   connectMove = null
   connectUp = null
+  magHoverId.value = null
 }
 
 /** Mag-point mousedown: start a draft path. */
@@ -776,6 +856,7 @@ function onConnectStart(noteId, side) {
     if (!draft.value) return
     const p = clientToCanvas(ev)
     draft.value = { ...draft.value, x: p.x, y: p.y }
+    magHoverId.value = nearestConnectNote(p.x, p.y, draft.value.fromId)
   }
   connectUp = () => {
     clearConnectDrag()
@@ -811,18 +892,24 @@ function resetToIdle() {
   clearConnectDrag()
   draft.value = null
   if (activeTool.value === 'connect') activeTool.value = null
+  if (activeTool.value === 'group') {
+    clearGroupStroke()
+    groupHint.value = ''
+    activeTool.value = null
+  }
   selectedId.value = null
   selectedConnId.value = null
   if (patternGather.value) endPatternGather(false)
+  clearSuggestions()
   const el = document.activeElement
   if (el instanceof HTMLElement && (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
     el.blur()
   }
 }
 
-/** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky tool still places on click. */
+/** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky / group tools still handle the click. */
 function onCanvasMouseDown(e) {
-  if (stickyActive.value) return
+  if (stickyActive.value || groupActive.value) return
   if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock')) return
   resetToIdle()
 
@@ -854,6 +941,7 @@ function onCanvasMouseDown(e) {
 
 /** Place one note at the click (canvas coords), then disarm the tool. */
 function onCanvasClick(e) {
+  if (groupActive.value) return
   if (!stickyActive.value || !canvasRef.value) return
 
   const rect = canvasRef.value.getBoundingClientRect()
@@ -882,6 +970,7 @@ function onCanvasClick(e) {
 
 /** Nudge a note after a drag. */
 function moveNote(id, dx, dy) {
+  if (patternGather.value) patternDragId.value = id
   const visitor = patternGather.value?.visitors.find((item) => item.id === id)
   if (visitor) {
     visitor.to = { x: visitor.to.x + dx, y: visitor.to.y + dy }
@@ -889,8 +978,23 @@ function moveNote(id, dx, dy) {
   }
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
+  if (patternGather.value && (!patternAdmitFrom || patternAdmitFrom.id !== id)) {
+    patternAdmitFrom = { id, x: note.x, y: note.y }
+  }
   note.x += dx
   note.y += dy
+}
+
+/** Drop outside takes a gathered idea out; drop inside the frame puts one back in. */
+function onNoteMoveEnd(id) {
+  const gather = patternGather.value
+  if (gather && patternDragId.value === id) {
+    const member = gather.visitors.some((item) => item.id === id)
+    if (member && isOutsidePatternGroup(id)) ejectPatternVisitor(id)
+    else if (!member && isInsidePatternGroup(id)) admitPatternVisitor(id)
+  }
+  patternDragId.value = null
+  patternAdmitFrom = null
 }
 
 /** Persist contenteditable text. */
@@ -960,7 +1064,13 @@ function hydrateRids(owner) {
   owner.abandonLabels = withRids(owner.abandonLabels)
   owner.pinnedLabels = linkPinRids(owner.pinnedLabels, owner.rationaleLabels)
   owner.abandonPinned = linkPinRids(owner.abandonPinned, owner.abandonLabels)
+  owner.rationaleLabels = persistedRationaleLabels(owner.rationaleLabels, owner.pinnedLabels)
+  owner.abandonLabels = persistedRationaleLabels(owner.abandonLabels, owner.abandonPinned)
   return owner
+}
+
+function keptRationaleLabels(owner) {
+  return persistedRationaleLabels(owner?.rationaleLabels, owner?.pinnedLabels)
 }
 
 /** One entry per rationale identity — the list the model checks before coining a new label. */
@@ -971,8 +1081,8 @@ const labelInventory = computed(() => {
     if (!label?.rid || !text || byRid.has(label.rid)) return
     byRid.set(label.rid, { ref: label.rid, text })
   }
-  for (const note of notes.value) (note.rationaleLabels || []).forEach(add)
-  for (const conn of connections.value) (conn.rationaleLabels || []).forEach(add)
+  for (const note of notes.value) keptRationaleLabels(note).forEach(add)
+  for (const conn of connections.value) keptRationaleLabels(conn).forEach(add)
   return [...byRid.values()]
 })
 
@@ -986,24 +1096,24 @@ const ridOwners = computed(() => {
       owners.get(label.rid).add(key)
     }
   }
-  for (const note of notes.value) track(`n${note.id}`, note.rationaleLabels)
-  for (const conn of connections.value) track(`c${conn.id}`, conn.rationaleLabels)
+  for (const note of notes.value) track(`n${note.id}`, keptRationaleLabels(note))
+  for (const conn of connections.value) track(`c${conn.id}`, keptRationaleLabels(conn))
   const counts = {}
   for (const [rid, keys] of owners) counts[rid] = keys.size
   return counts
 })
 
-/** Every rationale phrasing on the canvas — same note and other notes — for repeating patterns. */
+/** Every kept rationale phrasing on the canvas — top 3 plus yellow labels — for repeating patterns. */
 const canvasLabels = computed(() => {
   const rows = []
   for (const note of notes.value) {
-    for (const label of note.rationaleLabels || []) {
+    for (const label of keptRationaleLabels(note)) {
       if (!String(label?.text || '').trim()) continue
       rows.push({ id: label.id, rid: label.rid, text: label.text, owner: `n${note.id}` })
     }
   }
   for (const conn of connections.value) {
-    for (const label of conn.rationaleLabels || []) {
+    for (const label of keptRationaleLabels(conn)) {
       if (!String(label?.text || '').trim()) continue
       rows.push({ id: label.id, rid: label.rid, text: label.text, owner: `c${conn.id}` })
     }
@@ -1038,6 +1148,8 @@ const ownerDirectory = computed(() => {
 /** Preview: ideas linked by overlapping patterns compact into one suggested group. */
 const patternGather = ref(null) // { sourceId, memberKey, visitors: [{ id, title, from, to, picked }] }
 const patternAnimatingIds = ref(new Set())
+const patternDragId = ref(null)
+let patternAdmitFrom = null
 let patternAnimTimer = 0
 const patternHitIds = computed(() => new Set((patternGather.value?.visitors || []).map((item) => item.id)))
 const patternPickedIds = computed(
@@ -1045,6 +1157,20 @@ const patternPickedIds = computed(
 )
 const patternDimActive = computed(() => Boolean(patternGather.value))
 const patternPickedCount = computed(() => (patternGather.value?.visitors || []).filter((item) => item.picked).length)
+
+/** Group focus: only members (plus a note being dragged in/out) stay on the empty stage. */
+function noteOnGroupStage(id) {
+  if (!patternGather.value) return true
+  if (patternHitIds.value.has(id)) return true
+  if (patternAnimatingIds.value.has(id)) return true
+  if (patternDragId.value === id) return true
+  return false
+}
+
+function connectionOnGroupStage(line) {
+  if (!patternGather.value) return true
+  return noteOnGroupStage(line.fromId) && noteOnGroupStage(line.toId)
+}
 
 function memberSetKey(ids) {
   return [...ids].map(Number).sort((a, b) => a - b).join(',')
@@ -1089,36 +1215,113 @@ function expandPatternNeighborhood(seedIds) {
   return [...seen]
 }
 
+/** Right-edge tabs (and the count badge) sit outside the note box. */
+const TAB_MAX_W = 160
+const TAB_BADGE_PAD = 16
+const TAB_PLUS_W = 28
+const TAB_LINE_H = 31
+const CLUSTER_GAP = 28
+
+function noteTabCount(note) {
+  const labels = Array.isArray(note.pinnedLabels) ? note.pinnedLabels : []
+  return clusterSimilarLabels(labels).length
+}
+
+function tabClearX(note) {
+  if (!noteTabCount(note)) return TAB_PLUS_W
+  return Math.min(TAB_MAX_W, note.width ?? 168) + TAB_BADGE_PAD
+}
+
+function tabClearY(note) {
+  const n = noteTabCount(note)
+  const size = noteSize(note)
+  const rightFit = Math.max(1, Math.floor((size.height - 20) / TAB_LINE_H))
+  const overflow = Math.max(0, n - rightFit)
+  return overflow ? overflow * TAB_LINE_H + 8 : 12
+}
+
+function noteBodyBox(note, pos) {
+  const size = noteSize(note)
+  const p = pos || { x: note.x, y: note.y }
+  return { x: p.x, y: p.y, w: size.width, h: size.height }
+}
+
+function noteVisualBox(note, pos) {
+  const body = noteBodyBox(note, pos)
+  return {
+    x: body.x,
+    y: body.y - tabClearY(note),
+    w: body.w + tabClearX(note),
+    h: body.h + tabClearY(note),
+  }
+}
+
+function slotForNote(note, x, y) {
+  const size = noteSize(note)
+  const extraX = tabClearX(note)
+  const extraY = tabClearY(note)
+  return {
+    x,
+    y,
+    w: size.width,
+    h: size.height,
+    vx: x,
+    vy: y - extraY,
+    vw: size.width + extraX,
+    vh: size.height + extraY,
+  }
+}
+
+function clusterHasTabOverlap(memberNotes) {
+  const boxes = memberNotes.map((note) => noteVisualBox(note))
+  const slack = 8
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const a = boxes[i]
+      const b = boxes[j]
+      if (a.x < b.x + b.w - slack && a.x + a.w - slack > b.x && a.y < b.y + b.h - slack && a.y + a.h - slack > b.y) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 function groupSpread(memberNotes) {
   let minX = Infinity
   let minY = Infinity
   let maxX = -Infinity
   let maxY = -Infinity
   for (const note of memberNotes) {
-    const size = noteSize(note)
-    minX = Math.min(minX, note.x)
-    minY = Math.min(minY, note.y)
-    maxX = Math.max(maxX, note.x + size.width)
-    maxY = Math.max(maxY, note.y + size.height)
+    const box = noteVisualBox(note)
+    minX = Math.min(minX, box.x)
+    minY = Math.min(minY, box.y)
+    maxX = Math.max(maxX, box.x + box.w)
+    maxY = Math.max(maxY, box.y + box.h)
   }
   return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY }
 }
 
 /** Compact grid centred on the group's current midpoint — not on whoever was clicked. */
 function placeCluster(memberNotes) {
-  const gap = 32
+  const gap = CLUSTER_GAP
   const n = memberNotes.length
   const cols = n <= 3 ? n : Math.ceil(Math.sqrt(n))
   const rows = Math.ceil(n / cols)
   const sizes = memberNotes.map((note) => noteSize(note))
+  const padX = memberNotes.map((note) => tabClearX(note))
+  const padY = memberNotes.map((note) => tabClearY(note))
   const colW = Array(cols).fill(0)
-  const rowH = Array(rows).fill(0)
+  const rowBody = Array(rows).fill(0)
+  const rowTop = Array(rows).fill(0)
   for (let i = 0; i < n; i++) {
     const c = i % cols
     const r = Math.floor(i / cols)
-    colW[c] = Math.max(colW[c], sizes[i].width)
-    rowH[r] = Math.max(rowH[r], sizes[i].height)
+    colW[c] = Math.max(colW[c], sizes[i].width + padX[i])
+    rowBody[r] = Math.max(rowBody[r], sizes[i].height)
+    rowTop[r] = Math.max(rowTop[r], padY[i])
   }
+  const rowH = rowBody.map((h, r) => h + rowTop[r])
   const gridW = colW.reduce((sum, w) => sum + w, 0) + gap * Math.max(0, cols - 1)
   const gridH = rowH.reduce((sum, h) => sum + h, 0) + gap * Math.max(0, rows - 1)
   let cx = 0
@@ -1137,13 +1340,7 @@ function placeCluster(memberNotes) {
     for (let c = 0; c < cols; c++) {
       const i = r * cols + c
       if (i >= n) break
-      const size = sizes[i]
-      slots.push({
-        x: x + (colW[c] - size.width) / 2,
-        y: y + (rowH[r] - size.height) / 2,
-        w: size.width,
-        h: size.height,
-      })
+      slots.push(slotForNote(memberNotes[i], x, y + rowTop[r]))
       x += colW[c] + gap
     }
     y += rowH[r] + gap
@@ -1154,13 +1351,10 @@ function placeCluster(memberNotes) {
 function clusterSlots(memberNotes) {
   const compact = placeCluster(memberNotes)
   const now = groupSpread(memberNotes)
-  const compactW = Math.max(...compact.map((slot) => slot.x + slot.w)) - Math.min(...compact.map((slot) => slot.x))
-  const compactH = Math.max(...compact.map((slot) => slot.y + slot.h)) - Math.min(...compact.map((slot) => slot.y))
-  if (now.w <= compactW + 96 && now.h <= compactH + 96) {
-    return memberNotes.map((note) => {
-      const size = noteSize(note)
-      return { x: note.x, y: note.y, w: size.width, h: size.height }
-    })
+  const compactW = Math.max(...compact.map((slot) => (slot.vx ?? slot.x) + (slot.vw ?? slot.w))) - Math.min(...compact.map((slot) => slot.vx ?? slot.x))
+  const compactH = Math.max(...compact.map((slot) => (slot.vy ?? slot.y) + (slot.vh ?? slot.h))) - Math.min(...compact.map((slot) => slot.vy ?? slot.y))
+  if (now.w <= compactW + 96 && now.h <= compactH + 96 && !clusterHasTabOverlap(memberNotes)) {
+    return memberNotes.map((note) => slotForNote(note, note.x, note.y))
   }
   return compact
 }
@@ -1171,10 +1365,14 @@ function panToSlots(slots) {
   let maxX = -Infinity
   let maxY = -Infinity
   for (const slot of slots) {
-    minX = Math.min(minX, slot.x)
-    minY = Math.min(minY, slot.y)
-    maxX = Math.max(maxX, slot.x + slot.w)
-    maxY = Math.max(maxY, slot.y + slot.h)
+    const x = slot.vx ?? slot.x
+    const y = slot.vy ?? slot.y
+    const w = slot.vw ?? slot.w
+    const h = slot.vh ?? slot.h
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x + w)
+    maxY = Math.max(maxY, y + h)
   }
   const { w, h } = viewSize()
   const s = scale.value
@@ -1183,7 +1381,19 @@ function panToSlots(slots) {
   applyPan()
 }
 
-const patternFrameStyle = computed(() => {
+function visitorBounds(visitor) {
+  const note = notes.value.find((item) => item.id === visitor.id)
+  if (!note) return null
+  return noteBodyBox(note, liveNotePos(note))
+}
+
+function visitorVisualBounds(visitor) {
+  const note = notes.value.find((item) => item.id === visitor.id)
+  if (!note) return null
+  return noteVisualBox(note, liveNotePos(note))
+}
+
+function patternMembersBox(exceptId) {
   const gather = patternGather.value
   if (!gather?.visitors.length) return null
   let minX = Infinity
@@ -1191,23 +1401,80 @@ const patternFrameStyle = computed(() => {
   let maxX = -Infinity
   let maxY = -Infinity
   for (const visitor of gather.visitors) {
-    const note = notes.value.find((item) => item.id === visitor.id)
-    if (!note) continue
-    const pos = liveNotePos(note)
-    const size = noteSize(note)
-    minX = Math.min(minX, pos.x)
-    minY = Math.min(minY, pos.y)
-    maxX = Math.max(maxX, pos.x + size.width)
-    maxY = Math.max(maxY, pos.y + size.height)
+    if (exceptId != null && visitor.id === exceptId) continue
+    const box = visitorVisualBounds(visitor)
+    if (!box) continue
+    minX = Math.min(minX, box.x)
+    minY = Math.min(minY, box.y)
+    maxX = Math.max(maxX, box.x + box.w)
+    maxY = Math.max(maxY, box.y + box.h)
   }
   if (!Number.isFinite(minX)) return null
+  return { minX, minY, maxX, maxY }
+}
+
+/** The note's centre sits inside the remaining cluster (with a little slack). */
+function isInsidePatternGroup(id) {
+  const others = patternMembersBox(id)
+  if (!others) return false
+  const visitor = patternGather.value?.visitors.find((item) => item.id === id)
+  const note = notes.value.find((item) => item.id === id)
+  const box = visitor ? visitorBounds(visitor) : note
+    ? { ...liveNotePos(note), w: noteSize(note).width, h: noteSize(note).height }
+    : null
+  if (!box) return false
+  const pad = 64
+  const cx = box.x + box.w / 2
+  const cy = box.y + box.h / 2
+  return cx >= others.minX - pad && cx <= others.maxX + pad && cy >= others.minY - pad && cy <= others.maxY + pad
+}
+
+/** Far enough from the remaining cluster that this idea is no longer part of the group. */
+function isOutsidePatternGroup(id) {
+  if (!patternMembersBox(id)) return false
+  return !isInsidePatternGroup(id)
+}
+
+const patternLeavingId = computed(() => {
+  const id = patternDragId.value
+  if (id == null) return null
+  if (!patternGather.value?.visitors.some((item) => item.id === id)) return null
+  return isOutsidePatternGroup(id) ? id : null
+})
+
+const patternJoiningId = computed(() => {
+  const id = patternDragId.value
+  if (id == null || !patternGather.value) return null
+  if (patternGather.value.visitors.some((item) => item.id === id)) return null
+  return isInsidePatternGroup(id) ? id : null
+})
+
+const patternFrameStyle = computed(() => {
+  const box = patternMembersBox(patternDragId.value)
+  if (!box) return null
   const pad = 20
   return {
-    left: `${minX - pad}px`,
-    top: `${minY - pad}px`,
-    width: `${maxX - minX + pad * 2}px`,
-    height: `${maxY - minY + pad * 2}px`,
+    left: `${box.minX - pad}px`,
+    top: `${box.minY - pad}px`,
+    width: `${box.maxX - box.minX + pad * 2}px`,
+    height: `${box.maxY - box.minY + pad * 2}px`,
   }
+})
+
+/** Shared rationale patterns among the gathered notes — why they sit in this frame. */
+const patternGroupWhy = computed(() => {
+  const gather = patternGather.value
+  if (!gather?.visitors.length || gather.origin === 'lasso') return ''
+  const members = new Set(gather.visitors.map((item) => `n${item.id}`))
+  const rows = canvasLabels.value.filter((row) => members.has(row.owner))
+  const shared = clusterSimilarLabels(rows)
+    .map((group) => {
+      const owners = new Set(group.members.map((item) => item.owner).filter(Boolean))
+      return { text: String(group.preview || '').trim(), owners: owners.size }
+    })
+    .filter((item) => item.text && item.owners >= 2)
+    .sort((a, b) => b.owners - a.owners || a.text.localeCompare(b.text))
+  return shared.slice(0, 3).map((item) => item.text).join(' · ')
 })
 
 function flashPatternAnim(ids) {
@@ -1222,6 +1489,8 @@ function flashPatternAnim(ids) {
 function endPatternGather(keepPicked) {
   const gather = patternGather.value
   if (!gather) return
+  patternDragId.value = null
+  patternAdmitFrom = null
   const keptIds = new Set()
   if (keepPicked) {
     const keep = gather.visitors.filter((item) => item.picked)
@@ -1244,8 +1513,159 @@ function endPatternGather(keepPicked) {
   if (returning.length) flashPatternAnim(returning)
 }
 
+function ejectPatternVisitor(id) {
+  const gather = patternGather.value
+  if (!gather) return
+  const index = gather.visitors.findIndex((item) => item.id === id)
+  if (index < 0) return
+  const visitor = gather.visitors[index]
+  const note = notes.value.find((item) => item.id === id)
+  if (note) {
+    note.x = visitor.to.x
+    note.y = visitor.to.y
+  }
+  gather.visitors.splice(index, 1)
+  gather.memberKey = memberSetKey(gather.visitors.map((item) => item.id))
+  logEvent('pattern_ejected', { sourceId: gather.sourceId, id }).catch(() => {})
+  if (!gather.visitors.length) endPatternGather(false)
+}
+
+function admitPatternVisitor(id) {
+  const gather = patternGather.value
+  if (!gather || gather.visitors.some((item) => item.id === id)) return
+  const note = notes.value.find((item) => item.id === id)
+  if (!note || isNoteFrozen(note) || isAbandoned(note)) return
+  const from = patternAdmitFrom?.id === id
+    ? { x: patternAdmitFrom.x, y: patternAdmitFrom.y }
+    : { x: note.x, y: note.y }
+  gather.visitors.push({
+    id: note.id,
+    title: String(note.text || '').trim() || 'untitled idea',
+    from,
+    to: { x: note.x, y: note.y },
+    picked: false,
+  })
+  gather.memberKey = memberSetKey(gather.visitors.map((item) => item.id))
+  logEvent('pattern_admitted', { sourceId: gather.sourceId, id }).catch(() => {})
+}
+
 function clearPatternHits() {
   endPatternGather(false)
+}
+
+function pathLength(points) {
+  let sum = 0
+  for (let i = 1; i < points.length; i += 1) {
+    const dx = points[i].x - points[i - 1].x
+    const dy = points[i].y - points[i - 1].y
+    sum += Math.hypot(dx, dy)
+  }
+  return sum
+}
+
+/** Even-odd ray test. The loop is treated as closed. */
+function pointInPolygon(pt, polygon) {
+  let inside = false
+  const n = polygon.length
+  for (let i = 0, j = n - 1; i < n; j = i, i += 1) {
+    const xi = polygon[i].x
+    const yi = polygon[i].y
+    const xj = polygon[j].x
+    const yj = polygon[j].y
+    const crosses = yi > pt.y !== yj > pt.y
+    if (crosses && pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi + 1e-9) + xi) inside = !inside
+  }
+  return inside
+}
+
+const groupStrokePath = computed(() => {
+  const pts = groupStroke.value
+  if (pts.length < 2) return ''
+  return `M ${pts.map((pt) => `${pt.x} ${pt.y}`).join(' L ')}`
+})
+
+function onGroupPointerDown(e) {
+  if (e.button !== 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  groupHint.value = ''
+  groupStroke.value = [clientToCanvas(e)]
+  try {
+    e.currentTarget.setPointerCapture(e.pointerId)
+  } catch {
+    /* capture is optional; window listeners still follow the stroke */
+  }
+  window.addEventListener('pointermove', onGroupPointerMove)
+  window.addEventListener('pointerup', onGroupPointerUp)
+  window.addEventListener('pointercancel', onGroupPointerUp)
+}
+
+function onGroupPointerMove(e) {
+  if (!groupStroke.value.length) return
+  if (e.buttons !== undefined && e.buttons === 0) return
+  const pt = clientToCanvas(e)
+  const last = groupStroke.value[groupStroke.value.length - 1]
+  const dx = pt.x - last.x
+  const dy = pt.y - last.y
+  if (dx * dx + dy * dy < 9) return
+  groupStroke.value = [...groupStroke.value, pt]
+}
+
+function endGroupPointer() {
+  window.removeEventListener('pointermove', onGroupPointerMove)
+  window.removeEventListener('pointerup', onGroupPointerUp)
+  window.removeEventListener('pointercancel', onGroupPointerUp)
+}
+
+function onGroupPointerUp() {
+  if (!groupStroke.value.length) {
+    endGroupPointer()
+    return
+  }
+  const pts = groupStroke.value
+  groupStroke.value = []
+  endGroupPointer()
+  if (pts.length < 3 || pathLength(pts) < 48) {
+    groupHint.value = 'draw a loop around at least two ideas'
+    return
+  }
+  const inside = notes.value.filter((note) => {
+    if (isNoteFrozen(note) || isAbandoned(note)) return false
+    const pos = liveNotePos(note)
+    const size = noteSize(note)
+    return pointInPolygon({ x: pos.x + size.width / 2, y: pos.y + size.height / 2 }, pts)
+  })
+  if (inside.length < 2) {
+    groupHint.value = 'circle at least two ideas'
+    return
+  }
+  beginGather(inside, { sourceId: inside[0].id, origin: 'lasso' })
+  activeTool.value = null
+  logEvent('group_lasso', { visitors: inside.map((item) => item.id) }).catch(() => {})
+}
+
+function beginGather(memberNotes, { sourceId = null, origin = 'pattern' } = {}) {
+  const sorted = [...memberNotes].sort((a, b) => a.id - b.id)
+  if (sorted.length < 2) return false
+  endPatternGather(false)
+  const slots = clusterSlots(sorted)
+  const sid = sourceId ?? sorted[0].id
+  patternGather.value = {
+    sourceId: sid,
+    memberKey: memberSetKey(sorted.map((note) => note.id)),
+    origin,
+    visitors: sorted.map((note, i) => ({
+      id: note.id,
+      title: String(note.text || '').trim() || 'untitled idea',
+      from: { x: note.x, y: note.y },
+      to: { x: slots[i].x, y: slots[i].y },
+      picked: false,
+    })),
+  }
+  selectedId.value = sid
+  selectedConnId.value = null
+  panToSlots(slots)
+  return true
 }
 
 function inspectPattern(places, sourceId) {
@@ -1275,22 +1695,7 @@ function inspectPattern(places, sourceId) {
     selectedId.value = sourceId
     return
   }
-  endPatternGather(false)
-  const slots = clusterSlots(memberNotes)
-  patternGather.value = {
-    sourceId,
-    memberKey: key,
-    visitors: memberNotes.map((note, i) => ({
-      id: note.id,
-      title: String(note.text || '').trim() || 'untitled idea',
-      from: { x: note.x, y: note.y },
-      to: { x: slots[i].x, y: slots[i].y },
-      picked: false,
-    })),
-  }
-  selectedId.value = sourceId
-  selectedConnId.value = null
-  panToSlots(slots)
+  beginGather(memberNotes, { sourceId, origin: 'pattern' })
   logEvent('pattern_gather', { sourceId, visitors: memberNotes.map((item) => item.id) }).catch(() => {})
 }
 
@@ -1303,11 +1708,12 @@ function keepPatternGroup() {
   endPatternGather(true)
 }
 
-/** Keep up to 3 labels attached to the side of a note. */
+/** Keep up to 3 labels attached to the side of a note. Unused pure-AI labels are dropped. */
 function setPinnedLabels(id, pinned) {
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
   note.pinnedLabels = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  note.rationaleLabels = persistedRationaleLabels(note.rationaleLabels, note.pinnedLabels)
   logEvent('pin_change', { noteId: id, pinned: note.pinnedLabels }).catch(() => {})
 }
 
@@ -1322,7 +1728,7 @@ function sameRationale(a, b) {
 function updateLabels(id, labels) {
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
-  note.rationaleLabels = Array.isArray(labels) ? labels : []
+  note.rationaleLabels = persistedRationaleLabels(Array.isArray(labels) ? labels : [], note.pinnedLabels)
   note.pinnedLabels = (note.pinnedLabels || [])
     .map((pin) => {
       const match = note.rationaleLabels.find((item) => sameRationale(item, pin))
@@ -1456,13 +1862,14 @@ function setAbandonPinned(id, pinned) {
   const note = notes.value.find((n) => n.id === id)
   if (!note) return
   note.abandonPinned = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  note.abandonLabels = persistedRationaleLabels(note.abandonLabels, note.abandonPinned)
 }
 
 function updateAbandonRationale(id, payload) {
   const note = notes.value.find((n) => n.id === id)
   if (!note) return
   note.abandonText = payload.input || ''
-  note.abandonLabels = Array.isArray(payload.labels) ? payload.labels : []
+  note.abandonLabels = persistedRationaleLabels(payload.labels, note.abandonPinned)
 }
 
 function removeConnection(id) {
@@ -1511,13 +1918,14 @@ function setRelationAbandonPinned(id, pinned) {
   const conn = connections.value.find((c) => c.id === id)
   if (!conn) return
   conn.abandonPinned = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  conn.abandonLabels = persistedRationaleLabels(conn.abandonLabels, conn.abandonPinned)
 }
 
 function updateRelationAbandonRationale(id, payload) {
   const conn = connections.value.find((c) => c.id === id)
   if (!conn) return
   conn.abandonText = payload.input || ''
-  conn.abandonLabels = Array.isArray(payload.labels) ? payload.labels : []
+  conn.abandonLabels = persistedRationaleLabels(payload.labels, conn.abandonPinned)
 }
 
 /** Clicking a note's rationale box selects that note (and does not pan / place). */
@@ -1571,13 +1979,14 @@ function setRelationPinned(id, pinned) {
   const conn = connections.value.find((c) => c.id === id)
   if (!conn) return
   conn.pinnedLabels = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  conn.rationaleLabels = persistedRationaleLabels(conn.rationaleLabels, conn.pinnedLabels)
   logEvent('pin_change', { connectionId: id, pinned: conn.pinnedLabels }).catch(() => {})
 }
 
 function updateRelationLabels(id, labels) {
   const conn = connections.value.find((c) => c.id === id)
   if (!conn) return
-  conn.rationaleLabels = Array.isArray(labels) ? labels : []
+  conn.rationaleLabels = persistedRationaleLabels(Array.isArray(labels) ? labels : [], conn.pinnedLabels)
   const ids = new Set(conn.rationaleLabels.map((item) => item.id))
   conn.pinnedLabels = (conn.pinnedLabels || [])
     .map((pin) => {
@@ -1594,7 +2003,7 @@ function updateRelationRationale(id, payload) {
   const conn = connections.value.find((c) => c.id === id)
   if (!conn) return
   conn.rationaleText = payload.input || ''
-  conn.rationaleLabels = Array.isArray(payload.labels) ? payload.labels : []
+  conn.rationaleLabels = persistedRationaleLabels(payload.labels, conn.pinnedLabels)
 }
 
 function onRelationPointer(id) {
@@ -1634,6 +2043,9 @@ function applyHistory(snap) {
   if (!connections.value.some((c) => c.id === selectedConnId.value)) selectedConnId.value = null
   draft.value = null
   metrics.value = {}
+  patternGather.value = null
+  patternDragId.value = null
+  patternAnimatingIds.value = new Set()
   historyEpoch.value += 1
   searchVecCache.clear()
 }
@@ -1679,12 +2091,20 @@ function onKeydown(e) {
       closeSearch()
       return
     }
+    if (groupActive.value || groupStroke.value.length) {
+      clearGroupStroke()
+      groupHint.value = ''
+      activeTool.value = null
+      return
+    }
     if (patternGather.value) {
       endPatternGather(false)
       return
     }
-    if (suggestedLinks.value.length || suggestLoading.value || suggestError.value) {
+    if (suggestedLinks.value.length || suggestLoading.value || suggestError.value || connectActive.value) {
       clearSuggestions()
+      activeTool.value = null
+      draft.value = null
       return
     }
     if (draft.value) {
@@ -1724,13 +2144,17 @@ function onKeydown(e) {
     e.preventDefault()
     toggleTool('sticky')
   }
+  if ((e.key === 'g' || e.key === 'G') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault()
+    toggleTool('group')
+  }
 }
 
 function updateRationale(id, payload) {
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
   note.rationaleText = payload.input || ''
-  note.rationaleLabels = Array.isArray(payload.labels) ? payload.labels : []
+  note.rationaleLabels = persistedRationaleLabels(payload.labels, note.pinnedLabels)
 }
 
 function canvasPayload() {
@@ -1746,18 +2170,22 @@ function canvasPayload() {
       pinnedLabels: note.pinnedLabels || [],
       rationaleOpen: Boolean(note.rationaleOpen),
       rationaleText: note.rationaleText || '',
-      rationaleLabels: note.rationaleLabels || [],
+      rationaleLabels: persistedRationaleLabels(note.rationaleLabels, note.pinnedLabels),
       abandoned: Boolean(note.abandoned),
       abandonOpen: Boolean(note.abandonOpen),
       abandonText: note.abandonText || '',
-      abandonLabels: note.abandonLabels || [],
+      abandonLabels: persistedRationaleLabels(note.abandonLabels, note.abandonPinned),
       abandonPinned: note.abandonPinned || [],
       frozenX: note.frozenX,
       frozenY: note.frozenY,
       frozenWidth: note.frozenWidth,
       frozenHeight: note.frozenHeight,
     })),
-    connections: connections.value,
+    connections: connections.value.map((c) => ({
+      ...c,
+      rationaleLabels: persistedRationaleLabels(c.rationaleLabels, c.pinnedLabels),
+      abandonLabels: persistedRationaleLabels(c.abandonLabels, c.abandonPinned),
+    })),
     pan: pan.value,
     scale: scale.value,
     nextId,
@@ -1884,6 +2312,7 @@ onUnmounted(() => {
   wheelTarget?.removeEventListener('wheel', onWheel)
   wheelTarget = null
   clearConnectDrag()
+  clearGroupStroke()
   clearTimeout(saveTimer)
   window.clearTimeout(patternAnimTimer)
   suggestAbort?.abort()
@@ -1895,8 +2324,8 @@ onUnmounted(() => {
     <div
       ref="canvasRef"
       class="canvas"
-      :class="{ placing: stickyActive, connecting: connectActive }"
-      :style="connectActive ? { cursor: PEN_CURSOR } : undefined"
+      :class="{ placing: stickyActive, connecting: connectActive, grouping: groupActive, 'group-focus': patternDimActive }"
+      :style="connectActive || groupActive ? { cursor: PEN_CURSOR } : undefined"
       @mousedown="onCanvasMouseDown"
       @click="onCanvasClick"
     >
@@ -1919,7 +2348,7 @@ onUnmounted(() => {
 
       <div class="notes-layer" :style="notesLayerStyle">
         <svg class="connectors" overflow="visible" aria-hidden="true">
-          <g v-for="line in renderedConnections" :key="line.id">
+          <g v-for="line in renderedConnections" v-show="connectionOnGroupStage(line)" :key="line.id">
             <path
               class="connector-hit"
               :class="{ abandoned: line.abandoned }"
@@ -1942,14 +2371,15 @@ onUnmounted(() => {
           </g>
           <path
             v-if="draftPath"
+            class="draft-line"
             :d="draftPath"
             fill="none"
-            stroke="#b45309"
-            stroke-width="2.5"
+            :stroke="USER_ECHO"
+            stroke-width="3"
             stroke-linecap="round"
             stroke-dasharray="6 5"
           />
-          <g v-for="line in renderedSuggestions" :key="`sug-${line.key}`">
+          <g v-for="line in renderedSuggestions" v-show="!patternDimActive" :key="`sug-${line.key}`">
             <path
               class="connector-hit suggest-hit"
               :d="line.d"
@@ -1964,18 +2394,34 @@ onUnmounted(() => {
               :class="{ picked: line.picked }"
               :d="line.d"
               fill="none"
-              :stroke="line.picked ? '#2563eb' : '#b45309'"
+              :stroke="line.picked ? AI_ECHO_STRONG : AI_ECHO"
               :stroke-width="line.picked ? 3 : 2.5"
               stroke-linecap="round"
               :stroke-dasharray="line.picked ? '9 5' : '7 6'"
             />
           </g>
         </svg>
-        <div v-if="patternFrameStyle" class="pattern-frame" :style="patternFrameStyle">
-          <span class="pattern-frame-label">suggested group</span>
+        <div v-if="patternFrameStyle" class="pattern-frame" :class="{ joining: patternJoiningId != null }" :style="patternFrameStyle">
+          <div class="pattern-frame-caption">
+            <span class="pattern-frame-kicker">{{ patternJoiningId ? 'drop to add' : patternGather?.origin === 'lasso' ? 'your group' : 'suggested group' }}</span>
+            <span v-if="patternGroupWhy && !patternJoiningId" class="pattern-frame-why">{{ patternGroupWhy }}</span>
+          </div>
         </div>
+        <svg v-if="groupStrokePath" class="group-lasso" overflow="visible" aria-hidden="true">
+          <path
+            class="group-lasso-line"
+            :d="groupStrokePath"
+            fill="none"
+            stroke="#b45309"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-dasharray="7 5"
+          />
+        </svg>
         <div
           v-for="line in renderedConnections"
+          v-show="connectionOnGroupStage(line)"
           :key="`rel-${line.id}`"
           class="relation-wrap"
           :class="{ abandoned: line.abandoned }"
@@ -2006,6 +2452,7 @@ onUnmounted(() => {
         </div>
         <div
           v-for="line in renderedSuggestions"
+          v-show="!patternDimActive"
           :key="`sug-chip-${line.key}`"
           class="suggest-wrap"
           :style="{
@@ -2032,7 +2479,7 @@ onUnmounted(() => {
             :note="note"
             :scale="scale"
             :selected="selectedId === note.id"
-            :connect-mode="connectActive"
+            :connect-mode="noteShowsMag(note)"
             :mag-outset="MAG_OUTSET"
             :drafting="!!draft"
             :draft-from-id="draft?.fromId ?? null"
@@ -2043,13 +2490,17 @@ onUnmounted(() => {
             :display-x="liveNotePos(note).x"
             :display-y="liveNotePos(note).y"
             :gathering="patternHitIds.has(note.id) || patternAnimatingIds.has(note.id)"
-            :search-hit="searchHitIds.has(note.id) || patternHitIds.has(note.id)"
+            :leaving-group="patternLeavingId === note.id"
+            :joining-group="patternJoiningId === note.id"
+            :search-hit="searchHitIds.has(note.id) || patternHitIds.has(note.id) || patternJoiningId === note.id"
             :search-picked="searchPickedIds.has(note.id) || patternPickedIds.has(note.id)"
-            :search-dim="searchDimActive || patternDimActive"
+            :search-dim="searchDimActive"
+            :stage-hidden="patternDimActive && !noteOnGroupStage(note.id)"
             :suggesting="suggestLoading && suggestSourceId === note.id"
             :suggest-hit="suggestTargetIds.has(note.id)"
             :suggest-picked="suggestedLinks.some((link) => link.toId === note.id && link.picked)"
             @move="moveNote"
+            @move-end="onNoteMoveEnd"
             @text-change="changeText"
             @select="selectNote"
             @toggle-gather="toggleGatherPick"
@@ -2058,8 +2509,7 @@ onUnmounted(() => {
             @metrics="setMetrics"
             @connect-start="onConnectStart"
             @connect-end="onConnectEnd"
-            @request-connect="toggleTool('connect')"
-            @suggest-relations="suggestRelations"
+            @request-relation="onRelationTool"
             @request-delete="requestDeleteNote"
             @toggle-rationale="toggleRationale"
             @open-rationale="openRationale"
@@ -2069,7 +2519,7 @@ onUnmounted(() => {
             @revive="reviveNote"
           />
           <div
-            v-if="note.abandonOpen && !note.abandoned"
+            v-if="note.abandonOpen && !note.abandoned && noteOnGroupStage(note.id)"
             class="rationale-dock"
             :style="rationaleStyle(note)"
             @pointerdown.stop="onRationalePointer(note.id)"
@@ -2103,7 +2553,7 @@ onUnmounted(() => {
             />
           </div>
           <div
-            v-show="note.rationaleOpen && !note.abandoned && !note.abandonOpen"
+            v-show="note.rationaleOpen && !note.abandoned && !note.abandonOpen && noteOnGroupStage(note.id)"
             class="rationale-dock"
             :style="rationaleStyle(note)"
             @pointerdown.stop="onRationalePointer(note.id)"
@@ -2133,7 +2583,7 @@ onUnmounted(() => {
         </template>
         <template v-for="line in renderedConnections" :key="`rel-abandon-${line.id}`">
           <div
-            v-if="line.abandonOpen && !line.abandoned"
+            v-if="line.abandonOpen && !line.abandoned && connectionOnGroupStage(line)"
             class="rationale-dock"
             :style="relationRationaleStyle(line)"
             @pointerdown.stop="onRelationPointer(line.id)"
@@ -2169,7 +2619,7 @@ onUnmounted(() => {
         </template>
         <div
           v-for="line in renderedConnections"
-          v-show="line.rationaleOpen && !line.abandoned && !line.abandonOpen"
+          v-show="line.rationaleOpen && !line.abandoned && !line.abandonOpen && connectionOnGroupStage(line)"
           :key="`rel-dock-${line.id}`"
           class="rationale-dock"
           :style="relationRationaleStyle(line)"
@@ -2315,13 +2765,25 @@ onUnmounted(() => {
         </button>
       </div>
 
+      <div
+        v-if="groupActive"
+        class="group-lasso-layer"
+        @pointerdown="onGroupPointerDown"
+        @pointermove="onGroupPointerMove"
+        @pointerup="onGroupPointerUp"
+        @pointercancel="onGroupPointerUp"
+      />
+
       <!-- FigJam-style tool well: sticky note only -->
       <div class="bottom-bar" @mousedown.stop @click.stop>
         <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
-        <div v-else-if="suggestError" class="hint">{{ suggestError }}</div>
-        <div v-else-if="suggestLoading" class="hint">looking for related ideas…</div>
-        <div v-else-if="suggestedLinks.length" class="hint">dashed = suggested · click to choose one or more</div>
-        <div v-else-if="patternGather" class="hint">dashed frame = suggested group · tick a subset or keep group · esc cancels</div>
+        <div v-else-if="groupActive && groupHint" class="hint">{{ groupHint }}</div>
+        <div v-else-if="groupActive" class="hint">draw around ideas to group them · esc to cancel</div>
+        <div v-else-if="suggestError" class="hint">{{ suggestError }} · or drag a mag point to draw your own</div>
+        <div v-else-if="suggestLoading" class="hint">looking for related ideas… · you can still drag a mag point</div>
+        <div v-else-if="suggestedLinks.length" class="hint">blue dashed = AI · yellow dashed = you drawing · click a blue line to keep it</div>
+        <div v-else-if="connectActive" class="hint">drag a mag point on this note · other notes show mag points when the pen is close</div>
+        <div v-else-if="patternGather" class="hint">{{ patternGather.origin === 'lasso' ? 'your group · drag an idea out or drop one in · keep group · esc cancels' : 'dashed frame = suggested group · labels on the frame are why they sit together · drag an idea out or drop one in · keep group · esc cancels' }}</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
         <button
           v-if="suggestedLinks.length"
@@ -2357,7 +2819,7 @@ onUnmounted(() => {
           v-if="patternGather"
           type="button"
           class="tool-btn"
-          title="Send every gathered idea back"
+          title="Send remaining gathered ideas back"
           @click="endPatternGather(false)"
         >
           <span class="btn-label">put back</span>
@@ -2371,6 +2833,16 @@ onUnmounted(() => {
         >
           <StickyNoteIcon :size="28" />
           <span class="btn-label">create idea</span>
+        </button>
+        <button
+          type="button"
+          class="tool-btn"
+          :class="{ active: groupActive }"
+          title="Group ideas (G)"
+          @click="toggleTool('group')"
+        >
+          <GroupIcon :size="28" />
+          <span class="btn-label">group</span>
         </button>
         <div class="search-slot">
           <div v-if="searchHits.length || (searchOpen && searchError)" class="search-results">
@@ -2442,8 +2914,27 @@ onUnmounted(() => {
   overscroll-behavior: none;
 }
 
-.canvas.placing {
+.canvas.placing,
+.canvas.grouping {
   cursor: crosshair;
+}
+
+.group-lasso-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  touch-action: none;
+  cursor: inherit;
+}
+
+.group-lasso {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+  width: 1px;
+  height: 1px;
 }
 
 .grid {
@@ -2452,6 +2943,10 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+.canvas.group-focus .grid {
+  visibility: hidden;
 }
 
 .connectors {
@@ -2479,56 +2974,73 @@ onUnmounted(() => {
   cursor: pointer;
 }
 
+.suggest-line {
+  filter: drop-shadow(0 0 0.5px #1e3a5f);
+}
+
+.draft-line {
+  filter: drop-shadow(0 0 0.5px #5b4a12);
+}
+
 .suggest-wrap {
   position: absolute;
+  width: max-content;
+  max-width: 260px;
   transform: translate(-50%, -50%);
   pointer-events: auto;
   z-index: 24;
 }
 
 .suggest-pick {
-  display: flex;
-  align-items: center;
+  display: inline-flex;
+  align-items: flex-start;
   gap: 6px;
-  max-width: 220px;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 260px;
   margin: 0;
-  padding: 5px 8px;
-  border: 1px dashed #b45309;
-  border-radius: 999px;
+  padding: 6px 9px;
+  border: 1px dashed #93c5fd;
+  border-radius: 10px;
   background: var(--chrome);
-  color: var(--ink);
+  color: #1e3a5f;
   box-shadow: 0 8px 20px rgba(44, 40, 31, 0.12);
   cursor: pointer;
 }
 
 .suggest-pick.on {
   border-style: solid;
-  border-color: #2563eb;
-  background: #eff6ff;
+  border-color: #60a5fa;
+  background: rgba(147, 197, 253, 0.28);
 }
 
 .suggest-check {
   flex: 0 0 auto;
   width: 13px;
   height: 13px;
+  margin-top: 1px;
   border: 1.5px solid var(--line);
   border-radius: 4px;
   background: var(--paper);
 }
 
 .suggest-check.on {
-  border-color: #2563eb;
-  background: #2563eb;
+  border-color: #60a5fa;
+  background: #93c5fd;
   box-shadow: inset 0 0 0 2px var(--chrome);
 }
 
 .suggest-why {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 9em;
+  max-width: 220px;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
   font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 10px;
-  line-height: 1.2;
+  font-size: 11px;
+  line-height: 1.35;
   color: var(--ink-muted);
 }
 
@@ -2557,18 +3069,52 @@ onUnmounted(() => {
   pointer-events: none;
   border: 1.5px dashed #b45309;
   border-radius: 18px;
-  background: rgba(180, 83, 9, 0.05);
+  background: transparent;
 }
 
-.pattern-frame-label {
+.pattern-frame-caption {
   position: absolute;
-  top: -16px;
-  left: 10px;
+  top: 0;
+  left: 12px;
+  right: 12px;
+  transform: translateY(calc(-100% - 6px));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  max-width: calc(100% - 24px);
+}
+
+.pattern-frame-kicker {
   font-family: 'DM Mono', ui-monospace, monospace;
   font-size: 10px;
   letter-spacing: 0.02em;
   color: #b45309;
-  white-space: nowrap;
+}
+
+.pattern-frame-why {
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px dashed #b45309;
+  border-radius: 8px;
+  background: var(--chrome);
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #92400e;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.pattern-frame.joining {
+  border-color: #92400e;
+  background: transparent;
+}
+
+.pattern-frame.joining .pattern-frame-kicker {
+  color: #92400e;
 }
 
 .notes-layer > :deep(.note),

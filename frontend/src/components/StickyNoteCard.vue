@@ -9,7 +9,6 @@ import {
   cachedDraftVector,
   clipUserLabel,
   clusterSimilarLabels,
-  tabPatternHint,
   embedTexts,
   isSimilarLabel,
   LIVE_EMBED_MS,
@@ -23,8 +22,8 @@ import {
 } from '../api/rationale'
 import ColorWheel from './ColorWheel.vue'
 import ConnectionIcon from './ConnectionIcon.vue'
-import SuggestRelationIcon from './SuggestRelationIcon.vue'
 import DeleteIcon from './DeleteIcon.vue'
+import LabelPeek from './LabelPeek.vue'
 
 const MIN_SIZE = 120 // smallest width/height from corner resize; keeps room for the edge tabs
 const BASE_FONT_PX = 13
@@ -48,9 +47,12 @@ const props = defineProps({
   displayX: { type: Number, default: null },
   displayY: { type: Number, default: null },
   gathering: { type: Boolean, default: false },
+  leavingGroup: { type: Boolean, default: false },
+  joiningGroup: { type: Boolean, default: false },
   searchHit: { type: Boolean, default: false },
   searchPicked: { type: Boolean, default: false },
   searchDim: { type: Boolean, default: false },
+  stageHidden: { type: Boolean, default: false },
   suggesting: { type: Boolean, default: false },
   suggestHit: { type: Boolean, default: false },
   suggestPicked: { type: Boolean, default: false },
@@ -65,11 +67,13 @@ function labelPattern(label) {
   return props.patternStats?.byRid?.[label?.rid] || null
 }
 
-const emit = defineEmits(['move', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'requestConnect', 'suggestRelations', 'requestDelete', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive', 'inspect-pattern', 'toggle-gather'])
+const emit = defineEmits(['move', 'move-end', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'request-relation', 'requestDelete', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive', 'inspect-pattern', 'toggle-gather'])
 
-function groupPatternHint(group) {
-  const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
-  return tabPatternHint(group.members.length, stats)
+function patternAcross(label) {
+  const owners = Number(labelPattern(label)?.owners) || 0
+  if (owners >= 2) return owners
+  const n = recurrence(label)
+  return n > 1 ? n : 0
 }
 
 function inspectGroupPattern(group) {
@@ -432,9 +436,9 @@ function isTabEcho(label) {
 
 // Tabs run down the right edge until the note is too short, then the highest-ranked
 // ones wrap onto the top edge so rank order still reads clockwise around the note.
-const TAB_GAP = 3 // matches the flex gap in .edge-tabs
+const TAB_GAP = 5 // matches the flex gap in .edge-tabs
 const TAB_INSET = 10 // the column starts this far down, and keeps the same clearance at the bottom
-const TAB_FALLBACK_H = 18 // one-line tab, used until a tab has been measured on the right edge
+const TAB_FALLBACK_H = 26 // one-line tab, used until a tab has been measured on the right edge
 
 const rightTabsRef = ref(null)
 const addWrapRef = ref(null)
@@ -445,6 +449,7 @@ const tabGroups = computed(() => clusterSimilarLabels(pinnedLabels.value))
 
 const topTabs = computed(() => tabGroups.value.slice(0, topTabCount.value))
 const rightTabs = computed(() => tabGroups.value.slice(topTabCount.value))
+const canAddTab = computed(() => pinnedLabels.value.length < MAX_PINNED || creating.value)
 
 /** Right-edge heights only; a tab on the top edge keeps the last height it had on the right. */
 function measureTabs() {
@@ -459,7 +464,8 @@ function layoutTabs() {
   if (!noteRef.value || frozen.value) return
   measureTabs()
   const list = tabGroups.value
-  const plusHeight = addWrapRef.value?.offsetHeight || 16
+  const plusHeight =
+    pinnedLabels.value.length < MAX_PINNED ? addWrapRef.value?.offsetHeight || 24 : 0
   const room = noteRef.value.offsetHeight - TAB_INSET * 2
   let count = 0
   while (count < list.length) {
@@ -482,6 +488,7 @@ function relayoutTabs(passes = 2) {
 
 // Pinning, unpinning, folds and edited label text all change how tall the column is.
 watch(tabGroups, () => relayoutTabs(), { deep: true })
+watch(canAddTab, () => relayoutTabs())
 
 function applyLiveEmbedHits(vec) {
   const hits = {}
@@ -572,18 +579,11 @@ function toggleColorPicker(e) {
   colorOpen.value = !colorOpen.value
 }
 
-/** Tell the canvas to arm the connector tool. */
-function requestConnect(e) {
+/** Arm mag-point drawing and ask the canvas for AI relation dashes from this note. */
+function requestRelation(e) {
   e.stopPropagation()
   colorOpen.value = false
-  emit('requestConnect')
-}
-
-/** Ask the canvas for AI relation suggestions from this note. */
-function requestSuggest(e) {
-  e.stopPropagation()
-  colorOpen.value = false
-  emit('suggestRelations', props.note.id)
+  emit('request-relation', props.note.id)
 }
 
 function requestDelete(e) {
@@ -616,7 +616,7 @@ function nextLabelId() {
   return max + 1
 }
 
-/** × on a tab only takes the label off the note; it stays in the reflection pool. */
+/** × on a tab takes it off the note. Yellow labels stay saved; unused AI is dropped. */
 function unpinLabel(label, e) {
   e?.preventDefault()
   e?.stopPropagation()
@@ -669,7 +669,7 @@ function onTabEditKeydown(e, label) {
 
 function beginCreateTab(e) {
   e?.stopPropagation()
-  if (creating.value) return
+  if (creating.value || pinnedLabels.value.length >= MAX_PINNED) return
   activate()
   addHover.value = false
   creating.value = true
@@ -758,7 +758,8 @@ function onNoteMouseDown(e) {
     window.removeEventListener('mouseup', onUp)
     dragCleanup = null
     dragging.value = false
-    if (!didDrag && onTab) emit('openRationale', props.note.id)
+    if (didDrag) emit('move-end', props.note.id)
+    else if (!didDrag && onTab) emit('openRationale', props.note.id)
     else if (!didDrag && !onTab && !props.gathering && (alreadySelected || !String(props.note.text || '').trim())) startTextEdit()
   }
 
@@ -877,10 +878,13 @@ function onMagMouseUp(e, side) {
       editing,
       'search-hit': searchHit && !frozen,
       'search-picked': searchPicked && !frozen,
-      'search-dim': searchDim && !searchHit && !searchPicked && !frozen,
+      'search-dim': searchDim && !searchHit && !searchPicked && !frozen && !stageHidden,
+      'stage-hidden': stageHidden,
       'suggest-hit': suggestHit && !suggestPicked && !frozen,
       'suggest-picked': suggestPicked && !frozen,
       gathering: gathering && !dragging && !resizing,
+      'leaving-group': leavingGroup,
+      'joining-group': joiningGroup,
     }"
     :style="{
       left: `${displayX ?? note.x}px`,
@@ -889,6 +893,7 @@ function onMagMouseUp(e, side) {
       minHeight: `${note.height ?? 168}px`,
       background: note.color,
       '--mag-outset': `${magOutset}px`,
+      '--tab-max': `${Math.min(160, note.width ?? 168)}px`,
     }"
     @mousedown="onNoteMouseDown"
     @click="onNoteClick"
@@ -923,30 +928,19 @@ function onMagMouseUp(e, side) {
       </button>
       <div class="toolbar-item">
         <button
-          class="color-btn"
+          class="color-btn suggest-btn"
           type="button"
-          :class="{ open: connectMode }"
-          title="Connector"
-          @click="requestConnect"
+          :class="{ open: connectMode, busy: suggesting }"
+          :title="suggesting ? 'Looking for related ideas…' : 'Link ideas · AI suggestions'"
+          @click="requestRelation"
         >
           <ConnectionIcon :size="18" />
         </button>
         <div v-if="connectMode" class="tool-hint">
-          <span>drag to mag</span>
+          <span>yellow dash = you</span>
+          <span>blue dash = AI</span>
           <span>esc to cancel</span>
         </div>
-      </div>
-      <div class="toolbar-item">
-        <button
-          class="color-btn suggest-btn"
-          type="button"
-          :class="{ busy: suggesting }"
-          :disabled="suggesting"
-          :title="suggesting ? 'Looking for related ideas…' : 'Suggest relations (AI)'"
-          @click="requestSuggest"
-        >
-          <SuggestRelationIcon :size="18" />
-        </button>
       </div>
       <div class="toolbar-item">
         <button
@@ -1023,12 +1017,16 @@ function onMagMouseUp(e, side) {
             @pointerdown.stop
             @mousedown.stop
             @click.stop="startTabEdit(label)"
-          >{{ label.text }}</span>
-          <span
-            v-if="recurrence(label) > 1"
-            class="tab-badge"
-            :title="`this rationale is behind ${recurrence(label)} ideas`"
-          >×{{ recurrence(label) }}</span>
+          ><LabelPeek :text="label.text" prefer="below" /></span>
+          <button
+            v-if="patternAcross(label) > 1"
+            type="button"
+            class="tab-count"
+            :title="`this pattern appears on ${patternAcross(label)} ideas`"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="inspectGroupPattern(group)"
+          >{{ patternAcross(label) }}</button>
           <button
             type="button"
             class="tab-del"
@@ -1038,15 +1036,6 @@ function onMagMouseUp(e, side) {
             @click.stop="unpinLabel(label, $event)"
           >×</button>
         </span>
-        <button
-          v-if="groupPatternHint(group)"
-          type="button"
-          class="tab-same-hint"
-          title="Bring those ideas nearby"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop="inspectGroupPattern(group)"
-        >{{ groupPatternHint(group) }}</button>
       </div>
     </div>
 
@@ -1086,12 +1075,16 @@ function onMagMouseUp(e, side) {
             @pointerdown.stop
             @mousedown.stop
             @click.stop="startTabEdit(label)"
-          >{{ label.text }}</span>
-          <span
-            v-if="recurrence(label) > 1"
-            class="tab-badge"
-            :title="`this rationale is behind ${recurrence(label)} ideas`"
-          >×{{ recurrence(label) }}</span>
+          ><LabelPeek :text="label.text" prefer="right" /></span>
+          <button
+            v-if="patternAcross(label) > 1"
+            type="button"
+            class="tab-count"
+            :title="`this pattern appears on ${patternAcross(label)} ideas`"
+            @pointerdown.stop
+            @mousedown.stop
+            @click.stop="inspectGroupPattern(group)"
+          >{{ patternAcross(label) }}</button>
           <button
             type="button"
             class="tab-del"
@@ -1101,17 +1094,9 @@ function onMagMouseUp(e, side) {
             @click.stop="unpinLabel(label, $event)"
           >×</button>
         </span>
-        <button
-          v-if="groupPatternHint(group)"
-          type="button"
-          class="tab-same-hint"
-          title="Bring those ideas nearby"
-          @pointerdown.stop
-          @mousedown.stop
-          @click.stop="inspectGroupPattern(group)"
-        >{{ groupPatternHint(group) }}</button>
       </div>
       <div
+        v-if="canAddTab"
         ref="addWrapRef"
         class="edge-add-wrap"
         @pointerdown.stop
@@ -1171,7 +1156,7 @@ function onMagMouseUp(e, side) {
       class="fold-btn"
       type="button"
       :class="{ open: note.rationaleOpen }"
-      :title="note.rationaleOpen ? 'Hide reflection' : 'Show reflection'"
+      :title="note.rationaleOpen ? 'Hide rationale' : 'Show rationale'"
       :style="{ color: textColor }"
       @pointerdown.stop
       @mousedown.stop
@@ -1234,6 +1219,19 @@ function onMagMouseUp(e, side) {
   padding-left: 36px;
 }
 
+.note.leaving-group {
+  z-index: 23;
+  opacity: 0.88;
+  box-shadow: 0 8px 22px rgba(44, 40, 31, 0.16);
+}
+
+.note.joining-group {
+  z-index: 23;
+  box-shadow:
+    0 0 0 2px #b45309,
+    0 8px 22px rgba(44, 40, 31, 0.16);
+}
+
 .gather-check {
   position: absolute;
   top: 8px;
@@ -1284,6 +1282,11 @@ function onMagMouseUp(e, side) {
 
 .note.search-dim {
   opacity: 0.28;
+}
+
+.note.stage-hidden {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .note.frozen {
@@ -1559,7 +1562,7 @@ function onMagMouseUp(e, side) {
   top: 10px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 5px;
   z-index: 2;
 }
 
@@ -1580,7 +1583,7 @@ function onMagMouseUp(e, side) {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 3px;
+  gap: 5px;
   z-index: 2;
 }
 
@@ -1591,9 +1594,9 @@ function onMagMouseUp(e, side) {
 /* Shrink to share the note's width, and only wrap to a second row when that is not enough. */
 .edge-tabs-top .edge-tab {
   flex: 0 1 auto;
-  min-width: 60px;
-  padding: 2px 5px;
-  border-radius: 3px 3px 0 0;
+  min-width: 76px;
+  padding: 5px 8px;
+  border-radius: 4px 4px 0 0;
   border-left-width: 1px; /* border colour still comes from the .ai / .user shorthand */
   border-left-style: solid;
   border-bottom-width: 0;
@@ -1601,19 +1604,20 @@ function onMagMouseUp(e, side) {
 }
 
 .edge-tab {
+  position: relative;
   box-sizing: border-box;
   display: inline-flex;
   align-items: flex-start;
-  gap: 2px;
+  gap: 4px;
   width: max-content;
-  max-width: 88px;
-  padding: 2px 4px 2px 6px;
+  max-width: var(--tab-max, 160px);
+  padding: 5px 8px 5px 9px;
   border-left: 0;
-  border-radius: 0 3px 3px 0;
+  border-radius: 0 4px 4px 0;
   box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.18);
   font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 9px;
-  line-height: 1.25;
+  font-size: 12px;
+  line-height: 1.35;
   letter-spacing: 0.01em;
   overflow-wrap: break-word;
   word-break: normal;
@@ -1690,8 +1694,8 @@ function onMagMouseUp(e, side) {
   background: rgba(253, 230, 138, 0.28);
   color: rgba(91, 74, 18, 0.62);
   box-shadow: none;
-  font-size: 8px;
-  line-height: 1.2;
+  font-size: 11px;
+  line-height: 1.25;
   white-space: nowrap;
   overflow: hidden;
   pointer-events: none;
@@ -1709,7 +1713,8 @@ function onMagMouseUp(e, side) {
 
 .edge-tab .tab-input {
   display: block;
-  width: 72px;
+  width: auto;
+  min-width: 72px;
   margin: 0;
   padding: 0;
   border: 0;
@@ -1729,9 +1734,9 @@ function onMagMouseUp(e, side) {
   min-width: 0;
   flex: 1;
   cursor: text;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
   overflow: hidden;
 }
 
@@ -1748,44 +1753,39 @@ function onMagMouseUp(e, side) {
   align-items: center;
 }
 
-.tab-same-hint {
-  align-self: center;
-  max-width: 92px;
-  margin: 0;
+.tab-count {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 2;
+  box-sizing: border-box;
+  min-width: 16px;
+  height: 16px;
   padding: 0 4px;
-  border: 0;
-  background: transparent;
-  color: var(--ink-faint);
+  border: 1px solid rgba(44, 40, 31, 0.28);
+  border-radius: 999px;
+  background: #fff;
+  color: #1f2937;
   font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 8px;
-  line-height: 1.25;
-  letter-spacing: 0.01em;
-  text-align: left;
-  white-space: normal;
-  overflow-wrap: anywhere;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+  transform: translate(45%, -45%);
   cursor: pointer;
 }
 
-.tab-same-hint:hover {
-  color: var(--accent);
-}
-
-/* Recurrence, not authorship: the tab colour already says who wrote it. */
-.tab-badge {
-  flex-shrink: 0;
-  align-self: center;
-  padding: 0 3px;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.22);
-  font-size: 8px;
-  font-weight: 700;
-  line-height: 12px;
+.tab-count:hover {
+  border-color: #b45309;
+  color: #b45309;
 }
 
 .tab-del {
+  position: relative;
+  z-index: 3;
   flex-shrink: 0;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   margin-top: 1px;
   padding: 0;
   border: 0;
@@ -1794,8 +1794,8 @@ function onMagMouseUp(e, side) {
   color: inherit;
   opacity: 0.5;
   cursor: pointer;
-  font-size: 11px;
-  line-height: 12px;
+  font-size: 13px;
+  line-height: 14px;
 }
 
 .tab-del:hover {
@@ -1856,22 +1856,23 @@ function onMagMouseUp(e, side) {
 
 .edge-add {
   box-sizing: border-box;
-  width: 16px;
-  height: 12px;
+  width: 26px;
+  height: 24px;
   padding: 0;
   margin-top: 3px;
-  border: 0;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.28);
-  font-size: 10px;
-  line-height: 12px;
-  color: rgba(22, 22, 29, 0.78);
+  border: 1px solid rgba(44, 40, 31, 0.22);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.88);
+  font-size: 18px;
+  line-height: 22px;
+  color: rgba(22, 22, 29, 0.92);
   cursor: pointer;
 }
 
 .edge-add:hover {
-  background: rgba(255, 255, 255, 0.45);
-  color: rgba(22, 22, 29, 0.92);
+  background: #fff;
+  border-color: rgba(44, 40, 31, 0.4);
+  color: #16161d;
 }
 
 .note-text {
@@ -1901,7 +1902,7 @@ function onMagMouseUp(e, side) {
   padding: 0;
   border-radius: 50%;
   background: #fff;
-  border: 2px solid #8ec8ff;
+  border: 2px solid #fde68a;
   box-sizing: border-box;
   z-index: 6;
   cursor: inherit;
@@ -1910,7 +1911,7 @@ function onMagMouseUp(e, side) {
 
 .mag-point:hover {
   transform: translate(-50%, -50%) scale(1.25);
-  background: #8ec8ff;
+  background: #fde68a;
 }
 
 .mag-point.blocked,
