@@ -50,6 +50,7 @@ Rules:
 - match the language of the input
 - if target is "relation", labels should name why two ideas are linked
 - if target is "note", labels should name the idea's design rationale
+- if target is "group", labels should name why these ideas belong together as one group
 - Read the sticky-note idea FIRST: if it already contains a why (reason, constraint, who it is for, why it matters), use that.
 - Then combine with the reflection field. If reflection is empty, label only from the idea's own why.
 - If the idea is only a proposal with no why, label from the reflection field.
@@ -101,6 +102,19 @@ Rules:
 - "why" is at most 12 words, same language as the ideas, naming the relation
 - no chatbot tone, no markdown
 """
+SUGGEST_GROUP_WHY_PROMPT = """You write one short reason why these sticky-note ideas belong in one suggested group.
+
+Return JSON only:
+{"why":"..."}
+
+Rules:
+- one sentence, at most 18 words
+- name the shared concern, goal, constraint, tension, or who it is for
+- use the idea texts and the shared rationale labels as clues
+- write a reason, not a list of label names
+- same language as the ideas
+- no chatbot tone, no markdown, no quotation marks around the sentence
+"""
 DETECT_REFLECTION_PROMPT = """You decide whether a sticky-note IDEA already contains design reflection (the why), not only a proposal.
 
 Reflection means a reason, motive, constraint, assumption, worry, tradeoff, who it is for, or why it matters.
@@ -119,6 +133,7 @@ Rules:
 MAX_KNOWN_LABELS = 40  # caps prompt size; the newest labels are the ones worth matching
 MAX_SUGGEST_LINKS = 5
 MAX_SUGGEST_WHY_WORDS = 12
+MAX_GROUP_WHY_WORDS = 18
 MIN_RATIONALE_CHARS = 1
 OPENAI_TIMEOUT_S = 30.0
 MAX_LABEL_WORDS = 10
@@ -224,7 +239,7 @@ class KnownLabel(BaseModel):
 class RationaleRequest(BaseModel):
     text: str = Field(default="", max_length=4000)  # reflection field
     idea: str = Field(default="", max_length=4000)  # sticky-note / relation body
-    target: str = Field(default="generic")  # generic | note | relation
+    target: str = Field(default="generic")  # generic | note | relation | group
     known: list[KnownLabel] = Field(default_factory=list, max_length=200)
 
 
@@ -250,6 +265,11 @@ class SuggestIdea(BaseModel):
 class SuggestLinksRequest(BaseModel):
     source: SuggestIdea
     candidates: list[SuggestIdea] = Field(min_length=1, max_length=40)
+
+
+class SuggestGroupWhyRequest(BaseModel):
+    ideas: list[SuggestIdea] = Field(min_length=2, max_length=8)
+    shared: list[str] = Field(default_factory=list, max_length=6)
 
 
 class DetectReflectionRequest(BaseModel):
@@ -850,6 +870,51 @@ async def suggest_links(req: SuggestLinksRequest):
     return {"links": parse_suggest_links(content, allowed_ids), "model": model}
 
 
+def parse_group_why(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return clip_words(str(data.get("why") or "").strip(), MAX_GROUP_WHY_WORDS)
+
+
+@app.post("/api/group-why")
+async def suggest_group_why(req: SuggestGroupWhyRequest):
+    """One short narrative for why these ideas sit in a suggested group."""
+    listing = "\n\n".join(idea_block(item) for item in req.ideas)
+    shared = [str(item).strip() for item in req.shared if str(item).strip()][:6]
+    shared_line = " | ".join(item[:200] for item in shared) if shared else "(none)"
+    user_content = f"grouped ideas\n{listing}\n\nshared rationale labels: {shared_line}"
+
+    client = get_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SUGGEST_GROUP_WHY_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.4,
+            max_tokens=80,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise openai_http_error(exc) from exc
+
+    content = response.choices[0].message.content
+    why = parse_group_why(content or "")
+    return {"why": why, "model": model}
+
+
 def parse_detect_reflection(raw: str) -> dict:
     text = raw.strip()
     if text.startswith("```"):
@@ -928,7 +993,7 @@ async def rationale_labels(req: RationaleRequest):
             "Write a bit more rationale so the labels can be specific.",
         )
 
-    target = req.target if req.target in {"generic", "note", "relation"} else "generic"
+    target = req.target if req.target in {"generic", "note", "relation", "group"} else "generic"
     client = get_client()
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -936,7 +1001,8 @@ async def rationale_labels(req: RationaleRequest):
     known_refs = {item.ref for item in known}
     blocks = [f"target: {target}"]
     if idea:
-        blocks.append(f"sticky-note idea:\n{idea}")
+        idea_label = "grouped ideas" if target == "group" else "sticky-note idea"
+        blocks.append(f"{idea_label}:\n{idea}")
     blocks.append(f"reflection:\n{reflection or '(empty)'}")
     user_content = "\n\n".join(blocks)
     if known:

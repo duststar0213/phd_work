@@ -23,16 +23,17 @@ export function demoRationaleLabels(text, target = 'generic') {
   const words = String(text || '').trim().split(/\s+/).filter(Boolean)
   const snippet = words.slice(0, 4).join(' ') || 'stated intent'
   const relation = target === 'relation'
+  const group = target === 'group'
   return [
     { text: clipWords(snippet || 'stated intent'), kind: 'goal' },
-    { text: clipWords(relation ? 'why these link' : 'unspoken constraint'), kind: 'constraint' },
-    { text: clipWords(relation ? 'shared assumption' : 'possible tension'), kind: relation ? 'assumption' : 'tension' },
+    { text: clipWords(group ? 'why they sit together' : relation ? 'why these link' : 'unspoken constraint'), kind: 'constraint' },
+    { text: clipWords(group ? 'shared concern' : relation ? 'shared assumption' : 'possible tension'), kind: group || relation ? 'assumption' : 'tension' },
     { text: clipWords('open question'), kind: 'question' },
   ]
 }
 
 /**
- * POST /api/rationale-labels. `target` is generic | note | relation.
+ * POST /api/rationale-labels. `target` is generic | note | relation | group.
  * `options.known` is [{ ref, text }] of labels the designer already has, so the model can
  * point at one with `same_as` instead of coining a near-duplicate.
  */
@@ -153,6 +154,53 @@ export async function suggestLinks(source, candidates, options = {}) {
     }).slice(0, 5),
     model: data.model || '',
   }
+}
+
+/**
+ * POST /api/group-why. Ideas are { id, text, labels[] }; shared is overlapping rationale labels.
+ * Returns one short sentence, or '' if the model had nothing to say.
+ */
+export async function suggestGroupWhy(payload, options = {}) {
+  const ideas = (Array.isArray(payload?.ideas) ? payload.ideas : [])
+    .map((item) => ({
+      id: String(item?.id ?? '').trim(),
+      text: String(item?.text || '').trim().slice(0, 2000),
+      labels: (Array.isArray(item?.labels) ? item.labels : [])
+        .map((label) => String(label || '').trim())
+        .filter(Boolean)
+        .slice(0, 3),
+    }))
+    .filter((item) => item.id)
+    .slice(0, 8)
+  const shared = (Array.isArray(payload?.shared) ? payload.shared : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .slice(0, 6)
+  if (ideas.length < 2) return ''
+
+  const response = await fetchWithTimeout(
+    '/api/group-why',
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ideas, shared }),
+      signal: options.signal,
+    },
+    REQUEST_TIMEOUT_MS,
+  )
+  const data = await readJson(response)
+  if (!response.ok) throw toApiError(response.status, data)
+  return clipWords(String(data.why || '').trim(), 18)
+}
+
+/** Fallback copy while the model writes a group why, or if that call fails. */
+export function narrativeSharedWhy(labels) {
+  const names = [...new Set((Array.isArray(labels) ? labels : []).map((item) => String(item || '').trim()).filter(Boolean))].slice(0, 3)
+  if (!names.length) return ''
+  if (names.length === 1) return `they belong together because they share this why: ${names[0]}`
+  if (names.length === 2) return `they belong together because they share ${names[0]}, and ${names[1]}`
+  return `they belong together because they share ${names[0]}, ${names[1]}, and ${names[2]}`
 }
 
 export const MEANING_TOP_K = 3

@@ -44,7 +44,7 @@ function newRid() {
 }
 
 const props = defineProps({
-  target: { type: String, default: 'generic' }, // generic | note | relation
+  target: { type: String, default: 'generic' }, // generic | note | relation | group
   idea: { type: String, default: '' }, // sticky-note / relation text the prompt is about
   compact: { type: Boolean, default: false }, // tighter layout under a note
   idPrefix: { type: String, default: 'label' }, // unique ids when many notes share the canvas

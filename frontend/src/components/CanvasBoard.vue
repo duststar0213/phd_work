@@ -5,7 +5,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
-import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, clusterSimilarLabels } from '../api/rationale'
+import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, suggestGroupWhy, narrativeSharedWhy, clusterSimilarLabels } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
 import GroupIcon from './GroupIcon.vue'
@@ -123,6 +123,7 @@ const NOTE_COLORS = [
 
 const notes = ref([])
 const connections = ref([]) // { id, fromId, fromSide, toId, toSide } — one mag point can own many
+const groups = ref([]) // kept lasso groups: { id, memberIds, rationaleText, rationaleLabels, pinnedLabels }
 const metrics = ref({}) // noteId -> { width, height } from ResizeObserver
 const selectedId = ref(null)
 const selectedConnId = ref(null)
@@ -162,6 +163,7 @@ let suggestAbort = null
 
 let nextId = 1
 let nextConnId = 1
+let nextGroupId = 1
 const panRef = { x: 0, y: 0 }
 let connectMove = null
 let connectUp = null
@@ -191,6 +193,43 @@ const MAG_OUTSET = 18
 const MAG_HOVER_PX = 20
 /** Gap under the note so the rationale box sits below the bottom mag point. */
 const RATIONALE_GAP = 28
+/** Used until a dock is measured, so the dashed frame grows on the same click as V. */
+const RATIONALE_DOCK_FALLBACK = 220
+const dockHeights = ref({})
+const dockObservers = new Map()
+
+function setDockHeight(id, height) {
+  const h = Math.max(0, Math.round(height || 0))
+  if (dockHeights.value[id] === h) return
+  dockHeights.value = { ...dockHeights.value, [id]: h }
+}
+
+function bindDockRef(id, el) {
+  const prev = dockObservers.get(id)
+  if (prev?.el === el) return
+  prev?.ro.disconnect()
+  if (!el) {
+    dockObservers.delete(id)
+    if (dockHeights.value[id]) {
+      const next = { ...dockHeights.value }
+      delete next[id]
+      dockHeights.value = next
+    }
+    return
+  }
+  const ro = new ResizeObserver(() => {
+    setDockHeight(id, el.offsetHeight)
+  })
+  ro.observe(el)
+  dockObservers.set(id, { el, ro })
+  setDockHeight(id, el.offsetHeight)
+}
+
+function noteRationaleExtent(note) {
+  if (!note || isAbandoned(note) || (!note.rationaleOpen && !note.abandonOpen)) return 0
+  const measured = Number(dockHeights.value[note.id]) || 0
+  return RATIONALE_GAP + (measured > 0 ? measured : RATIONALE_DOCK_FALLBACK)
+}
 
 /** Live note box (ResizeObserver), falling back to the stored size. */
 function noteSize(note) {
@@ -203,20 +242,30 @@ function noteSize(note) {
 
 function liveNotePos(note) {
   if (!note) return { x: 0, y: 0 }
-  const visitor = patternGather.value?.visitors.find((item) => item.id === note.id)
-  if (visitor) return { x: visitor.to.x, y: visitor.to.y }
-  return { x: note.x, y: note.y }
+  const gather = patternGather.value
+  const visitor = gather?.visitors.find((item) => item.id === note.id)
+  if (!visitor) return { x: note.x, y: note.y }
+  if (gather.origin === 'suggest' && patternDragId.value !== note.id) {
+    const memberNotes = gather.visitors
+      .map((item) => notes.value.find((entry) => entry.id === item.id))
+      .filter(Boolean)
+    const slots = traySlotsForNotes(memberNotes)
+    const index = gather.visitors.findIndex((item) => item.id === note.id)
+    if (index >= 0 && slots[index]) return { x: slots[index].x, y: slots[index].y }
+  }
+  return { x: visitor.to.x, y: visitor.to.y }
 }
 
 /** Rationale panel sits under the note and matches its current width. */
 function rationaleStyle(note) {
   const { width, height } = noteSize(note)
   const pos = liveNotePos(note)
+  const inGroup = Boolean(patternGather.value && patternHitIds.value.has(note.id))
   return {
     left: `${pos.x}px`,
     top: `${pos.y + height + RATIONALE_GAP}px`,
     width: `${width}px`,
-    zIndex: selectedId.value === note.id ? 19 : 1,
+    zIndex: inGroup ? (selectedId.value === note.id ? 21 : 18) : selectedId.value === note.id ? 19 : 1,
   }
 }
 /** Mag-point position in canvas space (uses live size so wrapped text is included). */
@@ -295,10 +344,19 @@ function toggleTool(name) {
     clearSuggestions()
     draft.value = null
   }
-  if (activeTool.value === 'group' && next !== 'group') clearGroupStroke()
+  if (activeTool.value === 'group' && next !== 'group') {
+    clearGroupStroke()
+    if (patternGather.value?.origin === 'suggest') endPatternGather(false)
+  }
   if (next === 'group') {
     if (patternGather.value) endPatternGather(false)
     groupHint.value = ''
+    activeTool.value = 'group'
+    if (activeTool.value !== 'connect') draft.value = null
+    nextTick(() => {
+      if (focusedSuggestSets.value.length) showSuggestSet(0, { morph: false })
+    })
+    return
   }
   activeTool.value = next
   if (activeTool.value !== 'connect') draft.value = null
@@ -521,6 +579,7 @@ function clearBoard() {
   clearConnectDrag()
   notes.value = []
   connections.value = []
+  groups.value = []
   metrics.value = {}
   selectedId.value = null
   selectedConnId.value = null
@@ -530,6 +589,7 @@ function clearBoard() {
   searchTestHint.value = ''
   nextId = 1
   nextConnId = 1
+  nextGroupId = 1
   panRef.x = 0
   panRef.y = 0
   pan.value = { x: 0, y: 0 }
@@ -910,7 +970,7 @@ function resetToIdle() {
 /** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky / group tools still handle the click. */
 function onCanvasMouseDown(e) {
   if (stickyActive.value || groupActive.value) return
-  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock')) return
+  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock') || e.target.closest('.pattern-frame-caption')) return
   resetToIdle()
 
   const drag = {
@@ -988,7 +1048,7 @@ function moveNote(id, dx, dy) {
 /** Drop outside takes a gathered idea out; drop inside the frame puts one back in. */
 function onNoteMoveEnd(id) {
   const gather = patternGather.value
-  if (gather && patternDragId.value === id) {
+  if (gather && gather.origin !== 'label' && gather.origin !== 'suggest' && patternDragId.value === id) {
     const member = gather.visitors.some((item) => item.id === id)
     if (member && isOutsidePatternGroup(id)) ejectPatternVisitor(id)
     else if (!member && isInsidePatternGroup(id)) admitPatternVisitor(id)
@@ -1083,6 +1143,8 @@ const labelInventory = computed(() => {
   }
   for (const note of notes.value) keptRationaleLabels(note).forEach(add)
   for (const conn of connections.value) keptRationaleLabels(conn).forEach(add)
+  for (const group of groups.value) keptRationaleLabels(group).forEach(add)
+  if (patternGather.value?.origin === 'lasso') keptRationaleLabels(patternGather.value).forEach(add)
   return [...byRid.values()]
 })
 
@@ -1098,6 +1160,8 @@ const ridOwners = computed(() => {
   }
   for (const note of notes.value) track(`n${note.id}`, keptRationaleLabels(note))
   for (const conn of connections.value) track(`c${conn.id}`, keptRationaleLabels(conn))
+  for (const group of groups.value) track(`g${group.id}`, keptRationaleLabels(group))
+  if (patternGather.value?.origin === 'lasso') track('g-live', keptRationaleLabels(patternGather.value))
   const counts = {}
   for (const [rid, keys] of owners) counts[rid] = keys.size
   return counts
@@ -1116,6 +1180,18 @@ const canvasLabels = computed(() => {
     for (const label of keptRationaleLabels(conn)) {
       if (!String(label?.text || '').trim()) continue
       rows.push({ id: label.id, rid: label.rid, text: label.text, owner: `c${conn.id}` })
+    }
+  }
+  for (const group of groups.value) {
+    for (const label of keptRationaleLabels(group)) {
+      if (!String(label?.text || '').trim()) continue
+      rows.push({ id: label.id, rid: label.rid, text: label.text, owner: `g${group.id}` })
+    }
+  }
+  if (patternGather.value?.origin === 'lasso') {
+    for (const label of keptRationaleLabels(patternGather.value)) {
+      if (!String(label?.text || '').trim()) continue
+      rows.push({ id: label.id, rid: label.rid, text: label.text, owner: 'g-live' })
     }
   }
   return rows
@@ -1142,11 +1218,20 @@ const ownerDirectory = computed(() => {
       title: relationIdea(conn),
     }
   }
+  for (const group of groups.value) {
+    dir[`g${group.id}`] = {
+      key: `g${group.id}`,
+      kind: 'group',
+      id: group.id,
+      title: 'your group',
+    }
+  }
+  dir['g-live'] = { key: 'g-live', kind: 'group', id: 'live', title: 'your group' }
   return dir
 })
 
-/** Preview: ideas linked by overlapping patterns compact into one suggested group. */
-const patternGather = ref(null) // { sourceId, memberKey, visitors: [{ id, title, from, to, picked }] }
+/** Preview: compact related ideas. origin: pattern (AI group) | label (same rationale) | lasso. */
+const patternGather = ref(null) // { sourceId, memberKey, visitors, origin, focusWhy, rationaleText, rationaleLabels, pinnedLabels }
 const patternAnimatingIds = ref(new Set())
 const patternDragId = ref(null)
 let patternAdmitFrom = null
@@ -1155,7 +1240,8 @@ const patternHitIds = computed(() => new Set((patternGather.value?.visitors || [
 const patternPickedIds = computed(
   () => new Set((patternGather.value?.visitors || []).filter((item) => item.picked).map((item) => item.id)),
 )
-const patternDimActive = computed(() => Boolean(patternGather.value))
+const patternDimActive = computed(() => Boolean(patternGather.value && patternGather.value.origin !== 'suggest'))
+const suggestedBrowseIndex = ref(0)
 const patternPickedCount = computed(() => (patternGather.value?.visitors || []).filter((item) => item.picked).length)
 
 /** Group focus: only members (plus a note being dragged in/out) stay on the empty stage. */
@@ -1169,6 +1255,7 @@ function noteOnGroupStage(id) {
 
 function connectionOnGroupStage(line) {
   if (!patternGather.value) return true
+  if (patternGather.value.origin === 'suggest') return false
   return noteOnGroupStage(line.fromId) && noteOnGroupStage(line.toId)
 }
 
@@ -1176,44 +1263,73 @@ function memberSetKey(ids) {
   return [...ids].map(Number).sort((a, b) => a - b).join(',')
 }
 
-/** Pairwise pattern links only — so A–B and A–C become one group without swallowing every 5-idea cluster. */
-function pairwisePatternAdjacency() {
-  const edges = new Map()
-  const add = (a, b) => {
-    if (a === b) return
-    if (!edges.has(a)) edges.set(a, new Set())
-    edges.get(a).add(b)
-  }
-  for (const stats of Object.values(patternStats.value?.byRid || {})) {
-    const ids = [...new Set(
-      (stats.ownerKeys || [])
-        .filter((key) => String(key).startsWith('n'))
-        .map((key) => Number(String(key).slice(1)))
-        .filter((id) => Number.isFinite(id)),
-    )]
-    if (ids.length !== 2) continue
-    add(ids[0], ids[1])
-    add(ids[1], ids[0])
-  }
-  return edges
+function noteIdsFromOwnerKeys(keys) {
+  return [...new Set(
+    (keys || [])
+      .filter((key) => String(key).startsWith('n'))
+      .map((key) => Number(String(key).slice(1)))
+      .filter((id) => Number.isFinite(id)),
+  )]
 }
 
-function expandPatternNeighborhood(seedIds) {
-  const seeds = [...new Set(seedIds.filter((id) => id != null))]
-  const adj = pairwisePatternAdjacency()
-  const seen = new Set(seeds)
-  const queue = [...seeds]
-  while (queue.length && seen.size < 6) {
-    const id = queue.shift()
-    for (const next of adj.get(id) || []) {
-      if (seen.has(next)) continue
-      seen.add(next)
-      queue.push(next)
-      if (seen.size >= 6) break
-    }
-  }
-  return [...seen]
+function clipIdeaTitle(text) {
+  const line = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!line) return 'untitled idea'
+  return line.length > 48 ? `${line.slice(0, 46).trim()}…` : line
 }
+
+function sharedLabelTextsForNoteIds(ids) {
+  const members = new Set([...ids].map((id) => `n${id}`))
+  const rows = canvasLabels.value.filter((row) => members.has(row.owner))
+  return clusterSimilarLabels(rows)
+    .map((group) => {
+      const owners = new Set(group.members.map((item) => item.owner).filter(Boolean))
+      return { text: String(group.preview || '').trim(), owners: owners.size }
+    })
+    .filter((item) => item.text && item.owners >= 2)
+    .sort((a, b) => b.owners - a.owners || a.text.localeCompare(b.text))
+    .slice(0, 3)
+    .map((item) => item.text)
+}
+
+/** Unique note-sets that share a rationale — listed in the group-tool holder. */
+const suggestedGroupSets = computed(() => {
+  const byKey = new Map()
+  for (const [rid, stats] of Object.entries(patternStats.value?.byRid || {})) {
+    const ids = noteIdsFromOwnerKeys(stats.ownerKeys).filter((id) => {
+      const note = notes.value.find((item) => item.id === id)
+      return note && !isNoteFrozen(note) && !isAbandoned(note)
+    })
+    if (ids.length < 2) continue
+    const key = memberSetKey(ids)
+    const owners = Number(stats?.owners) || ids.length
+    const existing = byKey.get(key)
+    if (existing && existing.owners >= owners) continue
+    const memberSet = new Set(ids.map((id) => `n${id}`))
+    const preview = String(
+      canvasLabels.value.find((row) => row.rid === rid && memberSet.has(row.owner))?.text || '',
+    ).trim()
+    const memberNotes = ids.map((id) => notes.value.find((item) => item.id === id)).filter(Boolean)
+    byKey.set(key, {
+      key,
+      ids,
+      owners,
+      titles: memberNotes.map((note) => clipIdeaTitle(note.text)),
+      why: narrativeSharedWhy(preview ? [preview] : sharedLabelTextsForNoteIds(ids)),
+    })
+  }
+  return [...byKey.values()]
+    .sort((a, b) => b.ids.length - a.ids.length || String(a.why).localeCompare(String(b.why)))
+})
+
+/** Suggested groups that include the currently selected idea. */
+const focusedSuggestSets = computed(() => {
+  const id = selectedId.value
+  if (id == null) return []
+  return suggestedGroupSets.value
+    .filter((set) => set.ids.some((memberId) => Number(memberId) === Number(id)))
+    .slice(0, 5)
+})
 
 /** Right-edge tabs (and the count badge) sit outside the note box. */
 const TAB_MAX_W = 160
@@ -1303,14 +1419,18 @@ function groupSpread(memberNotes) {
 }
 
 /** Compact grid centred on the group's current midpoint — not on whoever was clicked. */
-function placeCluster(memberNotes) {
-  const gap = CLUSTER_GAP
+function placeCluster(memberNotes, opts = {}) {
+  const gap = opts.gap ?? CLUSTER_GAP
+  const sizeScale = opts.sizeScale ?? 1
   const n = memberNotes.length
-  const cols = n <= 3 ? n : Math.ceil(Math.sqrt(n))
+  const cols = opts.cols || (n <= 3 ? n : Math.ceil(Math.sqrt(n)))
   const rows = Math.ceil(n / cols)
-  const sizes = memberNotes.map((note) => noteSize(note))
-  const padX = memberNotes.map((note) => tabClearX(note))
-  const padY = memberNotes.map((note) => tabClearY(note))
+  const sizes = memberNotes.map((note) => {
+    const size = noteSize(note)
+    return { width: size.width * sizeScale, height: size.height * sizeScale }
+  })
+  const padX = memberNotes.map((note) => tabClearX(note) * sizeScale)
+  const padY = memberNotes.map((note) => tabClearY(note) * sizeScale)
   const colW = Array(cols).fill(0)
   const rowBody = Array(rows).fill(0)
   const rowTop = Array(rows).fill(0)
@@ -1321,22 +1441,31 @@ function placeCluster(memberNotes) {
     rowBody[r] = Math.max(rowBody[r], sizes[i].height)
     rowTop[r] = Math.max(rowTop[r], padY[i])
   }
-  const rowH = rowBody.map((h, r) => h + rowTop[r])
-  const gridW = colW.reduce((sum, w) => sum + w, 0) + gap * Math.max(0, cols - 1)
-  const gridH = rowH.reduce((sum, h) => sum + h, 0) + gap * Math.max(0, rows - 1)
-  let cx = 0
-  let cy = 0
-  for (const note of memberNotes) {
-    const size = noteSize(note)
-    cx += note.x + size.width / 2
-    cy += note.y + size.height / 2
+  const rowH = rowBody.map((body, r) => body + rowTop[r])
+  const gridW = colW.reduce((sum, col) => sum + col, 0) + gap * Math.max(0, cols - 1)
+  const gridH = rowH.reduce((sum, row) => sum + row, 0) + gap * Math.max(0, rows - 1)
+  let x0
+  let y0
+  if (opts.topLeft) {
+    x0 = opts.topLeft.x
+    y0 = opts.topLeft.y
+  } else {
+    let cx = 0
+    let cy = 0
+    for (const note of memberNotes) {
+      const size = noteSize(note)
+      cx += note.x + size.width / 2
+      cy += note.y + size.height / 2
+    }
+    cx /= n
+    cy /= n
+    x0 = cx - gridW / 2
+    y0 = cy - gridH / 2
   }
-  cx /= n
-  cy /= n
   const slots = []
-  let y = cy - gridH / 2
+  let y = y0
   for (let r = 0; r < rows; r++) {
-    let x = cx - gridW / 2
+    let x = x0
     for (let c = 0; c < cols; c++) {
       const i = r * cols + c
       if (i >= n) break
@@ -1359,7 +1488,219 @@ function clusterSlots(memberNotes) {
   return compact
 }
 
-function panToSlots(slots) {
+/** Compact related ideas around the clicked sticky note so it stays put. */
+function clusterSlotsAround(memberNotes, sourceId) {
+  const compact = placeCluster(memberNotes)
+  const idx = memberNotes.findIndex((note) => note.id === sourceId)
+  if (idx < 0) return compact
+  const source = memberNotes[idx]
+  const dx = source.x - compact[idx].x
+  const dy = source.y - compact[idx].y
+  return shiftSlotGrid(compact, dx, dy)
+}
+
+function shiftSlotGrid(slots, dx, dy) {
+  return slots.map((slot) => ({
+    ...slot,
+    x: slot.x + dx,
+    y: slot.y + dy,
+    vx: (slot.vx ?? slot.x) + dx,
+    vy: (slot.vy ?? slot.y) + dy,
+  }))
+}
+
+const TRAY_NAV_H = 68
+const TRAY_PAD = 12
+const TRAY_BOTTOM_GAP = 12
+const TOOLBAR_H = 88
+
+function trayScaleForCount(n) {
+  if (n <= 2) return 0.72
+  if (n <= 4) return 0.6
+  if (n <= 6) return 0.5
+  return 0.42
+}
+
+const suggestNoteScale = computed(() => trayScaleForCount(patternGather.value?.visitors.length || 0))
+
+function viewPointToCanvas(x, y) {
+  const s = scale.value || 1
+  return {
+    x: (x - pan.value.x) / s,
+    y: (y - pan.value.y) / s,
+  }
+}
+
+/** Park a suggested set in a screen-fixed tray above the tool well. */
+function traySlotsForNotes(memberNotes) {
+  if (!memberNotes.length) return []
+  const { w, h } = viewSize()
+  const sizeScale = trayScaleForCount(memberNotes.length)
+  const maxH = Math.min(200, h * 0.28)
+  const maxW = w - 56
+  let cols = Math.min(memberNotes.length, Math.max(2, Math.ceil(memberNotes.length / 2)))
+  let compact = placeCluster(memberNotes, { sizeScale, cols, gap: 16 })
+  const measure = (slots) => {
+    const boxes = slots.map((slot, i) => {
+      const note = memberNotes[i]
+      const size = noteSize(note)
+      return {
+        x: slot.x,
+        y: slot.y - tabClearY(note) * sizeScale,
+        w: (size.width + tabClearX(note)) * sizeScale,
+        h: (size.height + tabClearY(note)) * sizeScale,
+      }
+    })
+    const minX = Math.min(...boxes.map((box) => box.x))
+    const minY = Math.min(...boxes.map((box) => box.y))
+    const maxX = Math.max(...boxes.map((box) => box.x + box.w))
+    const maxY = Math.max(...boxes.map((box) => box.y + box.h))
+    return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY }
+  }
+  let box = measure(compact)
+  while ((box.h > maxH || box.w > maxW) && cols < memberNotes.length) {
+    cols += 1
+    compact = placeCluster(memberNotes, { sizeScale, cols, gap: 16 })
+    box = measure(compact)
+  }
+  const left = (w - Math.min(box.w, maxW)) / 2
+  const trayH = Math.min(box.h, maxH)
+  const top = h - TOOLBAR_H - 44 - trayH - TRAY_NAV_H
+  const origin = viewPointToCanvas(left, Math.max(24, top) + TRAY_NAV_H)
+  return shiftSlotGrid(compact, origin.x - box.minX, origin.y - box.minY)
+}
+
+function memberNotesForSuggestSet(set) {
+  return (Array.isArray(set?.ids) ? set.ids : [])
+    .map((id) => notes.value.find((note) => note.id === id))
+    .filter((note) => note && !isNoteFrozen(note) && !isAbandoned(note))
+    .sort((a, b) => a.id - b.id)
+}
+
+function showSuggestSet(index, { morph = true } = {}) {
+  const sets = focusedSuggestSets.value
+  if (!sets.length) {
+    if (patternGather.value?.origin === 'suggest') endPatternGather(false)
+    suggestedBrowseIndex.value = 0
+    return false
+  }
+  const i = ((index % sets.length) + sets.length) % sets.length
+  suggestedBrowseIndex.value = i
+  const set = sets[i]
+  const memberNotes = memberNotesForSuggestSet(set)
+  if (memberNotes.length < 2) return false
+  const slots = traySlotsForNotes(memberNotes)
+  const focusId = memberNotes.some((note) => note.id === selectedId.value)
+    ? selectedId.value
+    : memberNotes[0].id
+  const gather = {
+    sourceId: focusId,
+    memberKey: memberSetKey(memberNotes.map((note) => note.id)),
+    origin: 'suggest',
+    focusWhy: set.why || '',
+    rationaleText: '',
+    rationaleLabels: [],
+    pinnedLabels: [],
+    aiWhy: '',
+    visitors: memberNotes.map((note, slotIndex) => ({
+      id: note.id,
+      title: String(note.text || '').trim() || 'untitled idea',
+      from: { x: note.x, y: note.y },
+      to: { x: slots[slotIndex].x, y: slots[slotIndex].y },
+      picked: false,
+    })),
+  }
+  const prevIds = morph && patternGather.value?.origin === 'suggest'
+    ? patternGather.value.visitors.map((item) => item.id)
+    : []
+  const nextIds = memberNotes.map((note) => note.id)
+  patternGather.value = gather
+  flashPatternAnim([...new Set([...prevIds, ...nextIds])])
+  fillPatternGroupWhy(gather)
+  logEvent('pattern_gather', { sourceId: gather.sourceId, visitors: nextIds, from: 'group_tray', index: i }).catch(() => {})
+  return true
+}
+
+function shiftSuggestedBrowse(delta) {
+  showSuggestSet(suggestedBrowseIndex.value + delta)
+}
+
+watch(selectedId, () => {
+  if (!groupActive.value) return
+  if (patternGather.value && patternGather.value.origin !== 'suggest') return
+  if (!focusedSuggestSets.value.length) {
+    if (patternGather.value?.origin === 'suggest') endPatternGather(false)
+    suggestedBrowseIndex.value = 0
+    return
+  }
+  showSuggestSet(0, { morph: true })
+})
+
+const suggestTrayChromeStyle = computed(() => {
+  if (!groupActive.value) return null
+  if (!focusedSuggestSets.value.length && patternGather.value?.origin !== 'suggest') return null
+  pan.value
+  scale.value
+  const { w, h } = viewSize()
+  const gather = patternGather.value
+  const members = gather?.origin === 'suggest'
+    ? gather.visitors.map((item) => notes.value.find((note) => note.id === item.id)).filter(Boolean)
+    : []
+  if (!members.length) {
+    const width = Math.min(420, w - 40)
+    const height = 92
+    return {
+      left: `${(w - width) / 2}px`,
+      top: `${h - TOOLBAR_H - TRAY_BOTTOM_GAP - height}px`,
+      width: `${width}px`,
+      height: `${height}px`,
+    }
+  }
+  const slots = traySlotsForNotes(members)
+  const sizeScale = trayScaleForCount(members.length)
+  const s = scale.value || 1
+  const boxes = members.map((note, i) => {
+    const slot = slots[i]
+    const size = noteSize(note)
+    return {
+      x: slot.x,
+      y: slot.y - tabClearY(note) * sizeScale,
+      w: (size.width + tabClearX(note)) * sizeScale,
+      h: (size.height + tabClearY(note)) * sizeScale,
+    }
+  })
+  const minX = Math.min(...boxes.map((box) => box.x))
+  const minY = Math.min(...boxes.map((box) => box.y))
+  const maxX = Math.max(...boxes.map((box) => box.x + box.w))
+  const maxY = Math.max(...boxes.map((box) => box.y + box.h))
+  return {
+    left: `${minX * s + pan.value.x - TRAY_PAD}px`,
+    top: `${minY * s + pan.value.y - TRAY_NAV_H - TRAY_PAD}px`,
+    width: `${(maxX - minX) * s + TRAY_PAD * 2}px`,
+    height: `${(maxY - minY) * s + TRAY_NAV_H + TRAY_PAD * 2}px`,
+  }
+})
+
+const groupLassoStyle = computed(() => {
+  const chrome = suggestTrayChromeStyle.value
+  if (!chrome) return undefined
+  const { h } = viewSize()
+  const top = parseFloat(String(chrome.top))
+  if (!Number.isFinite(top)) return undefined
+  return { bottom: `${Math.max(0, h - top)}px` }
+})
+
+const suggestNavStyle = computed(() => {
+  const chrome = suggestTrayChromeStyle.value
+  if (!chrome) return null
+  return {
+    left: chrome.left,
+    top: chrome.top,
+    width: chrome.width,
+  }
+})
+
+function panToSlots(slots, extra = {}) {
   let minX = Infinity
   let minY = Infinity
   let maxX = -Infinity
@@ -1374,6 +1715,7 @@ function panToSlots(slots) {
     maxX = Math.max(maxX, x + w)
     maxY = Math.max(maxY, y + h)
   }
+  maxY += Number(extra.bottom) || 0
   const { w, h } = viewSize()
   const s = scale.value
   panRef.x = w / 2 - ((minX + maxX) / 2) * s
@@ -1390,7 +1732,9 @@ function visitorBounds(visitor) {
 function visitorVisualBounds(visitor) {
   const note = notes.value.find((item) => item.id === visitor.id)
   if (!note) return null
-  return noteVisualBox(note, liveNotePos(note))
+  const box = noteVisualBox(note, liveNotePos(note))
+  box.h += noteRationaleExtent(note)
+  return box
 }
 
 function patternMembersBox(exceptId) {
@@ -1438,6 +1782,7 @@ function isOutsidePatternGroup(id) {
 const patternLeavingId = computed(() => {
   const id = patternDragId.value
   if (id == null) return null
+  if (patternGather.value?.origin === 'label' || patternGather.value?.origin === 'suggest') return null
   if (!patternGather.value?.visitors.some((item) => item.id === id)) return null
   return isOutsidePatternGroup(id) ? id : null
 })
@@ -1445,11 +1790,36 @@ const patternLeavingId = computed(() => {
 const patternJoiningId = computed(() => {
   const id = patternDragId.value
   if (id == null || !patternGather.value) return null
+  if (patternGather.value.origin === 'label' || patternGather.value.origin === 'suggest') return null
   if (patternGather.value.visitors.some((item) => item.id === id)) return null
   return isInsidePatternGroup(id) ? id : null
 })
 
+const patternFrameKicker = computed(() => {
+  if (patternJoiningId.value) return 'drop to add'
+  const origin = patternGather.value?.origin
+  if (origin === 'lasso') return 'your group'
+  if (origin === 'label') return 'same rationale'
+  return 'suggested group'
+})
+
+const patternKeepCopy = computed(() => {
+  const origin = patternGather.value?.origin
+  if (origin === 'label') return 'keep nearby'
+  if (patternPickedCount.value) return `keep ${patternPickedCount.value}`
+  return 'keep group'
+})
+
+const patternGatherHint = computed(() => {
+  const origin = patternGather.value?.origin
+  if (origin === 'lasso') return 'your group · write why they belong together · enter suggests labels · keep group · esc cancels'
+  if (origin === 'label') return 'ideas that share this rationale · keep nearby or put back · esc cancels'
+  if (origin === 'suggest') return 'groups for this idea · ← → see others · keep group or put back · or draw your own'
+  return 'dashed frame = suggested group · the line on the frame is why they sit together · drag an idea out or drop one in · keep group · esc cancels'
+})
+
 const patternFrameStyle = computed(() => {
+  if (patternGather.value?.origin === 'suggest') return null
   const box = patternMembersBox(patternDragId.value)
   if (!box) return null
   const pad = 20
@@ -1461,21 +1831,52 @@ const patternFrameStyle = computed(() => {
   }
 })
 
-/** Shared rationale patterns among the gathered notes — why they sit in this frame. */
+function sharedPatternLabelTexts(gather) {
+  if (!gather?.visitors.length || gather.origin === 'lasso') return []
+  return sharedLabelTextsForNoteIds(gather.visitors.map((item) => item.id))
+}
+
+/** Shared rationale among gathered notes — AI sentence when ready, else a short narrative from the labels. */
 const patternGroupWhy = computed(() => {
   const gather = patternGather.value
-  if (!gather?.visitors.length || gather.origin === 'lasso') return ''
-  const members = new Set(gather.visitors.map((item) => `n${item.id}`))
-  const rows = canvasLabels.value.filter((row) => members.has(row.owner))
-  const shared = clusterSimilarLabels(rows)
-    .map((group) => {
-      const owners = new Set(group.members.map((item) => item.owner).filter(Boolean))
-      return { text: String(group.preview || '').trim(), owners: owners.size }
-    })
-    .filter((item) => item.text && item.owners >= 2)
-    .sort((a, b) => b.owners - a.owners || a.text.localeCompare(b.text))
-  return shared.slice(0, 3).map((item) => item.text).join(' · ')
+  if (!gather?.visitors.length) return ''
+  if (gather.origin === 'lasso') {
+    return keptRationaleLabels(gather)
+      .map((item) => String(item.text || '').trim())
+      .filter(Boolean)
+      .slice(0, 3)
+      .join(' · ')
+  }
+  if (gather.origin === 'label') {
+    return String(gather.focusWhy || '').trim() || sharedPatternLabelTexts(gather).join(' · ')
+  }
+  return String(gather.aiWhy || '').trim() || narrativeSharedWhy(sharedPatternLabelTexts(gather))
 })
+
+let groupWhyAbort = null
+
+function fillPatternGroupWhy(gather) {
+  if (!gather || (gather.origin !== 'pattern' && gather.origin !== 'suggest')) return
+  groupWhyAbort?.abort()
+  groupWhyAbort = new AbortController()
+  const memberKey = gather.memberKey
+  const ideas = gather.visitors.map((visitor) => {
+    const note = notes.value.find((item) => item.id === visitor.id)
+    return {
+      id: String(visitor.id),
+      text: visitor.title,
+      labels: keptRationaleLabels(note).map((item) => item.text).filter(Boolean).slice(0, 3),
+    }
+  })
+  suggestGroupWhy({ ideas, shared: sharedPatternLabelTexts(gather) }, { signal: groupWhyAbort.signal })
+    .then((why) => {
+      if (!why || patternGather.value?.memberKey !== memberKey) return
+      patternGather.value.aiWhy = why
+    })
+    .catch((err) => {
+      if (err?.code === 'cancelled' || err?.name === 'AbortError') return
+    })
+}
 
 function flashPatternAnim(ids) {
   window.clearTimeout(patternAnimTimer)
@@ -1489,6 +1890,8 @@ function flashPatternAnim(ids) {
 function endPatternGather(keepPicked) {
   const gather = patternGather.value
   if (!gather) return
+  groupWhyAbort?.abort()
+  groupWhyAbort = null
   patternDragId.value = null
   patternAdmitFrom = null
   const keptIds = new Set()
@@ -1644,16 +2047,86 @@ function onGroupPointerUp() {
   logEvent('group_lasso', { visitors: inside.map((item) => item.id) }).catch(() => {})
 }
 
-function beginGather(memberNotes, { sourceId = null, origin = 'pattern' } = {}) {
+function groupIdeaText(gather) {
+  const lines = (gather?.visitors || [])
+    .map((item) => String(item.title || '').trim())
+    .filter(Boolean)
+  return lines.join('\n').slice(0, 3500)
+}
+
+function savedLassoGroup(memberKey) {
+  return groups.value.find((group) => memberSetKey(group.memberIds) === memberKey) || null
+}
+
+function upsertKeptGroup(gather) {
+  if (gather?.origin !== 'lasso') return
+  const memberIds = (gather.visitors || [])
+    .filter((item) => item.picked)
+    .map((item) => item.id)
+  if (memberIds.length < 2) return
+  const hasWhy =
+    Boolean(String(gather.rationaleText || '').trim()) ||
+    keptRationaleLabels(gather).some((item) => String(item.text || '').trim())
+  if (!hasWhy) return
+  const key = memberSetKey(memberIds)
+  const payload = {
+    memberIds,
+    rationaleText: gather.rationaleText || '',
+    rationaleLabels: persistedRationaleLabels(gather.rationaleLabels, gather.pinnedLabels),
+    pinnedLabels: Array.isArray(gather.pinnedLabels) ? gather.pinnedLabels.slice(0, 3) : [],
+    origin: 'lasso',
+  }
+  const existing = savedLassoGroup(key)
+  if (existing) Object.assign(existing, payload)
+  else groups.value.push({ id: nextGroupId++, ...payload })
+}
+
+function setGroupPinned(pinned) {
+  const gather = patternGather.value
+  if (!gather || gather.origin !== 'lasso') return
+  gather.pinnedLabels = Array.isArray(pinned) ? pinned.slice(0, 3) : []
+  gather.rationaleLabels = persistedRationaleLabels(gather.rationaleLabels, gather.pinnedLabels)
+}
+
+function updateGroupRationale(payload) {
+  const gather = patternGather.value
+  if (!gather || gather.origin !== 'lasso') return
+  gather.rationaleText = payload.input || ''
+  gather.rationaleLabels = persistedRationaleLabels(payload.labels, gather.pinnedLabels)
+}
+
+const groupRationaleStyle = computed(() => {
+  if (patternGather.value?.origin !== 'lasso') return null
+  const box = patternMembersBox(patternDragId.value)
+  if (!box) return null
+  const pad = 20
+  const width = Math.max(280, Math.min(420, box.maxX - box.minX + pad * 2))
+  return {
+    left: `${box.minX - pad}px`,
+    top: `${box.maxY + pad + 10}px`,
+    width: `${width}px`,
+    zIndex: 19,
+  }
+})
+
+function beginGather(memberNotes, { sourceId = null, origin = 'pattern', focusWhy = '' } = {}) {
   const sorted = [...memberNotes].sort((a, b) => a.id - b.id)
   if (sorted.length < 2) return false
   endPatternGather(false)
-  const slots = clusterSlots(sorted)
   const sid = sourceId ?? sorted[0].id
+  const slots = origin === 'label' ? clusterSlotsAround(sorted, sid) : clusterSlots(sorted)
+  const memberKey = memberSetKey(sorted.map((note) => note.id))
+  const saved = origin === 'lasso' ? savedLassoGroup(memberKey) : null
+  const labelWhy = String(focusWhy || '').trim() || (origin === 'label' ? sharedLabelTextsForNoteIds(sorted.map((note) => note.id))[0] || '' : '')
   patternGather.value = {
     sourceId: sid,
-    memberKey: memberSetKey(sorted.map((note) => note.id)),
+    memberKey,
     origin,
+    focusWhy: labelWhy,
+    rationaleText: saved?.rationaleText || '',
+    rationaleLabels: Array.isArray(saved?.rationaleLabels) ? saved.rationaleLabels.slice() : [],
+    pinnedLabels: Array.isArray(saved?.pinnedLabels) ? saved.pinnedLabels.slice() : [],
+    aiWhy: '',
     visitors: sorted.map((note, i) => ({
       id: note.id,
       title: String(note.text || '').trim() || 'untitled idea',
@@ -1664,20 +2137,29 @@ function beginGather(memberNotes, { sourceId = null, origin = 'pattern' } = {}) 
   }
   selectedId.value = sid
   selectedConnId.value = null
-  panToSlots(slots)
+  panToSlots(slots, origin === 'lasso' ? { bottom: 300 } : {})
+  if (origin === 'pattern') fillPatternGroupWhy(patternGather.value)
+  if (origin === 'lasso') {
+    nextTick(() => {
+      document.querySelector('.group-rationale-dock textarea')?.focus()
+    })
+  }
   return true
 }
 
-function inspectPattern(places, sourceId) {
+function inspectPattern(places, sourceId, focusWhy = '') {
   const incoming = Array.isArray(places) ? places : []
-  const seedIds = incoming.filter((item) => item.kind === 'note').map((item) => item.id)
-  if (sourceId != null) seedIds.push(sourceId)
+  const seedIds = [...new Set(
+    incoming
+      .filter((item) => item.kind === 'note')
+      .map((item) => item.id)
+      .concat(sourceId != null ? [sourceId] : []),
+  )]
   if (!seedIds.length) {
     endPatternGather(false)
     return
   }
-  const memberIds = expandPatternNeighborhood(seedIds)
-  const memberNotes = memberIds
+  const memberNotes = seedIds
     .map((id) => notes.value.find((note) => note.id === id))
     .filter((note) => note && !isNoteFrozen(note) && !isAbandoned(note))
     .sort((a, b) => a.id - b.id)
@@ -1686,25 +2168,37 @@ function inspectPattern(places, sourceId) {
     return
   }
   const key = memberSetKey(memberNotes.map((note) => note.id))
-  if (patternGather.value?.memberKey === key) {
-    if (patternGather.value.sourceId === sourceId) {
-      endPatternGather(false)
-      return
-    }
-    patternGather.value.sourceId = sourceId
-    selectedId.value = sourceId
+  if (patternGather.value?.origin === 'label' && patternGather.value.memberKey === key && patternGather.value.sourceId === sourceId) {
+    endPatternGather(false)
     return
   }
-  beginGather(memberNotes, { sourceId, origin: 'pattern' })
-  logEvent('pattern_gather', { sourceId, visitors: memberNotes.map((item) => item.id) }).catch(() => {})
+  beginGather(memberNotes, { sourceId, origin: 'label', focusWhy })
+  logEvent('label_gather', { sourceId, visitors: memberNotes.map((item) => item.id) }).catch(() => {})
 }
 
 function keepPatternGroup() {
   const gather = patternGather.value
   if (!gather) return
-  if (!gather.visitors.some((item) => item.picked)) {
+  if (gather.origin === 'label' || gather.origin === 'suggest' || !gather.visitors.some((item) => item.picked)) {
     for (const visitor of gather.visitors) visitor.picked = true
   }
+  if (gather.origin === 'suggest') {
+    const keep = gather.visitors.filter((item) => item.picked)
+    const memberNotes = keep
+      .map((item) => notes.value.find((note) => note.id === item.id))
+      .filter(Boolean)
+    const slots = placeCluster(memberNotes)
+    memberNotes.forEach((note, i) => {
+      note.x = slots[i].x
+      note.y = slots[i].y
+      keep[i].to = { x: slots[i].x, y: slots[i].y }
+    })
+    upsertKeptGroup(gather)
+    endPatternGather(true)
+    activeTool.value = null
+    return
+  }
+  upsertKeptGroup(gather)
   endPatternGather(true)
 }
 
@@ -2092,12 +2586,17 @@ function onKeydown(e) {
       return
     }
     if (groupActive.value || groupStroke.value.length) {
+      if (patternGather.value) endPatternGather(false)
       clearGroupStroke()
       groupHint.value = ''
       activeTool.value = null
       return
     }
     if (patternGather.value) {
+      if (typing) {
+        if (e.target instanceof HTMLElement) e.target.blur()
+        return
+      }
       endPatternGather(false)
       return
     }
@@ -2140,6 +2639,18 @@ function onKeydown(e) {
     }
   }
   if (typing) return
+  if (!e.metaKey && !e.ctrlKey && !e.altKey && patternGather.value?.origin === 'suggest') {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      shiftSuggestedBrowse(-1)
+      return
+    }
+    if (e.key === 'ArrowRight') {
+      e.preventDefault()
+      shiftSuggestedBrowse(1)
+      return
+    }
+  }
   if ((e.key === 'n' || e.key === 'N') && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault()
     toggleTool('sticky')
@@ -2186,10 +2697,19 @@ function canvasPayload() {
       rationaleLabels: persistedRationaleLabels(c.rationaleLabels, c.pinnedLabels),
       abandonLabels: persistedRationaleLabels(c.abandonLabels, c.abandonPinned),
     })),
+    groups: groups.value.map((group) => ({
+      id: group.id,
+      memberIds: Array.isArray(group.memberIds) ? group.memberIds : [],
+      rationaleText: group.rationaleText || '',
+      rationaleLabels: persistedRationaleLabels(group.rationaleLabels, group.pinnedLabels),
+      pinnedLabels: group.pinnedLabels || [],
+      origin: group.origin || 'lasso',
+    })),
     pan: pan.value,
     scale: scale.value,
     nextId,
     nextConnId,
+    nextGroupId,
   }
 }
 
@@ -2284,8 +2804,19 @@ onMounted(async () => {
     scale.value = 1
     nextId = Number(data.nextId) > 0 ? Number(data.nextId) : 1
     nextConnId = Number(data.nextConnId) > 0 ? Number(data.nextConnId) : 1
+    groups.value = (Array.isArray(data.groups) ? data.groups : []).map((group) => hydrateRids({
+      id: group.id,
+      memberIds: Array.isArray(group.memberIds) ? group.memberIds : [],
+      rationaleText: group.rationaleText || '',
+      rationaleLabels: Array.isArray(group.rationaleLabels) ? group.rationaleLabels : [],
+      pinnedLabels: Array.isArray(group.pinnedLabels) ? group.pinnedLabels : [],
+      origin: group.origin || 'lasso',
+    }))
+    const maxGroupId = groups.value.reduce((max, group) => Math.max(max, Number(group.id) || 0), 0)
+    nextGroupId = Number(data.nextGroupId) > 0 ? Number(data.nextGroupId) : maxGroupId + 1
   } catch {
     notes.value = []
+    groups.value = []
   }
   loaded = true
   history.seed(historyState())
@@ -2293,7 +2824,7 @@ onMounted(async () => {
   await nextTick()
   window.addEventListener('resize', onWindowResize)
   watch(
-    [notes, connections],
+    [notes, connections, groups],
     () => {
       scheduleSave()
       history.noteChange(historyState())
@@ -2313,6 +2844,8 @@ onUnmounted(() => {
   wheelTarget = null
   clearConnectDrag()
   clearGroupStroke()
+  for (const item of dockObservers.values()) item.ro.disconnect()
+  dockObservers.clear()
   clearTimeout(saveTimer)
   window.clearTimeout(patternAnimTimer)
   suggestAbort?.abort()
@@ -2403,7 +2936,7 @@ onUnmounted(() => {
         </svg>
         <div v-if="patternFrameStyle" class="pattern-frame" :class="{ joining: patternJoiningId != null }" :style="patternFrameStyle">
           <div class="pattern-frame-caption">
-            <span class="pattern-frame-kicker">{{ patternJoiningId ? 'drop to add' : patternGather?.origin === 'lasso' ? 'your group' : 'suggested group' }}</span>
+            <span class="pattern-frame-kicker">{{ patternFrameKicker }}</span>
             <span v-if="patternGroupWhy && !patternJoiningId" class="pattern-frame-why">{{ patternGroupWhy }}</span>
           </div>
         </div>
@@ -2447,7 +2980,7 @@ onUnmounted(() => {
             @toggle-rationale="toggleRelationRationale(line.id)"
             @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
             @labels-change="(labels) => updateRelationLabels(line.id, labels)"
-            @inspect-pattern="(places) => inspectPattern(places, line.fromId)"
+            @inspect-pattern="(places, focusWhy) => inspectPattern(places, line.fromId, focusWhy)"
           />
         </div>
         <div
@@ -2489,12 +3022,14 @@ onUnmounted(() => {
             :owner-directory="ownerDirectory"
             :display-x="liveNotePos(note).x"
             :display-y="liveNotePos(note).y"
-            :gathering="patternHitIds.has(note.id) || patternAnimatingIds.has(note.id)"
+            :gathering="patternAnimatingIds.has(note.id) || (patternHitIds.has(note.id) && patternGather?.origin !== 'suggest')"
+            :gather-pick="Boolean(patternGather) && patternGather.origin !== 'label' && patternGather.origin !== 'suggest' && patternHitIds.has(note.id)"
             :leaving-group="patternLeavingId === note.id"
             :joining-group="patternJoiningId === note.id"
-            :search-hit="searchHitIds.has(note.id) || patternHitIds.has(note.id) || patternJoiningId === note.id"
+            :search-hit="searchHitIds.has(note.id) || (patternHitIds.has(note.id) && patternGather?.origin !== 'suggest') || patternJoiningId === note.id"
             :search-picked="searchPickedIds.has(note.id) || patternPickedIds.has(note.id)"
-            :search-dim="searchDimActive"
+            :search-dim="searchDimActive || (patternGather?.origin === 'suggest' && !patternHitIds.has(note.id) && !patternAnimatingIds.has(note.id))"
+            :preview-scale="patternGather?.origin === 'suggest' && patternHitIds.has(note.id) ? suggestNoteScale : 1"
             :stage-hidden="patternDimActive && !noteOnGroupStage(note.id)"
             :suggesting="suggestLoading && suggestSourceId === note.id"
             :suggest-hit="suggestTargetIds.has(note.id)"
@@ -2515,12 +3050,13 @@ onUnmounted(() => {
             @open-rationale="openRationale"
             @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
             @labels-change="(labels) => updateLabels(note.id, labels)"
-            @inspect-pattern="(places) => inspectPattern(places, note.id)"
+            @inspect-pattern="(places, focusWhy) => inspectPattern(places, note.id, focusWhy)"
             @revive="reviveNote"
           />
           <div
             v-if="note.abandonOpen && !note.abandoned && noteOnGroupStage(note.id)"
             class="rationale-dock"
+            :ref="(el) => bindDockRef(note.id, el)"
             :style="rationaleStyle(note)"
             @pointerdown.stop="onRationalePointer(note.id)"
             @mousedown.stop="onRationalePointer(note.id)"
@@ -2547,7 +3083,7 @@ onUnmounted(() => {
               @pin-change="(pinned) => setAbandonPinned(note.id, pinned)"
               @rationale-change="(payload) => updateAbandonRationale(note.id, payload)"
               @labels="() => logEvent('abandon_labels_generated', { noteId: note.id })"
-              @inspect-pattern="(places) => inspectPattern(places, note.id)"
+              @inspect-pattern="(places, focusWhy) => inspectPattern(places, note.id, focusWhy)"
               @action="confirmAbandon(note.id)"
               @complete="confirmAbandon(note.id)"
             />
@@ -2555,6 +3091,7 @@ onUnmounted(() => {
           <div
             v-show="note.rationaleOpen && !note.abandoned && !note.abandonOpen && noteOnGroupStage(note.id)"
             class="rationale-dock"
+            :ref="(el) => bindDockRef(note.id, el)"
             :style="rationaleStyle(note)"
             @pointerdown.stop="onRationalePointer(note.id)"
             @mousedown.stop="onRationalePointer(note.id)"
@@ -2577,13 +3114,13 @@ onUnmounted(() => {
               @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
               @rationale-change="(payload) => updateRationale(note.id, payload)"
               @labels="() => logEvent('labels_generated', { noteId: note.id })"
-              @inspect-pattern="(places) => inspectPattern(places, note.id)"
+              @inspect-pattern="(places, focusWhy) => inspectPattern(places, note.id, focusWhy)"
             />
           </div>
         </template>
         <template v-for="line in renderedConnections" :key="`rel-abandon-${line.id}`">
           <div
-            v-if="line.abandonOpen && !line.abandoned && connectionOnGroupStage(line)"
+            v-if="line.abandonOpen && !line.abandoned && connectionOnGroupStage(line) && !patternGather"
             class="rationale-dock"
             :style="relationRationaleStyle(line)"
             @pointerdown.stop="onRelationPointer(line.id)"
@@ -2611,7 +3148,7 @@ onUnmounted(() => {
             @pin-change="(pinned) => setRelationAbandonPinned(line.id, pinned)"
             @rationale-change="(payload) => updateRelationAbandonRationale(line.id, payload)"
             @labels="() => logEvent('relation_abandon_labels_generated', { connectionId: line.id })"
-            @inspect-pattern="(places) => inspectPattern(places, line.fromId)"
+            @inspect-pattern="(places, focusWhy) => inspectPattern(places, line.fromId, focusWhy)"
             @action="confirmAbandonRelation(line.id)"
             @complete="confirmAbandonRelation(line.id)"
           />
@@ -2619,7 +3156,7 @@ onUnmounted(() => {
         </template>
         <div
           v-for="line in renderedConnections"
-          v-show="line.rationaleOpen && !line.abandoned && !line.abandonOpen && connectionOnGroupStage(line)"
+          v-show="line.rationaleOpen && !line.abandoned && !line.abandonOpen && connectionOnGroupStage(line) && !patternGather"
           :key="`rel-dock-${line.id}`"
           class="rationale-dock"
           :style="relationRationaleStyle(line)"
@@ -2645,7 +3182,36 @@ onUnmounted(() => {
             @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
             @rationale-change="(payload) => updateRelationRationale(line.id, payload)"
             @labels="() => logEvent('labels_generated', { connectionId: line.id })"
-            @inspect-pattern="(places) => inspectPattern(places, line.fromId)"
+            @inspect-pattern="(places, focusWhy) => inspectPattern(places, line.fromId, focusWhy)"
+          />
+        </div>
+        <div
+          v-if="patternGather?.origin === 'lasso' && groupRationaleStyle"
+          class="rationale-dock group-rationale-dock"
+          :style="groupRationaleStyle"
+          @pointerdown.stop
+          @mousedown.stop
+          @click.stop
+        >
+          <RationaleModule
+            :key="`group-${patternGather.memberKey}-${historyEpoch}`"
+            compact
+            target="group"
+            :idea="groupIdeaText(patternGather)"
+            id-prefix="group"
+            :pinned="patternGather.pinnedLabels || []"
+            :saved-input="patternGather.rationaleText || ''"
+            :saved-labels="patternGather.rationaleLabels || []"
+            :known-labels="labelInventory"
+            :rid-owners="ridOwners"
+            :pattern-stats="patternStats"
+            :canvas-labels="canvasLabels"
+            :owner-directory="ownerDirectory"
+            placeholder="tell me more why this is a group"
+            @pin-change="setGroupPinned"
+            @rationale-change="updateGroupRationale"
+            @labels="() => logEvent('group_labels_generated', { members: patternGather.visitors.map((item) => item.id) })"
+            @inspect-pattern="(places, focusWhy) => inspectPattern(places, patternGather.sourceId, focusWhy)"
           />
         </div>
       </div>
@@ -2768,22 +3334,56 @@ onUnmounted(() => {
       <div
         v-if="groupActive"
         class="group-lasso-layer"
+        :style="groupLassoStyle"
         @pointerdown="onGroupPointerDown"
         @pointermove="onGroupPointerMove"
         @pointerup="onGroupPointerUp"
         @pointercancel="onGroupPointerUp"
       />
 
+      <div
+        v-if="groupActive && (patternGather?.origin === 'suggest' || focusedSuggestSets.length)"
+        class="group-suggest-nav"
+        :style="suggestNavStyle"
+        @mousedown.stop
+        @click.stop
+      >
+        <button
+          type="button"
+          class="group-suggest-step"
+          :disabled="focusedSuggestSets.length < 2"
+          title="Previous group for this idea"
+          @click="shiftSuggestedBrowse(-1)"
+        >←</button>
+        <span class="group-suggest-kicker">{{ focusedSuggestSets.length ? `this idea · ${suggestedBrowseIndex + 1} / ${focusedSuggestSets.length}` : 'this idea' }}</span>
+        <button
+          type="button"
+          class="group-suggest-step"
+          :disabled="focusedSuggestSets.length < 2"
+          title="Next group for this idea"
+          @click="shiftSuggestedBrowse(1)"
+        >→</button>
+        <p v-if="patternGather?.origin === 'suggest' && patternGroupWhy" class="group-suggest-why">{{ patternGroupWhy }}</p>
+      </div>
+      <aside
+        v-if="groupActive && (patternGather?.origin === 'suggest' || focusedSuggestSets.length)"
+        class="group-suggest-tray"
+        :class="{ empty: patternGather?.origin !== 'suggest' }"
+        :style="suggestTrayChromeStyle"
+      ></aside>
+
       <!-- FigJam-style tool well: sticky note only -->
       <div class="bottom-bar" @mousedown.stop @click.stop>
         <div v-if="stickyActive" class="hint">click anywhere to place a note · esc to cancel</div>
         <div v-else-if="groupActive && groupHint" class="hint">{{ groupHint }}</div>
+        <div v-else-if="groupActive && patternGather?.origin === 'suggest'" class="hint">{{ patternGatherHint }}</div>
+        <div v-else-if="groupActive && selectedId && !focusedSuggestSets.length" class="hint">no suggested group for this idea · draw around ideas to make your own · esc to cancel</div>
         <div v-else-if="groupActive" class="hint">draw around ideas to group them · esc to cancel</div>
         <div v-else-if="suggestError" class="hint">{{ suggestError }} · or drag a mag point to draw your own</div>
         <div v-else-if="suggestLoading" class="hint">looking for related ideas… · you can still drag a mag point</div>
         <div v-else-if="suggestedLinks.length" class="hint">blue dashed = AI · yellow dashed = you drawing · click a blue line to keep it</div>
         <div v-else-if="connectActive" class="hint">drag a mag point on this note · other notes show mag points when the pen is close</div>
-        <div v-else-if="patternGather" class="hint">{{ patternGather.origin === 'lasso' ? 'your group · drag an idea out or drop one in · keep group · esc cancels' : 'dashed frame = suggested group · labels on the frame are why they sit together · drag an idea out or drop one in · keep group · esc cancels' }}</div>
+        <div v-else-if="patternGather" class="hint">{{ patternGatherHint }}</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
         <button
           v-if="suggestedLinks.length"
@@ -2809,11 +3409,11 @@ onUnmounted(() => {
           v-if="patternGather"
           type="button"
           class="tool-btn"
-          :title="patternPickedCount ? 'Keep the ticked ideas in the group' : 'Keep the suggested group together'"
+          :title="patternGather.origin === 'label' ? 'Keep these ideas nearby' : patternGather.origin === 'suggest' ? 'Keep this suggested group together' : patternPickedCount ? 'Keep the ticked ideas in the group' : 'Keep the suggested group together'"
           @click="keepPatternGroup"
         >
           <span class="sample-plus">✓</span>
-          <span class="btn-label">{{ patternPickedCount ? `keep ${patternPickedCount}` : 'keep group' }}</span>
+          <span class="btn-label">{{ patternKeepCopy }}</span>
         </button>
         <button
           v-if="patternGather"
@@ -2925,6 +3525,79 @@ onUnmounted(() => {
   z-index: 25;
   touch-action: none;
   cursor: inherit;
+}
+
+.group-suggest-tray {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1.5px dashed #b45309;
+  border-radius: 16px;
+  background: rgba(255, 251, 235, 0.55);
+  z-index: 12;
+  pointer-events: none;
+}
+
+.group-suggest-tray.empty {
+  background: var(--chrome);
+}
+
+.group-suggest-nav {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px 10px;
+  padding: 8px 10px 0;
+  z-index: 32;
+}
+
+.group-suggest-step {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--chrome);
+  color: #92400e;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.group-suggest-step:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.group-suggest-kicker {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #b45309;
+}
+
+.group-suggest-why {
+  flex: 1 0 100%;
+  margin: 0;
+  max-width: 100%;
+  text-align: center;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #92400e;
+  pointer-events: none;
+}
+
+.group-suggest-empty {
+  flex: 1 0 100%;
+  margin: 0;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink-muted);
+  pointer-events: none;
 }
 
 .group-lasso {
@@ -3061,6 +3734,7 @@ onUnmounted(() => {
   height: 0;
   overflow: visible;
   pointer-events: none;
+  z-index: 20;
 }
 
 .pattern-frame {
@@ -3083,6 +3757,7 @@ onUnmounted(() => {
   align-items: flex-start;
   gap: 4px;
   max-width: calc(100% - 24px);
+  pointer-events: auto;
 }
 
 .pattern-frame-kicker {
@@ -3141,6 +3816,10 @@ onUnmounted(() => {
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(44, 40, 31, 0.12);
   cursor: default;
+}
+
+.group-rationale-dock {
+  overflow: visible;
 }
 
 .bottom-bar {

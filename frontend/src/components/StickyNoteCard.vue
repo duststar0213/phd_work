@@ -47,6 +47,7 @@ const props = defineProps({
   displayX: { type: Number, default: null },
   displayY: { type: Number, default: null },
   gathering: { type: Boolean, default: false },
+  gatherPick: { type: Boolean, default: false },
   leavingGroup: { type: Boolean, default: false },
   joiningGroup: { type: Boolean, default: false },
   searchHit: { type: Boolean, default: false },
@@ -56,6 +57,7 @@ const props = defineProps({
   suggesting: { type: Boolean, default: false },
   suggestHit: { type: Boolean, default: false },
   suggestPicked: { type: Boolean, default: false },
+  previewScale: { type: Number, default: 1 },
 })
 
 /** How many ideas share this rationale. 2+ earns a badge on the tab. */
@@ -76,12 +78,14 @@ function patternAcross(label) {
   return n > 1 ? n : 0
 }
 
-function inspectGroupPattern(group) {
+function inspectGroupPattern(group, label) {
   const stats = group.members.map((item) => labelPattern(item)).find((item) => item) || null
   const keys = Array.isArray(stats?.ownerKeys) ? stats.ownerKeys : []
-  const places = keys.map((key) => props.ownerDirectory?.[key]).filter((item) => item?.title)
+  const places = keys
+    .map((key) => props.ownerDirectory?.[key])
+    .filter((item) => item?.kind === 'note' && item?.title)
   if (places.length < 2) return
-  emit('inspect-pattern', places)
+  emit('inspect-pattern', places, String(label?.text || group.preview || '').trim())
 }
 
 const textRef = ref(null)
@@ -883,8 +887,10 @@ function onMagMouseUp(e, side) {
       'suggest-hit': suggestHit && !suggestPicked && !frozen,
       'suggest-picked': suggestPicked && !frozen,
       gathering: gathering && !dragging && !resizing,
+      'gather-pickable': gatherPick && !dragging && !resizing,
       'leaving-group': leavingGroup,
       'joining-group': joiningGroup,
+      'tray-focus': selected && !frozen && previewScale !== 1,
     }"
     :style="{
       left: `${displayX ?? note.x}px`,
@@ -894,6 +900,10 @@ function onMagMouseUp(e, side) {
       background: note.color,
       '--mag-outset': `${magOutset}px`,
       '--tab-max': `${Math.min(160, note.width ?? 168)}px`,
+      '--preview-scale': previewScale,
+      transform: previewScale !== 1 ? `scale(${previewScale})` : undefined,
+      transformOrigin: 'top left',
+      zIndex: previewScale !== 1 ? (selected ? 28 : 22) : undefined,
     }"
     @mousedown="onNoteMouseDown"
     @click="onNoteClick"
@@ -903,7 +913,7 @@ function onMagMouseUp(e, side) {
     @contextmenu="onContextMenu"
   >
     <button
-      v-if="gathering && searchHit"
+      v-if="gatherPick"
       type="button"
       class="gather-check"
       :class="{ on: searchPicked }"
@@ -913,7 +923,7 @@ function onMagMouseUp(e, side) {
       @click.stop="emit('toggle-gather', note.id)"
     />
     <!-- Hidden while a mag-point drag is in progress so it does not cover the path. -->
-    <div v-if="selected && !drafting && !frozen" class="toolbar" @pointerdown.stop @mousedown.stop @click.stop>
+    <div v-if="selected && !drafting && !frozen && previewScale === 1" class="toolbar" @pointerdown.stop @mousedown.stop @click.stop>
       <button
         class="color-btn"
         type="button"
@@ -958,7 +968,7 @@ function onMagMouseUp(e, side) {
       </div>
     </div>
 
-    <template v-if="selected && !frozen">
+    <template v-if="selected && !frozen && previewScale === 1">
       <div
         v-for="corner in CORNERS"
         :key="corner"
@@ -1025,7 +1035,7 @@ function onMagMouseUp(e, side) {
             :title="`this pattern appears on ${patternAcross(label)} ideas`"
             @pointerdown.stop
             @mousedown.stop
-            @click.stop="inspectGroupPattern(group)"
+            @click.stop="inspectGroupPattern(group, label)"
           >{{ patternAcross(label) }}</button>
           <button
             type="button"
@@ -1083,7 +1093,7 @@ function onMagMouseUp(e, side) {
             :title="`this pattern appears on ${patternAcross(label)} ideas`"
             @pointerdown.stop
             @mousedown.stop
-            @click.stop="inspectGroupPattern(group)"
+            @click.stop="inspectGroupPattern(group, label)"
           >{{ patternAcross(label) }}</button>
           <button
             type="button"
@@ -1215,7 +1225,7 @@ function onMagMouseUp(e, side) {
   transition: left 0.38s ease, top 0.38s ease;
 }
 
-.note.gathering .note-text {
+.note.gather-pickable .note-text {
   padding-left: 36px;
 }
 
@@ -1278,6 +1288,24 @@ function onMagMouseUp(e, side) {
   box-shadow:
     0 0 0 2.5px #2563eb,
     0 8px 24px rgba(37, 99, 235, 0.22);
+}
+
+/* Scaled tray minis shrink a 1.5px selected ring to almost nothing.
+   Divide by --preview-scale so the ring stays ~4px on screen, and
+   keep this after other .note.* shadows so it always wins. */
+.note.tray-focus,
+.note.selected.tray-focus,
+.note.search-hit.tray-focus,
+.note.search-picked.tray-focus,
+.note.suggest-hit.tray-focus,
+.note.suggest-picked.tray-focus {
+  z-index: 28;
+  outline: calc(2.5px / var(--preview-scale, 1)) solid #2563eb;
+  outline-offset: calc(3px / var(--preview-scale, 1));
+  box-shadow:
+    0 0 0 calc(2px / var(--preview-scale, 1)) #fff,
+    0 0 0 calc(6px / var(--preview-scale, 1)) #2563eb,
+    0 0 0 calc(12px / var(--preview-scale, 1)) rgba(37, 99, 235, 0.34);
 }
 
 .note.search-dim {
