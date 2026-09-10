@@ -3271,7 +3271,7 @@ onUnmounted(() => {
               :class="{ selected: selectedConnId === line.id && !line.abandoned, faded: line.faded }"
               :d="line.d"
               fill="none"
-              :stroke="line.faded ? 'rgba(44, 40, 31, 0.12)' : selectedConnId === line.id ? '#2563eb' : 'rgba(44, 40, 31, 0.45)'"
+              :stroke="line.faded ? 'rgba(44, 40, 31, 0.12)' : selectedConnId === line.id ? '#2563eb' : USER_ECHO"
               :stroke-width="selectedConnId === line.id && !line.abandoned ? 3 : 2.5"
               stroke-linecap="round"
             />
@@ -4112,6 +4112,16 @@ onUnmounted(() => {
 
 .draft-line {
   filter: drop-shadow(0 0 0.5px #5b4a12);
+}
+
+/* Pale yellow needs an outline to stay readable on the paper background. */
+.connector-line {
+  filter: drop-shadow(0 0 0.5px #5b4a12);
+}
+
+.connector-line.faded,
+.connector-line.selected {
+  filter: none;
 }
 
 .suggest-wrap {
