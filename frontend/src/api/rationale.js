@@ -8,6 +8,15 @@ const LABEL_KINDS = ['assumption', 'constraint', 'goal', 'tension', 'insight', '
 const REQUEST_TIMEOUT_MS = 35000
 const MAX_LABEL_WORDS = 10
 const MAX_KNOWN_LABELS = 40 // matches the backend cap; newest labels are the ones worth matching
+const MAX_CONTEXT_CHARS = 1500 // the brief is background, so it must not crowd out the idea itself
+const MAX_ASKED_QUESTIONS = 8 // earlier questions the model must not ask again
+const NEW_CLAUSE_WORDS = 4 // unmatched content words that make an addition worth labelling
+const MAX_LABELLED_CHARS = 4000 // reflection already turned into labels, sent as background
+
+/** The designer's standing brief, trimmed to what is worth spending prompt on. */
+function clipContext(text) {
+  return String(text || '').trim().slice(0, MAX_CONTEXT_CHARS)
+}
 
 export class RationaleApiError extends Error {
   constructor(message, { code = 'unknown', status = 0 } = {}) {
@@ -36,6 +45,8 @@ export function demoRationaleLabels(text, target = 'generic') {
  * POST /api/rationale-labels. `target` is generic | note | relation | group.
  * `options.known` is [{ ref, text }] of labels the designer already has, so the model can
  * point at one with `same_as` instead of coining a near-duplicate.
+ * `options.previous` is the reflection those labels came from; the model reads it as
+ * background and labels what the designer has since added. Pass '' to re-read the lot.
  */
 export async function generateRationaleLabels(text, target = 'generic', options = {}) {
   const reflection = String(text ?? '').trim()
@@ -59,7 +70,14 @@ export async function generateRationaleLabels(text, target = 'generic', options 
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: reflection, idea, target, known }),
+      body: JSON.stringify({
+        text: reflection,
+        idea,
+        target,
+        known,
+        labelled: String(options.previous || '').trim().slice(0, MAX_LABELLED_CHARS),
+        context: clipContext(options.context),
+      }),
       signal: options.signal,
     },
     REQUEST_TIMEOUT_MS,
@@ -73,14 +91,15 @@ export async function generateRationaleLabels(text, target = 'generic', options 
   const labels = Array.isArray(data.labels)
     ? data.labels.map(normalizeLabel).filter((item) => item.text || item.sameAs)
     : []
-  if (!labels.length) {
+  // Nothing new to say about an addition is an answer, not a failure; the caller says so gently.
+  if (!labels.length && data.reason !== 'nothing_new') {
     throw new RationaleApiError('The AI returned no labels. Try rephrasing and generate again.', {
       code: 'empty_labels',
       status: response.status,
     })
   }
 
-  return { labels, model: data.model || '' }
+  return { labels, model: data.model || '', reason: String(data.reason || '') }
 }
 
 /** True when the idea is long enough to possibly contain a why. */
@@ -89,6 +108,48 @@ export function ideaReadyForReflectionDetect(text) {
   if (idea.length < 36) return false
   const tokens = idea.match(/[\p{Script=Han}]|[a-zA-Z0-9']+/gu) || []
   return tokens.length >= 8
+}
+
+/** True when the sticky note has enough content to question. Empty notes never pass. */
+export function ideaReadyForWhyQuestion(text) {
+  const idea = String(text || '').trim()
+  if (idea.length < 12) return false
+  const tokens = idea.match(/[\p{Script=Han}]|[a-zA-Z0-9']+/gu) || []
+  return tokens.length >= 3
+}
+
+/**
+ * POST /api/ask-why. One short question about the idea, from the note plus whatever
+ * rationale is written so far. `options.asked` are earlier questions it must not repeat.
+ * Empty string if the note is too thin or the model answered with a statement.
+ */
+export async function askWhyQuestion(idea, options = {}) {
+  const text = String(idea || '').trim()
+  if (!ideaReadyForWhyQuestion(text)) return ''
+  const asked = (Array.isArray(options.asked) ? options.asked : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .slice(-MAX_ASKED_QUESTIONS)
+  const response = await fetchWithTimeout(
+    '/api/ask-why',
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idea: text,
+        answer: String(options.answer || '').trim().slice(0, 4000),
+        asked,
+        context: clipContext(options.context),
+      }),
+      signal: options.signal,
+    },
+    REQUEST_TIMEOUT_MS,
+  )
+  const data = await readJson(response)
+  if (!response.ok) throw toApiError(response.status, data)
+  const question = clipWords(String(data.question || '').trim(), 16)
+  return /[?？]$/.test(question) ? question : ''
 }
 
 /**
@@ -131,7 +192,7 @@ export async function suggestLinks(source, candidates, options = {}) {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source, candidates }),
+      body: JSON.stringify({ source, candidates, context: clipContext(options.context) }),
       signal: options.signal,
     },
     REQUEST_TIMEOUT_MS,
@@ -184,7 +245,7 @@ export async function suggestGroupWhy(payload, options = {}) {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ideas, shared }),
+      body: JSON.stringify({ ideas, shared, context: clipContext(options.context) }),
       signal: options.signal,
     },
     REQUEST_TIMEOUT_MS,
@@ -903,6 +964,9 @@ function unmatchedContent(prev, next) {
  * Counts as the same (no generate): case, punctuation, word order, typos, adding/removing
  * a letter or two inside a word, and swapping one word for a synonym.
  * Counts as new: a cue-word flip (not / cheap→expensive) or a whole new clause.
+ *
+ * Newness is counted in words, never as a share of the text: a clause added to a long
+ * reflection is just as new as the same clause added to a short one.
  */
 function isTrivialRevision(previous, next) {
   const prev = String(previous || '').trim()
@@ -924,6 +988,7 @@ function isTrivialRevision(previous, next) {
 
   const leftover = leftoverPrev.length + leftoverNext.length
   if (leftover <= 2) return true
+  if (leftoverNext.length >= NEW_CLAUSE_WORDS) return false
   const total = Math.max(prevContent.length, nextContent.length)
   if (total && matched / total >= 0.85) return true
   return false

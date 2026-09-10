@@ -10,6 +10,7 @@ import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
 import GroupIcon from './GroupIcon.vue'
 import SearchIcon from './SearchIcon.vue'
+import ContextIcon from './ContextIcon.vue'
 import RationaleModule from './RationaleModule.vue'
 import RelationMarker from './RelationMarker.vue'
 import { SEARCH_TEST_PACKS, SEARCH_TEST_TOPIC } from '../data/searchTestPacks'
@@ -138,6 +139,10 @@ const draft = ref(null) // in-progress path: { fromId, fromSide, x, y }
 const pan = ref({ x: 0, y: 0 })
 const scale = ref(1)
 const canvasRef = ref(null)
+// Free-form brief the designer keeps for themselves; the AI only ever reads it as background.
+const designContext = ref('')
+const contextOpen = ref(false)
+const contextRef = ref(null)
 const searchOpen = ref(false)
 const searchQuery = ref('')
 const searchHits = ref([]) // [{ id, score, title, why }]
@@ -202,6 +207,8 @@ const MAG_HOVER_PX = 20
 const MAG_GRAB_PX = 26
 /** Gap under the note so the rationale box sits below the bottom mag point. */
 const RATIONALE_GAP = 28
+/** Room to paste a brief and some material, without letting the saved board grow unbounded. */
+const MAX_DESIGN_CONTEXT = 4000
 /** Used until a dock is measured, so the dashed frame grows on the same click as V. */
 const RATIONALE_DOCK_FALLBACK = 220
 const dockHeights = ref({})
@@ -695,7 +702,7 @@ async function suggestRelations(id) {
     const result = await suggestLinks(
       payload,
       candidates.slice(0, 40).map(noteSuggestPayload),
-      { signal },
+      { context: designContext.value, signal },
     )
     if (signal.aborted) return
     const byId = new Map(candidates.map((note) => [String(note.id), note]))
@@ -2208,7 +2215,10 @@ function fillPatternGroupWhy(gather) {
       labels: keptRationaleLabels(note).map((item) => item.text).filter(Boolean).slice(0, 3),
     }
   })
-  suggestGroupWhy({ ideas, shared: sharedPatternLabelTexts(gather) }, { signal: groupWhyAbort.signal })
+  suggestGroupWhy(
+    { ideas, shared: sharedPatternLabelTexts(gather) },
+    { context: designContext.value, signal: groupWhyAbort.signal },
+  )
     .then((why) => {
       if (!why || patternGather.value?.memberKey !== memberKey) return
       patternGather.value.aiWhy = why
@@ -2923,6 +2933,11 @@ function onKeydown(e) {
       clearArmed.value = false
       return
     }
+    if (contextOpen.value) {
+      contextOpen.value = false
+      if (typing && e.target instanceof HTMLElement) e.target.blur()
+      return
+    }
     if (searchOpen.value) {
       closeSearch()
       return
@@ -3054,7 +3069,13 @@ function canvasPayload() {
     nextId,
     nextConnId,
     nextGroupId,
+    designContext: designContext.value,
   }
+}
+
+function toggleContext() {
+  contextOpen.value = !contextOpen.value
+  if (contextOpen.value) nextTick(() => contextRef.value?.focus())
 }
 
 let saveTimer = null
@@ -3158,10 +3179,13 @@ onMounted(async () => {
     }))
     const maxGroupId = groups.value.reduce((max, group) => Math.max(max, Number(group.id) || 0), 0)
     nextGroupId = Number(data.nextGroupId) > 0 ? Number(data.nextGroupId) : maxGroupId + 1
+    designContext.value = typeof data.designContext === 'string' ? data.designContext : ''
   } catch {
     notes.value = []
     groups.value = []
   }
+  // A board with nothing on it and no brief means a first visit: open the brief once, unprompted.
+  contextOpen.value = !designContext.value.trim() && !notes.value.length
   loaded = true
   history.seed(historyState())
   history.setReady(true)
@@ -3176,6 +3200,7 @@ onMounted(async () => {
     { deep: true },
   )
   watch(pan, scheduleSave, { deep: true })
+  watch(designContext, scheduleSave)
 })
 
 onUnmounted(() => {
@@ -3445,6 +3470,7 @@ onUnmounted(() => {
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
             :owner-directory="ownerDirectory"
+            :context="designContext"
               :preset-labels="[presetAbandonLabel(note.id)]"
               placeholder="Tell me why abandon this idea…"
               action-label="just abandon it"
@@ -3480,6 +3506,8 @@ onUnmounted(() => {
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
             :owner-directory="ownerDirectory"
+            :context="designContext"
+              :active="Boolean(note.rationaleOpen)"
               @pin-change="(pinned) => setPinnedLabels(note.id, pinned)"
               @rationale-change="(payload) => updateRationale(note.id, payload)"
               @labels="() => logEvent('labels_generated', { noteId: note.id })"
@@ -3510,6 +3538,7 @@ onUnmounted(() => {
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
             :owner-directory="ownerDirectory"
+            :context="designContext"
             :preset-labels="[presetAbandonLabel(`rel-${line.id}`)]"
             placeholder="Tell me why abandon this relation…"
             action-label="just abandon it"
@@ -3547,6 +3576,7 @@ onUnmounted(() => {
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
             :owner-directory="ownerDirectory"
+            :context="designContext"
             placeholder="Tell me about how they relates…"
             @pin-change="(pinned) => setRelationPinned(line.id, pinned)"
             @rationale-change="(payload) => updateRelationRationale(line.id, payload)"
@@ -3576,6 +3606,7 @@ onUnmounted(() => {
             :pattern-stats="patternStats"
             :canvas-labels="canvasLabels"
             :owner-directory="ownerDirectory"
+            :context="designContext"
             placeholder="tell me more why this is a group"
             @pin-change="setGroupPinned"
             @rationale-change="updateGroupRationale"
@@ -3813,6 +3844,33 @@ onUnmounted(() => {
           <GroupIcon :size="28" />
           <span class="btn-label">group</span>
         </button>
+        <div class="context-slot">
+          <!-- Standing brief: the designer writes here whenever they like and the AI never answers it. -->
+          <div v-if="contextOpen" class="context-panel">
+            <div class="context-head">
+              <span class="context-title">what are you designing?</span>
+              <button type="button" class="context-close" title="Close" @click="contextOpen = false">×</button>
+            </div>
+            <textarea
+              ref="contextRef"
+              v-model="designContext"
+              class="context-input"
+              :maxlength="MAX_DESIGN_CONTEXT"
+              placeholder="Describe the design goal, who it is for, constraints — or paste any material that frames this work."
+            />
+            <p class="context-hint">background for the AI's questions · nothing is generated from this · edit it any time</p>
+          </div>
+          <button
+            type="button"
+            class="tool-btn"
+            :class="{ active: contextOpen }"
+            title="Design context the AI reads as background"
+            @click="toggleContext"
+          >
+            <ContextIcon :size="28" />
+            <span class="btn-label">{{ designContext.trim() ? 'context ✓' : 'context' }}</span>
+          </button>
+        </div>
         <div class="search-slot">
           <div v-if="searchHits.length || (searchOpen && searchError)" class="search-results">
             <div class="search-results-head">
@@ -4268,7 +4326,7 @@ onUnmounted(() => {
   position: absolute;
   box-sizing: border-box;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
   padding: 10px;
   background: var(--chrome);
   border: 1px solid var(--line);
@@ -4443,7 +4501,13 @@ onUnmounted(() => {
   color: var(--ink-muted);
 }
 
+/* Same box as the 28px tool icons, so a glyph tool sits level with an SVG one. */
 .sample-plus {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
   font-size: 22px;
   line-height: 1;
   font-family: 'DM Mono', ui-monospace, monospace;
@@ -4471,6 +4535,94 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.context-slot {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.context-panel {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 12px);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(78vw, 460px);
+  padding: 12px;
+  background: var(--chrome);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(44, 40, 31, 0.16);
+}
+
+.context-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.context-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.context-close {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 20px;
+}
+
+.context-close:hover {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.context-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 180px;
+  padding: 10px 12px;
+  resize: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  outline: none;
+}
+
+.context-input:focus {
+  border-color: rgba(180, 83, 9, 0.45);
+}
+
+.context-input::placeholder {
+  color: var(--ink-faint);
+}
+
+.context-hint {
+  margin: 0;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  line-height: 1.4;
+  color: var(--ink-faint);
 }
 
 .search-input {

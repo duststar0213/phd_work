@@ -18,8 +18,8 @@ import {
   needsShortLabel,
   SHORTEN_PAUSE_MS,
   suggestShortLabel,
-  detectEmbeddedReflection,
-  ideaReadyForReflectionDetect,
+  askWhyQuestion,
+  ideaReadyForWhyQuestion,
   generateRationaleLabels,
   isSimilarLabel,
   clusterSimilarLabels,
@@ -56,10 +56,12 @@ const props = defineProps({
   patternStats: { type: Object, default: () => ({}) }, // repeating wording across the canvas
   canvasLabels: { type: Array, default: () => [] }, // [{ text, rid, owner }]
   ownerDirectory: { type: Object, default: () => ({}) }, // n12 / c3 -> { key, kind, id, title }
+  context: { type: String, default: '' }, // the designer's standing brief; background for the AI only
   placeholder: { type: String, default: 'simply write a reflection on why you have this idea' },
   presetLabels: { type: Array, default: () => [] }, // chips shown on open so the user can skip writing
   actionLabel: { type: String, default: '' }, // optional extra button, e.g. "just abandon it"
   completeOnGenerate: { type: Boolean, default: false }, // emit complete after a successful Enter generate
+  active: { type: Boolean, default: true }, // false while the dock is hidden; skip AI guesses
 })
 
 const emit = defineEmits(['labels', 'error', 'pin-change', 'rationale-change', 'action', 'complete', 'inspect-pattern'])
@@ -73,6 +75,8 @@ const suggestRound = ref(false)
 const loading = ref(false)
 const error = ref('')
 const errorCode = ref('')
+/** Not an error: the addition carried no new reasoning. Offers a re-read of the whole field. */
+const noNewNotice = ref('')
 const source = ref('') // 'api' | ''
 const editingId = ref(null)
 const editingZone = ref(null) // which copy of the chip holds the caret
@@ -87,13 +91,18 @@ const pendingMerges = ref([]) // reuse hits awaiting a yes / no from the person
 const lastGenerated = ref('')
 
 const fieldRef = ref(null)
-const embeddedWhy = ref('')
-const embeddedFound = ref(false)
-const dismissedIdea = ref('')
+/** AI question about this idea; the person answers it, so it never enters the field. */
+const whyQuestion = ref('')
+/** Everything already asked here, so a later question cannot repeat an earlier one. */
+let askedQuestions = []
+let askedIdea = ''
+let askedAnswerLength = -1
+/** New rationale the person must write before the AI is allowed to ask again. */
+const ANSWER_STEP = 24
 
 let abortGenerate = null
-let abortDetect = null
-let detectTimer = 0
+let abortQuestion = null
+let ideaPromptTimer = 0
 let abortEcho = new AbortController()
 let nextLabelId = 1
 let hydrating = true
@@ -172,8 +181,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   abortGenerate?.abort()
-  abortDetect?.abort()
-  window.clearTimeout(detectTimer)
+  abortQuestion?.abort()
+  window.clearTimeout(ideaPromptTimer)
   abortEcho?.abort()
   liveEmbedAbort?.abort()
   window.clearTimeout(liveEmbedTimer)
@@ -182,69 +191,68 @@ onUnmounted(() => {
   fieldObserver?.disconnect()
 })
 
-const canOfferEmbedded = computed(() => {
-  if (props.target !== 'note' || props.completeOnGenerate) return false
-  if (!embeddedFound.value) return false
-  if (dismissedIdea.value && dismissedIdea.value === String(props.idea || '').trim()) return false
-  return !String(input.value || '').trim()
-})
+const fieldPlaceholder = computed(() => props.placeholder)
 
-const fieldPlaceholder = computed(() => {
-  if (canOfferEmbedded.value) return 'the idea already says why — use that, or write more…'
-  return props.placeholder
-})
-
-function clearEmbeddedOffer() {
-  embeddedFound.value = false
-  embeddedWhy.value = ''
+function clearWhyQuestion() {
+  whyQuestion.value = ''
+  askedIdea = ''
+  askedAnswerLength = -1
 }
 
-function useEmbeddedWhy() {
-  const idea = String(props.idea || '').trim()
-  const excerpt = String(embeddedWhy.value || '').trim()
-  input.value = excerpt.length >= 20 ? excerpt : idea
-  nextTick(() => {
-    autoGrow()
-    fieldRef.value?.focus()
-  })
+/** × drops the bubble; the next rewrite or new rationale earns the next question. */
+function dismissWhyQuestion() {
+  whyQuestion.value = ''
 }
 
-function dismissEmbeddedWhy() {
-  dismissedIdea.value = String(props.idea || '').trim()
-  clearEmbeddedOffer()
+function shouldAskAboutIdea() {
+  return props.target === 'note' && !props.completeOnGenerate && props.active
 }
 
-async function checkEmbeddedReflection(idea) {
-  if (props.target !== 'note' || props.completeOnGenerate) return
-  const text = String(idea || '').trim()
-  if (!ideaReadyForReflectionDetect(text) || String(input.value || '').trim()) {
-    clearEmbeddedOffer()
-    return
-  }
-  abortDetect?.abort()
-  abortDetect = new AbortController()
+/** A rewritten idea always earns a new question; a growing answer earns one every ANSWER_STEP. */
+function askIsDue() {
+  const text = String(props.idea || '').trim()
+  if (!ideaReadyForWhyQuestion(text)) return false
+  if (text !== askedIdea) return true
+  return Math.abs(String(input.value || '').trim().length - askedAnswerLength) >= ANSWER_STEP
+}
+
+async function refreshIdeaQuestion() {
+  const text = String(props.idea || '').trim()
+  const answer = String(input.value || '').trim()
+  if (!shouldAskAboutIdea() || !askIsDue()) return
+  abortQuestion?.abort()
+  abortQuestion = new AbortController()
   try {
-    const result = await detectEmbeddedReflection(text, { signal: abortDetect.signal })
-    if (String(props.idea || '').trim() !== text) return
-    embeddedFound.value = Boolean(result.hasReflection)
-    embeddedWhy.value = result.excerpt || ''
+    const question = await askWhyQuestion(text, {
+      answer,
+      asked: askedQuestions,
+      context: props.context,
+      signal: abortQuestion.signal,
+    })
+    if (String(props.idea || '').trim() !== text || !shouldAskAboutIdea()) return
+    askedIdea = text
+    askedAnswerLength = answer.length
+    if (!question || askedQuestions.some((item) => isSimilarLabel(item, question))) return
+    whyQuestion.value = question
+    askedQuestions = [...askedQuestions, question].slice(-8)
   } catch (err) {
     if (err?.code === 'cancelled' || err?.name === 'AbortError') return
-    clearEmbeddedOffer()
+    if (String(props.idea || '').trim() === text) whyQuestion.value = ''
   }
 }
 
+// The idea, the answer so far, and the panel opening all decide when the next question is due.
 watch(
-  () => [props.idea, props.target, props.completeOnGenerate],
+  () => [props.idea, input.value, props.target, props.completeOnGenerate, props.active],
   () => {
-    window.clearTimeout(detectTimer)
-    abortDetect?.abort()
-    clearEmbeddedOffer()
-    if (props.target !== 'note' || props.completeOnGenerate) return
-    if (!ideaReadyForReflectionDetect(props.idea)) return
-    detectTimer = window.setTimeout(() => {
-      checkEmbeddedReflection(props.idea)
-    }, 900)
+    window.clearTimeout(ideaPromptTimer)
+    abortQuestion?.abort()
+    if (!ideaReadyForWhyQuestion(props.idea)) {
+      clearWhyQuestion()
+      return
+    }
+    if (!shouldAskAboutIdea() || !askIsDue()) return
+    ideaPromptTimer = window.setTimeout(refreshIdeaQuestion, 1200)
   },
   { immediate: true },
 )
@@ -792,16 +800,28 @@ function generateFingerprint() {
   return [idea, reflection].filter(Boolean).join('\n\n')
 }
 
-/** Ask OpenAI for labels from the sticky-note idea and/or the reflection field. */
-async function generate() {
+/**
+ * Ask OpenAI for labels from the sticky-note idea and/or the reflection field.
+ * `fresh` re-reads the whole reflection instead of only what was added since last time.
+ */
+async function generate(options = {}) {
+  const fresh = options?.fresh === true
   const reflection = input.value.trim()
   const idea = String(props.idea || '').trim()
   if (loading.value) return
   if (!reflection && !idea) return
 
   const fingerprint = generateFingerprint()
-  const verdict = assessReflection(fingerprint, lastGenerated.value)
+  const alreadyLabelled = fresh ? '' : lastGenerated.value
+  const verdict = assessReflection(fingerprint, alreadyLabelled)
   if (!verdict.ok) {
+    // Writing on top of labelled text is normal, so say so plainly instead of erroring.
+    if (verdict.code === 'not_distinguishable') {
+      error.value = ''
+      errorCode.value = ''
+      noNewNotice.value = 'no new reasoning in what you added'
+      return
+    }
     error.value = verdict.message
     errorCode.value = verdict.code || ''
     return
@@ -811,6 +831,7 @@ async function generate() {
     lastGenerated.value = fingerprint
     error.value = ''
     errorCode.value = ''
+    noNewNotice.value = ''
     editingId.value = null
     notify()
     if (props.completeOnGenerate) emit('complete')
@@ -821,14 +842,22 @@ async function generate() {
   abortGenerate = new AbortController()
   error.value = ''
   errorCode.value = ''
+  noNewNotice.value = ''
   loading.value = true
   try {
     const data = await generateRationaleLabels(reflection, props.target, {
       idea,
       known: props.knownLabels,
-      previous: lastGenerated.value,
+      previous: alreadyLabelled,
+      context: props.context,
       signal: abortGenerate.signal,
     })
+
+    if (data.reason === 'nothing_new' && !data.labels.length) {
+      noNewNotice.value = 'nothing new to label in what you added'
+      lastGenerated.value = fingerprint
+      return
+    }
 
     // The model points at an existing rationale with same_as instead of coining a near-duplicate.
     // Those are proposals only — nothing merges until the person confirms it.
@@ -1075,6 +1104,12 @@ function dismissError() {
   errorCode.value = ''
 }
 
+/** The addition looked spent, but the person disagrees: label the whole reflection again. */
+function generateFresh() {
+  noNewNotice.value = ''
+  generate({ fresh: true })
+}
+
 function onAction() {
   emitRationale()
   emit('action')
@@ -1085,6 +1120,17 @@ defineExpose({ generate, input, labels })
 
 <template>
   <section class="module" :class="{ compact }">
+    <!-- Sticker, not panel furniture: it hangs off the field and can be flicked away. -->
+    <div v-if="whyQuestion" class="why-ask">
+      <p class="why-ask-text">{{ whyQuestion }}</p>
+      <button
+        type="button"
+        class="why-ask-close"
+        title="Dismiss this question"
+        @mousedown.prevent
+        @click.stop="dismissWhyQuestion"
+      >×</button>
+    </div>
     <label class="field">
       <span class="field-label">Rationale</span>
       <textarea
@@ -1096,25 +1142,19 @@ defineExpose({ generate, input, labels })
         @keydown="onFieldKeydown"
         @input="autoGrow"
       />
-      <span class="hint">{{
-        canOfferEmbedded
-          ? 'found a why in the idea · use that, then press enter'
-          : 'press enter to suggest labels · shift+enter for a new line'
-      }}</span>
+      <span class="hint">press enter to suggest labels · shift+enter for a new line</span>
     </label>
-    <div v-if="canOfferEmbedded" class="embed-ask">
-      <p class="embed-line">this idea already has a why. use it as the rationale?</p>
-      <div class="merge-actions">
-        <button type="button" class="btn tiny" @click="useEmbeddedWhy">use that</button>
-        <button type="button" class="btn tiny ghost" @click="dismissEmbeddedWhy">write my own</button>
-      </div>
-    </div>
 
     <p v-if="loading" class="status">generating…</p>
     <div v-else-if="error" class="banner" role="alert">
       <p>{{ error }}</p>
       <p class="banner-hint" v-if="errorCode !== 'not_distinguishable'">press enter to try again</p>
       <button type="button" class="btn tiny ghost" @click="dismissError">dismiss</button>
+    </div>
+    <div v-else-if="noNewNotice" class="notice">
+      <p>{{ noNewNotice }}</p>
+      <button type="button" class="btn tiny ghost" @click="generateFresh">label it anyway</button>
+      <button type="button" class="btn tiny ghost" @click="noNewNotice = ''">dismiss</button>
     </div>
 
     <!-- Reuse proposals: the AI thinks it just restated a rationale you already have. -->
@@ -1288,12 +1328,12 @@ defineExpose({ generate, input, labels })
 
 <style scoped>
 .module {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 12px;
   min-width: 0;
   max-width: 100%;
-  overflow: hidden;
 }
 
 .field {
@@ -1333,6 +1373,76 @@ textarea:focus {
 
 textarea::placeholder {
   color: var(--ink-faint);
+}
+
+/* Speech bubble hanging off the right of the field, over the canvas. */
+.why-ask {
+  position: absolute;
+  left: calc(100% + 14px);
+  top: 22px;
+  z-index: 12;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 200px;
+  padding: 8px 8px 8px 10px;
+  border: 1px solid #a8caf4;
+  border-radius: 12px;
+  background: #e8f1fd;
+  box-shadow: 0 6px 18px rgba(30, 58, 95, 0.18);
+}
+
+/* Two stacked triangles point back at the field: the outer is the border, the inner fills it. */
+.why-ask::before,
+.why-ask::after {
+  content: '';
+  position: absolute;
+  top: 14px;
+  width: 0;
+  height: 0;
+  border-style: solid;
+}
+
+.why-ask::before {
+  left: -9px;
+  border-width: 8px 9px 8px 0;
+  border-color: transparent #a8caf4 transparent transparent;
+}
+
+.why-ask::after {
+  left: -7px;
+  border-width: 7px 8px 7px 0;
+  border-color: transparent #e8f1fd transparent transparent;
+}
+
+.why-ask-text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: #1e3a5f;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+}
+
+.why-ask-close {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #1e3a5f;
+  opacity: 0.5;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 16px;
+}
+
+.why-ask-close:hover {
+  opacity: 1;
+  background: rgba(30, 58, 95, 0.12);
 }
 
 .hint {
@@ -1415,7 +1525,25 @@ textarea::placeholder {
   color: var(--ink-faint);
 }
 
-.embed-ask,
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.notice p {
+  margin: 0;
+  flex: 1 1 auto;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink-muted);
+}
+
 .merge-ask {
   display: flex;
   flex-direction: column;
@@ -1426,7 +1554,6 @@ textarea::placeholder {
   background: var(--paper);
 }
 
-.embed-line,
 .merge-line {
   margin: 0;
   font-size: 11px;

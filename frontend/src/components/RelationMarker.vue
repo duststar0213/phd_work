@@ -384,7 +384,7 @@ function onCreateKeydown(e) {
     <div
       v-if="!abandoned"
       class="edge-add-wrap"
-      @mouseenter="addHover = true"
+      @mouseenter="addHover = !creating"
       @mouseleave="addHover = false"
     >
       <span v-if="creating" class="edge-tab user draft">
@@ -406,7 +406,7 @@ function onCreateKeydown(e) {
         <button type="button" @mousedown.prevent="acceptShortSuggest">use</button>
         <button type="button" @mousedown.prevent="skipShortSuggest">keep mine</button>
       </div>
-      <span v-else-if="canAddTab && addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
+      <span v-else-if="canAddTab && !creating && addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
       <div class="edge-btns">
         <button
           v-if="open || !canAddTab"
@@ -538,7 +538,7 @@ function onCreateKeydown(e) {
   top: 50%;
   transform: translateY(-50%);
   z-index: 3;
-  max-width: 76px;
+  max-width: none;
   padding: 2px 6px;
   border-radius: 3px;
   border: 1px solid rgba(253, 230, 138, 0.4);
@@ -548,7 +548,7 @@ function onCreateKeydown(e) {
   font-size: 8px;
   line-height: 1.2;
   white-space: nowrap;
-  overflow: hidden;
+  overflow: visible;
   pointer-events: none;
 }
 

@@ -1120,7 +1120,7 @@ function onMagMouseUp(e, side) {
         class="edge-add-wrap"
         @pointerdown.stop
         @mousedown.stop
-        @mouseenter="addHover = true"
+        @mouseenter="addHover = !creating"
         @mouseleave="addHover = false"
       >
         <span v-if="creating" class="edge-tab user draft">
@@ -1142,7 +1142,7 @@ function onMagMouseUp(e, side) {
           <button type="button" @mousedown.prevent="acceptShortSuggest">use</button>
           <button type="button" @mousedown.prevent="skipShortSuggest">keep mine</button>
         </div>
-        <span v-else-if="addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
+        <span v-else-if="!creating && addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
         <button
           type="button"
           class="edge-add"
@@ -1730,7 +1730,7 @@ function onMagMouseUp(e, side) {
   top: 50%;
   transform: translateY(-50%);
   z-index: 3;
-  max-width: 76px;
+  max-width: none;
   padding: 2px 6px;
   border-radius: 3px;
   border: 1px solid rgba(253, 230, 138, 0.4);
@@ -1740,7 +1740,7 @@ function onMagMouseUp(e, side) {
   font-size: 11px;
   line-height: 1.25;
   white-space: nowrap;
-  overflow: hidden;
+  overflow: visible;
   pointer-events: none;
 }
 

@@ -62,6 +62,12 @@ reasoning (same point in different words, or in another language), do not invent
 new label: return {"same_as":"<ref>","phrasing":"<how you would have put it>"} instead.
 Only reuse a ref when the reasoning genuinely matches; related-but-different reasons
 stay separate. Never return the same ref twice in one response.
+
+The user message may also quote the reflection those labels were made from. People keep
+writing on top of what they wrote before, so read that quoted part as background only and
+label the reasoning the designer has ADDED since. Judge the addition on its own: a new
+clause is worth a label even when it sits in a long paragraph you have already labelled.
+Return an empty labels list only when the addition truly carries no reasoning of its own.
 """
 MEANING_SYSTEM_PROMPT = """You decide whether a label names the SAME reason as other existing labels (AI or human).
 
@@ -130,10 +136,86 @@ Rules:
 - same language as the idea
 - no chatbot tone, no markdown
 """
+ASK_WHY_PROMPT = """You read one sticky-note idea from a designer and ask ONE question that pushes the design reasoning of that idea further.
+
+Read the note before you ask. Return JSON only, with these seven keys in this order, every value written from the note in front of you:
+ideas (number), proposals (list of strings), kind (one of idea, reflection, mixed), stated_why (string), settled (string), gap (string), question (string).
+Never copy a placeholder or an example into a value.
+
+The note may come with rationale the designer has already written, and with questions already asked. Both are settled ground: read them, then ask about what is still open.
+
+ideas: how many proposals the note holds that could be built or dropped on their own. A wall plus a bot is 2. One proposal is still 1 when it merely names options, states, or steps.
+proposals: when ideas is 2 or more, name each one as a short noun phrase of at most 4 words taken from the note, such as "colour coding" or "timeline view"; never a sentence or a verb phrase. Otherwise an empty list.
+kind: "idea" when it proposes something to build or change, "reflection" when it only reports a situation, observation, or difficulty with nothing proposed, "mixed" when it does both.
+stated_why: the reason already given, copied from the note or from the rationale written so far; "" when there is none.
+settled: what else is already decided — the note's goal, any options it keeps open, any states it defines as different from each other, and anything the written rationale has now answered.
+gap: one thing its reasoning has not decided yet. Pick the gap the note itself leans on, from: what it trades away, what it competes with, what changes downstream once it works, what it assumes about the situation, who it serves, when it should not apply, what decides which case applies.
+question: ask about that gap, following the case that fits.
+
+Cases, in priority order. Take the first that fits and ignore the rest:
+1. ideas is 2 or more: ask why those proposals belong on one note, or which of them carries the intent. Do not ask about the workings of either one.
+2. kind is "reflection": ask what that thinking should change in the design.
+3. stated_why is not empty: that reason is settled, so never ask for it again; ask what it does not cover.
+4. stated_why is empty: ask for the reasoning behind the most consequential choice the note makes.
+
+Hard checks before you answer:
+- the situation you ask about must be possible under the idea's own logic; if the idea defines two states as different, never ask about something being both
+- do not invent an edge case the idea rules out
+- if your question repeats anything in "stated_why" or "settled", pick another gap
+- the asked list rules out a topic, not just a wording: if you already asked what is lost by filtering, asking what those ideas are worth is the same question again
+- take the rationale written so far as answered and ask the next thing it opens up, never the thing it just settled
+- only ask what defines or classifies something when telling two states apart is the point of the note; otherwise choose a different gap
+- if ideas is 2 or more and your question is about how one of those proposals works, throw it away and ask why they belong together instead
+- if nothing survives these checks, keep the reading fields and return "question":""
+
+Rules for the question:
+- stay on the idea as a design proposal; never ask about the person's feelings, memories, habits, or past projects
+- the note is the subject. A design context block, when present, only tells you which project the note sits in: lean on it to make the question concrete, never treat the project's goals as this note's goals, and never ask about the context itself
+- do not invent users, places, constraints, or motives that neither the note nor the context names
+- never restate or summarise the idea
+- name something concrete from the idea, so it could not be asked of any other note
+- reject anything that would fit any idea, such as "what do you hope to achieve" or "why is this important"
+- one question, at most 16 words, ending in a question mark
+- same language as the idea
+- no chatbot tone, no markdown, no preamble, no multiple questions
+
+Examples of the judgement wanted:
+idea: As a user, I want the system to distinguish between vaguely abandoned and explicitly rejected ideas so I can read their status differently.
+bad: How would the system handle an idea that straddles both categories? (the idea defines them as different states, so that case cannot exist)
+good: What tells the system an idea was vaguely abandoned rather than explicitly rejected?
+
+idea: As Dennis, I want to attach a vague or specific reason when I abandon something, so I remember why I set it aside.
+bad: Why choose a vague reason instead of a specific one? (the idea already allows both)
+bad: What did a vague reason cost you months later? (asks about him, not about the design)
+good: What should a vague reason still be good for when the idea returns?
+
+idea: Sticky note wall in the lab entrance for weekly reading picks
+bad: What do you hope to achieve with weekly picks? (fits any idea)
+good: What makes the entrance beat the group chat for these picks?
+
+idea: Weekly reading wall in the entrance, and a bot that posts the picks to Slack
+reading: ideas 2, because the wall and the bot could each be built alone
+bad: How would the wall and the bot stay in sync? (asks about plumbing, not intent)
+good: Why should the wall and the Slack bot live on one note?
+
+idea: Add a filter for abandoned ideas
+written so far: The board fills up and dead ideas drown the live ones.
+already asked: What is lost when abandoned ideas are hidden?
+bad: What value might abandoned ideas still hold? (the asked question again, in new words)
+good: What brings a hidden idea back onto the board?
+
+idea: I keep reopening ideas I dropped months ago and cannot tell if I rejected them or ran out of time
+reading: kind reflection, because it reports a difficulty and proposes nothing
+bad: What criteria separate a rejected idea from a dropped one? (answers the reflection for them)
+good: What should the canvas show differently once that difference is known?
+"""
 MAX_KNOWN_LABELS = 40  # caps prompt size; the newest labels are the ones worth matching
 MAX_SUGGEST_LINKS = 5
 MAX_SUGGEST_WHY_WORDS = 12
 MAX_GROUP_WHY_WORDS = 18
+MAX_WHY_QUESTION_WORDS = 16
+MAX_CONTEXT_CHARS = 1500  # the standing brief is background, so it must not crowd out the idea
+MIN_WHY_QUESTION_CHARS = 12
 MIN_RATIONALE_CHARS = 1
 OPENAI_TIMEOUT_S = 30.0
 MAX_LABEL_WORDS = 10
@@ -241,6 +323,8 @@ class RationaleRequest(BaseModel):
     idea: str = Field(default="", max_length=4000)  # sticky-note / relation body
     target: str = Field(default="generic")  # generic | note | relation | group
     known: list[KnownLabel] = Field(default_factory=list, max_length=200)
+    labelled: str = Field(default="", max_length=4000)  # reflection the known labels came from
+    context: str = Field(default="", max_length=MAX_CONTEXT_CHARS)  # the designer's standing brief
 
 
 class EmbedRequest(BaseModel):
@@ -265,15 +349,24 @@ class SuggestIdea(BaseModel):
 class SuggestLinksRequest(BaseModel):
     source: SuggestIdea
     candidates: list[SuggestIdea] = Field(min_length=1, max_length=40)
+    context: str = Field(default="", max_length=MAX_CONTEXT_CHARS)
 
 
 class SuggestGroupWhyRequest(BaseModel):
     ideas: list[SuggestIdea] = Field(min_length=2, max_length=8)
     shared: list[str] = Field(default_factory=list, max_length=6)
+    context: str = Field(default="", max_length=MAX_CONTEXT_CHARS)
 
 
 class DetectReflectionRequest(BaseModel):
     idea: str = Field(min_length=1, max_length=4000)
+
+
+class AskWhyRequest(BaseModel):
+    idea: str = Field(min_length=1, max_length=4000)
+    answer: str = Field(default="", max_length=4000)  # rationale written so far
+    asked: list[str] = Field(default_factory=list, max_length=8)  # never ask these again
+    context: str = Field(default="", max_length=MAX_CONTEXT_CHARS)
 
 
 def clear_local_proxies() -> None:
@@ -591,11 +684,16 @@ def clip_words(text: str, max_words: int = MAX_LABEL_WORDS) -> str:
     return " ".join(parts[:max_words])
 
 
-def parse_label_payload(raw: str, known_refs: set[str] | None = None) -> list[dict]:
+def parse_label_payload(
+    raw: str,
+    known_refs: set[str] | None = None,
+    allow_empty: bool = False,
+) -> list[dict]:
     """Parse model JSON into [{text, kind}, ...] plus {same_as, phrasing, kind} reuse hits.
 
     Strips markdown fences if present. A same_as pointing at a ref we never sent is a
-    model slip, so it falls back to the phrasing as a plain new label.
+    model slip, so it falls back to the phrasing as a plain new label. With `allow_empty`
+    an empty list is a verdict on the addition, not a failure, so it comes back as [].
     """
     refs = known_refs or set()
     text = raw.strip()
@@ -608,7 +706,11 @@ def parse_label_payload(raw: str, known_refs: set[str] | None = None) -> list[di
         raise api_error(502, "bad_model_json", "The AI returned no usable labels. Try rephrasing.") from exc
 
     items = data.get("labels") if isinstance(data, dict) else data
-    if not isinstance(items, list) or not items:
+    if not isinstance(items, list):
+        raise api_error(502, "empty_labels", "The AI returned no labels. Try rephrasing and generate again.")
+    if not items:
+        if allow_empty:
+            return []
         raise api_error(502, "empty_labels", "The AI returned no labels. Try rephrasing and generate again.")
 
     labels = []
@@ -635,7 +737,7 @@ def parse_label_payload(raw: str, known_refs: set[str] | None = None) -> list[di
             "text": clip_words(label_text),
             "kind": kind,
         })
-    if not labels:
+    if not labels and not allow_empty:
         raise api_error(502, "empty_labels", "The AI returned no labels. Try rephrasing and generate again.")
     return labels[:6]
 
@@ -844,7 +946,7 @@ async def suggest_links(req: SuggestLinksRequest):
         return {"links": [], "model": ""}
 
     listing = "\n\n".join(idea_block(item) for item in req.candidates if item.id in allowed_ids)
-    user_content = f"source idea\n{idea_block(req.source)}\n\ncandidate ideas\n{listing}"
+    user_content = f"{context_block(req.context)}source idea\n{idea_block(req.source)}\n\ncandidate ideas\n{listing}"
 
     client = get_client()
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -890,7 +992,7 @@ async def suggest_group_why(req: SuggestGroupWhyRequest):
     listing = "\n\n".join(idea_block(item) for item in req.ideas)
     shared = [str(item).strip() for item in req.shared if str(item).strip()][:6]
     shared_line = " | ".join(item[:200] for item in shared) if shared else "(none)"
-    user_content = f"grouped ideas\n{listing}\n\nshared rationale labels: {shared_line}"
+    user_content = f"{context_block(req.context)}grouped ideas\n{listing}\n\nshared rationale labels: {shared_line}"
 
     client = get_client()
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -940,6 +1042,168 @@ def keep_idea_excerpt(idea: str, excerpt: str) -> str:
     if needle and needle in hay:
         return excerpt
     return ""
+
+
+def context_block(context: str) -> str:
+    """The designer's standing brief, as a labelled block the model reads as background only."""
+    text = " ".join(str(context or "").split())[:MAX_CONTEXT_CHARS].strip()
+    if not text:
+        return ""
+    return f"design context, written by the designer about the project as a whole (background only):\n{text}\n\n"
+
+
+def already_labelled_text(labelled: str, idea: str, reflection: str) -> str:
+    """The part of the reflection the existing labels came from, when this round only added to it.
+
+    The client sends the idea and the reflection joined, so the idea is trimmed back off.
+    A reflection that was rewritten rather than extended returns "", and gets read whole.
+    """
+    text = labelled.strip()
+    if not text or not reflection:
+        return ""
+    if idea and text.startswith(idea):
+        text = text[len(idea):].strip()
+    if not text or text == reflection:
+        return ""
+    return text if reflection.startswith(text) else ""
+
+
+def idea_has_why_context(idea: str) -> bool:
+    """Skip the why-question model when the sticky note is empty or too thin."""
+    text = idea.strip()
+    if len(text) < MIN_WHY_QUESTION_CHARS:
+        return False
+    tokens = re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9']+", text)
+    return len(tokens) >= 3
+
+
+def lumped_ideas_question(proposals: list[str], idea: str) -> str:
+    """A note holding several proposals always earns the same question, in the note's language."""
+    # Clipping to 4 words can leave a dangling preposition, which reads badly inside the sentence.
+    first, second = (
+        re.sub(r"\s+(?:of|for|to|with|and|the|a|an)$", "", item.strip().strip(".,;"), flags=re.IGNORECASE)
+        for item in proposals[:2]
+    )
+    if re.search(r"[\u4e00-\u9fff]", idea):
+        return f"为什么「{first}」和「{second}」要放在同一张便签上？"
+    return f"Why do “{first}” and “{second}” belong on one note?"
+
+
+def ask_why_user_content(req: AskWhyRequest, idea: str) -> str:
+    """Note first, then the ground already covered: the rationale written and the questions spent."""
+    blocks = [f"{context_block(req.context)}sticky note:\n{idea}"]
+    answer = req.answer.strip()
+    if answer:
+        blocks.append(f"rationale the designer has written so far:\n{answer}")
+    asked = [item.strip() for item in req.asked if item.strip()][-8:]
+    if asked:
+        listing = "\n".join(f"- {item}" for item in asked)
+        blocks.append(f"questions already asked here, never ask these again:\n{listing}")
+    return "\n\n".join(blocks)
+
+
+QUESTION_FILLER = {
+    "what", "why", "how", "when", "where", "who", "which", "whose", "does", "did", "the",
+    "and", "but", "for", "with", "that", "this", "these", "those", "you", "your", "their",
+    "would", "should", "could", "might", "may", "can", "will", "are", "was", "were", "been",
+    "have", "has", "had", "not", "from", "into", "than", "then", "some", "any", "one",
+}
+
+
+def question_topic(text: str) -> set[str]:
+    """The content words a question turns on, blunted so tense and plurals do not hide a repeat."""
+    words = re.findall(r"[a-z]{3,}|[\u4e00-\u9fff]", text.lower())
+    stems = set()
+    for word in words:
+        if word in QUESTION_FILLER:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(word) > len(suffix) + 2 and word.endswith(suffix):
+                word = word[: -len(suffix)]
+                break
+        stems.add(word)
+    return stems
+
+
+def same_question(a: str, b: str) -> bool:
+    """Wording aside, is this the ground an earlier question already covered?"""
+    if re.sub(r"[^\w\u4e00-\u9fff]+", " ", a.lower()).strip() == re.sub(r"[^\w\u4e00-\u9fff]+", " ", b.lower()).strip():
+        return True
+    left, right = question_topic(a), question_topic(b)
+    if not left or not right:
+        return False
+    return len(left & right) / min(len(left), len(right)) >= 0.6
+
+
+def parse_why_reply(raw: str, idea: str = "") -> dict:
+    """The question, plus how the model read the note: one idea or several, idea or reflection, why already given."""
+    empty = {"question": "", "ideas": 0, "kind": "", "stated_why": ""}
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    question = clip_words(str(data.get("question") or "").strip(), MAX_WHY_QUESTION_WORDS)
+    try:
+        ideas = int(data.get("ideas") or 0)
+    except (TypeError, ValueError):
+        ideas = 0
+    # A statement means the model summarised instead of asking; drop it rather than show it.
+    if not question.endswith(("?", "？")):
+        question = ""
+    raw_proposals = data.get("proposals")
+    proposals = [
+        clip_words(str(item).strip(), 4)
+        for item in (raw_proposals if isinstance(raw_proposals, list) else [])
+        if str(item).strip()
+    ]
+    # The model keeps drifting into how one proposal works, so a lumped note is questioned here instead.
+    if ideas >= 2 and len(proposals) >= 2:
+        question = lumped_ideas_question(proposals, idea)
+    return {
+        "question": question,
+        "ideas": ideas,
+        "kind": str(data.get("kind") or "").strip().lower(),
+        "stated_why": str(data.get("stated_why") or "").strip(),
+    }
+
+
+@app.post("/api/ask-why")
+async def ask_why(req: AskWhyRequest):
+    """One probing question from sticky-note text only; empty when there is not enough to go on."""
+    idea = req.idea.strip()
+    if not idea_has_why_context(idea):
+        return {"question": "", "ideas": 0, "kind": "", "stated_why": "", "model": ""}
+
+    client = get_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": ASK_WHY_PROMPT},
+                {"role": "user", "content": ask_why_user_content(req, idea)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.5,
+            max_tokens=320,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise openai_http_error(exc) from exc
+
+    content = response.choices[0].message.content
+    reply = parse_why_reply(content or "", idea)
+    # The model still repeats itself now and then; an exact repeat is worse than no bubble.
+    if reply["question"] and any(same_question(reply["question"], item) for item in req.asked):
+        reply["question"] = ""
+    return {**reply, "model": model}
 
 
 @app.post("/api/detect-reflection")
@@ -999,7 +1263,8 @@ async def rationale_labels(req: RationaleRequest):
 
     known = req.known[-MAX_KNOWN_LABELS:]
     known_refs = {item.ref for item in known}
-    blocks = [f"target: {target}"]
+    blocks = [block for block in (context_block(req.context).strip(),) if block]
+    blocks.append(f"target: {target}")
     if idea:
         idea_label = "grouped ideas" if target == "group" else "sticky-note idea"
         blocks.append(f"{idea_label}:\n{idea}")
@@ -1008,6 +1273,12 @@ async def rationale_labels(req: RationaleRequest):
     if known:
         listing = "\n".join(f"{item.ref} | {item.text}" for item in known)
         user_content = f"{user_content}\n\nlabels the designer already has:\n{listing}"
+    labelled = already_labelled_text(req.labelled, idea, reflection)
+    if labelled:
+        user_content = (
+            f"{user_content}\n\nthe part of that reflection those labels already cover, "
+            f"background only:\n{labelled}"
+        )
 
     try:
         response = await client.chat.completions.create(
@@ -1029,9 +1300,11 @@ async def rationale_labels(req: RationaleRequest):
     if not content:
         raise api_error(502, "empty_labels", "The AI returned no labels. Try rephrasing and generate again.")
 
-    labels = parse_label_payload(content, known_refs)
+    labels = parse_label_payload(content, known_refs, allow_empty=bool(labelled))
+    if not labels:
+        return {"labels": [], "model": model, "reason": "nothing_new"}
     labels = await attach_embeddings(client, labels)
-    return {"labels": labels, "model": model}
+    return {"labels": labels, "model": model, "reason": ""}
 
 
 if __name__ == "__main__":
