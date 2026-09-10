@@ -5,7 +5,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
-import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, suggestGroupWhy, narrativeSharedWhy, clusterSimilarLabels } from '../api/rationale'
+import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, suggestGroupWhy, narrativeSharedWhy, clusterSimilarLabels, isSimilarLabel } from '../api/rationale'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
 import GroupIcon from './GroupIcon.vue'
@@ -24,6 +24,10 @@ const emit = defineEmits(['signed-out'])
 const PEN_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#fde68a" stroke="#2c281f" stroke-width="1.2" d="M3.2 21.2 5 17.8 18.6 4.2a1.5 1.5 0 0 1 2.1 2.1L7.1 20l-3.9 1.2z"/></svg>',
 )}") 3 21, crosshair`
+
+function setDrawingPenCursor(on) {
+  document.documentElement.classList.toggle('drawing-pen', Boolean(on))
+}
 
 /** Offset a point away from a note edge so the curve leaves the mag point cleanly. */
 function outward(side, dist) {
@@ -158,6 +162,9 @@ const suggestSourceId = ref(null)
 const suggestedLinks = ref([]) // [{ key, fromId, fromSide, toId, toSide, why, picked }]
 const suggestLoading = ref(false)
 const suggestError = ref('')
+const suggestPark = ref(null) // { sourceId, visitors: [{ id, from, to }] }
+const suggestWhyHover = ref(null)
+const suggestWhyOpen = ref(null)
 let searchTestPackCursor = 0
 let suggestAbort = null
 
@@ -191,6 +198,8 @@ const notesLayerStyle = computed(() => ({
 const MAG_OUTSET = 18
 /** Show another note's mag points when the pen is this close to its box. */
 const MAG_HOVER_PX = 20
+/** Click/press within this radius of a mag counts as grabbing it (canvas space). */
+const MAG_GRAB_PX = 26
 /** Gap under the note so the rationale box sits below the bottom mag point. */
 const RATIONALE_GAP = 28
 /** Used until a dock is measured, so the dashed frame grows on the same click as V. */
@@ -244,16 +253,20 @@ function liveNotePos(note) {
   if (!note) return { x: 0, y: 0 }
   const gather = patternGather.value
   const visitor = gather?.visitors.find((item) => item.id === note.id)
-  if (!visitor) return { x: note.x, y: note.y }
-  if (gather.origin === 'suggest' && patternDragId.value !== note.id) {
-    const memberNotes = gather.visitors
-      .map((item) => notes.value.find((entry) => entry.id === item.id))
-      .filter(Boolean)
-    const slots = traySlotsForNotes(memberNotes)
-    const index = gather.visitors.findIndex((item) => item.id === note.id)
-    if (index >= 0 && slots[index]) return { x: slots[index].x, y: slots[index].y }
+  if (visitor) {
+    if (gather.origin === 'suggest' && patternDragId.value !== note.id) {
+      const memberNotes = gather.visitors
+        .map((item) => notes.value.find((entry) => entry.id === item.id))
+        .filter(Boolean)
+      const slots = traySlotsForNotes(memberNotes)
+      const index = gather.visitors.findIndex((item) => item.id === note.id)
+      if (index >= 0 && slots[index]) return { x: slots[index].x, y: slots[index].y }
+    }
+    return { x: visitor.to.x, y: visitor.to.y }
   }
-  return { x: visitor.to.x, y: visitor.to.y }
+  const parked = suggestPark.value?.visitors.find((item) => item.id === note.id)
+  if (parked) return { x: parked.to.x, y: parked.to.y }
+  return { x: note.x, y: note.y }
 }
 
 /** Rationale panel sits under the note and matches its current width. */
@@ -265,7 +278,11 @@ function rationaleStyle(note) {
     left: `${pos.x}px`,
     top: `${pos.y + height + RATIONALE_GAP}px`,
     width: `${width}px`,
-    zIndex: inGroup ? (selectedId.value === note.id ? 21 : 18) : selectedId.value === note.id ? 19 : 1,
+    zIndex: suggestParkedIds.value.has(note.id)
+      ? selectedId.value === note.id ? 39 : 35
+      : inGroup
+        ? (selectedId.value === note.id ? 21 : 18)
+        : selectedId.value === note.id ? 19 : 1,
   }
 }
 /** Mag-point position in canvas space (uses live size so wrapped text is included). */
@@ -331,6 +348,13 @@ const renderedSuggestions = computed(() =>
 
 const suggestPickedCount = computed(() => suggestedLinks.value.filter((link) => link.picked).length)
 const suggestTargetIds = computed(() => new Set(suggestedLinks.value.map((link) => link.toId)))
+const suggestParkedIds = computed(() => new Set((suggestPark.value?.visitors || []).map((item) => item.id)))
+const suggestPulledIds = computed(() => {
+  const park = suggestPark.value
+  if (!park) return new Set()
+  return new Set(park.visitors.filter((item) => item.id !== park.sourceId).map((item) => item.id))
+})
+const suggestDimActive = computed(() => suggestPulledIds.value.size > 0)
 
 const searchHitIds = computed(() => new Set(searchHits.value.map((item) => item.id)))
 const searchPickedIds = computed(() => new Set(searchPicked.value))
@@ -418,6 +442,32 @@ function clearSuggestions() {
   suggestedLinks.value = []
   suggestLoading.value = false
   suggestError.value = ''
+  suggestPark.value = null
+  suggestWhyHover.value = null
+  suggestWhyOpen.value = null
+}
+
+/** Drop a single AI suggestion after that pair is linked by hand (or already linked). */
+function pruneSuggestedLinkBetween(a, b) {
+  const before = suggestedLinks.value.length
+  suggestedLinks.value = suggestedLinks.value.filter(
+    (link) =>
+      !((link.fromId === a && link.toId === b) || (link.fromId === b && link.toId === a)),
+  )
+  if (suggestedLinks.value.length === before) return
+  // If this target was pulled in for that suggestion, send it home unless still suggested.
+  const stillSuggested = new Set(suggestedLinks.value.map((link) => link.toId))
+  for (const id of [a, b]) {
+    if (id !== suggestSourceId.value && !stillSuggested.has(id)) releaseSuggestedTarget(id)
+  }
+  if (!suggestedLinks.value.length && !suggestLoading.value && !suggestError.value) {
+    // All AI dashes resolved; leave the board quiet but keep selection.
+    suggestSourceId.value = null
+    suggestPark.value = null
+    suggestWhyHover.value = null
+    suggestWhyOpen.value = null
+    if (activeTool.value === 'connect') activeTool.value = null
+  }
 }
 
 function noteSuggestPayload(note) {
@@ -441,14 +491,153 @@ function alreadyLinked(a, b) {
 
 /** Pick mag-point sides so a suggested curve leaves toward the other note. */
 function pickConnectSides(fromNote, toNote) {
+  const fromPos = liveNotePos(fromNote)
+  const toPos = liveNotePos(toNote)
   const from = noteSize(fromNote)
   const to = noteSize(toNote)
-  const dx = toNote.x + to.width / 2 - (fromNote.x + from.width / 2)
-  const dy = toNote.y + to.height / 2 - (fromNote.y + from.height / 2)
+  const dx = toPos.x + to.width / 2 - (fromPos.x + from.width / 2)
+  const dy = toPos.y + to.height / 2 - (fromPos.y + from.height / 2)
   if (Math.abs(dx) >= Math.abs(dy)) {
     return dx >= 0 ? ['right', 'left'] : ['left', 'right']
   }
   return dy >= 0 ? ['bottom', 'top'] : ['top', 'bottom']
+}
+
+const SUGGEST_PULL_GAP = 64
+const PULL_CLEAR_GAP = 24
+
+function liveParkPos(noteId) {
+  const parked = suggestPark.value?.visitors.find((item) => item.id === noteId)
+  if (parked) return { x: parked.to.x, y: parked.to.y }
+  const note = notes.value.find((item) => item.id === noteId)
+  return note ? { x: note.x, y: note.y } : { x: 0, y: 0 }
+}
+
+/** Boxes of every other sticky (using parked pull positions when set). */
+function occupiedBoxesForPull(ignoreId) {
+  const boxes = []
+  for (const note of notes.value) {
+    if (note.id === ignoreId || isAbandoned(note)) continue
+    boxes.push(noteVisualBox(note, liveParkPos(note.id)))
+  }
+  return boxes
+}
+
+/** Keep the preferred pull spot when free; otherwise spiral until nothing is covered. */
+function clearPullSlot(note, preferred, ignoreId) {
+  const gap = PULL_CLEAR_GAP
+  const occupied = occupiedBoxesForPull(ignoreId)
+  const tryPos = (x, y) => {
+    const box = noteVisualBox(note, { x, y })
+    if (occupied.some((other) => boxesOverlap(box, other, gap))) return null
+    return { x, y }
+  }
+  const first = tryPos(preferred.x, preferred.y)
+  if (first) return first
+
+  for (let ring = 1; ring <= 28; ring++) {
+    const radius = ring * 28
+    const steps = Math.max(8, ring * 6)
+    for (let i = 0; i < steps; i++) {
+      const angle = (i / steps) * Math.PI * 2
+      const hit = tryPos(
+        preferred.x + Math.cos(angle) * radius,
+        preferred.y + Math.sin(angle) * radius,
+      )
+      if (hit) return hit
+    }
+  }
+
+  const right = occupied.reduce((max, box) => Math.max(max, box.x + box.w), preferred.x)
+  return { x: right + gap + 8, y: preferred.y }
+}
+
+function pulledSlotForTarget(source, target, from) {
+  const srcSize = noteSize(source)
+  const cx = source.x + srcSize.width / 2
+  const cy = source.y + srcSize.height / 2
+  const size = noteSize(target)
+  const origin = from || { x: target.x, y: target.y }
+  const tx = origin.x + size.width / 2
+  const ty = origin.y + size.height / 2
+  const dist = Math.hypot(tx - cx, ty - cy) || 1
+  const srcReach = Math.max(srcSize.width + tabClearX(source), srcSize.height + tabClearY(source)) / 2
+  const reach = Math.max(size.width + tabClearX(target), size.height + tabClearY(target)) / 2
+  const desired = srcReach + reach + SUGGEST_PULL_GAP
+  const preferred = dist <= desired
+    ? { x: origin.x, y: origin.y }
+    : {
+        x: cx + Math.cos(Math.atan2(ty - cy, tx - cx)) * desired - size.width / 2,
+        y: cy + Math.sin(Math.atan2(ty - cy, tx - cx)) * desired - size.height / 2,
+      }
+  return clearPullSlot(target, preferred, target.id)
+}
+
+function ensureSuggestPark(source) {
+  if (suggestPark.value?.sourceId === source.id) return
+  suggestPark.value = {
+    sourceId: source.id,
+    visitors: [{ id: source.id, from: { x: source.x, y: source.y }, to: { x: source.x, y: source.y } }],
+  }
+}
+
+function pullSuggestedTarget(targetId) {
+  const source = notes.value.find((note) => note.id === suggestSourceId.value)
+  const target = notes.value.find((note) => note.id === targetId)
+  if (!source || !target) return
+  ensureSuggestPark(source)
+  const existing = suggestPark.value.visitors.find((item) => item.id === targetId)
+  const from = existing?.from || { x: target.x, y: target.y }
+  const to = pulledSlotForTarget(source, target, from)
+  if (existing) existing.to = to
+  else suggestPark.value.visitors.push({ id: targetId, from, to })
+  refreshSuggestedSides(source)
+  panToSuggestPark()
+}
+
+function releaseSuggestedTarget(targetId) {
+  const park = suggestPark.value
+  if (!park) return
+  park.visitors = park.visitors.filter((item) => item.id !== targetId)
+  if (park.visitors.every((item) => item.id === park.sourceId)) suggestPark.value = null
+  const source = notes.value.find((note) => note.id === suggestSourceId.value)
+  if (source) refreshSuggestedSides(source)
+}
+
+function panToSuggestPark() {
+  const park = suggestPark.value
+  if (!park?.visitors.length) return
+  const slots = park.visitors.map((visitor) => {
+    const note = notes.value.find((item) => item.id === visitor.id)
+    return note
+      ? slotForNote(note, visitor.to.x, visitor.to.y)
+      : { x: visitor.to.x, y: visitor.to.y, w: 168, h: 168, vx: visitor.to.x, vy: visitor.to.y, vw: 168, vh: 168 }
+  })
+  panToSlots(slots)
+}
+
+function refreshSuggestedSides(source) {
+  suggestedLinks.value = suggestedLinks.value.map((link) => {
+    const target = notes.value.find((note) => note.id === link.toId)
+    if (!target) return link
+    const [fromSide, toSide] = pickConnectSides(source, target)
+    return { ...link, fromSide, toSide }
+  })
+}
+
+function commitSuggestPark(keepIds) {
+  const park = suggestPark.value
+  if (!park) return
+  const keep = new Set(keepIds)
+  keep.add(park.sourceId)
+  for (const visitor of park.visitors) {
+    if (!keep.has(visitor.id)) continue
+    const note = notes.value.find((item) => item.id === visitor.id)
+    if (!note) continue
+    note.x = visitor.to.x
+    note.y = visitor.to.y
+  }
+  suggestPark.value = null
 }
 
 /** One toolbar action: mag-point drawing plus AI dashed suggestions from this idea. */
@@ -537,10 +726,31 @@ async function suggestRelations(id) {
   }
 }
 
-function toggleSuggestedLink(key) {
-  suggestedLinks.value = suggestedLinks.value.map((link) =>
-    link.key === key ? { ...link, picked: !link.picked } : link,
+/** Click the blue line or the dashed frame: select the link AND pull the idea closer. */
+function activateSuggestedLink(key) {
+  // Never steal a hand-drawn yellow link in progress.
+  if (draft.value) return
+  const link = suggestedLinks.value.find((item) => item.key === key)
+  if (!link) return
+  const picked = !link.picked
+  suggestedLinks.value = suggestedLinks.value.map((item) =>
+    item.key === key ? { ...item, picked } : item,
   )
+  if (picked) pullSuggestedTarget(link.toId)
+  else releaseSuggestedTarget(link.toId)
+}
+
+/** Click the checkbox only: toggle the check mark, no position change. */
+function toggleSuggestedLink(key) {
+  suggestedLinks.value = suggestedLinks.value.map((item) =>
+    item.key === key ? { ...item, picked: !item.picked } : item,
+  )
+}
+
+function onSuggestFrameClick(key, event) {
+  if (event.target.closest('.suggest-check')) return // handled by toggleSuggestedLink
+  activateSuggestedLink(key)
+  suggestWhyOpen.value = suggestWhyOpen.value === key ? null : key
 }
 
 function keepSuggestedLinks() {
@@ -567,6 +777,7 @@ function keepSuggestedLinks() {
       noteId: source.id,
       kept: additions.map((item) => item.toId),
     }).catch(() => {})
+    commitSuggestPark(additions.map((item) => item.toId))
   }
   clearSuggestions()
 }
@@ -889,9 +1100,33 @@ function nearestConnectNote(px, py, fromId) {
 }
 
 function noteShowsMag(note) {
-  if (!connectActive.value || isNoteFrozen(note) || isAbandoned(note)) return false
+  if (isNoteFrozen(note) || isAbandoned(note)) return false
+  // Selected sticky always shows mag points (no need to arm the suggest icon first).
   if (selectedId.value === note.id) return true
+  // While drawing a yellow link, only reveal mag points on the sticky the pen is near.
   return Boolean(draft.value) && magHoverId.value === note.id
+}
+
+function noteSuggestArmed(note) {
+  return connectActive.value && selectedId.value === note.id
+}
+
+/** Nearest visible mag point under/near the pointer — used when the click lands in the gap outside the note. */
+function nearestMagGrab(px, py) {
+  let best = null
+  let bestD = Infinity
+  for (const note of notes.value) {
+    if (!noteShowsMag(note)) continue
+    for (const side of ['top', 'right', 'bottom', 'left']) {
+      const point = magPos(note.id, side)
+      const d = Math.hypot(point.x - px, point.y - py)
+      if (d < bestD) {
+        bestD = d
+        best = { noteId: note.id, side }
+      }
+    }
+  }
+  return bestD <= MAG_GRAB_PX ? best : null
 }
 
 /** Drop window listeners used while rubber-banding a connector. */
@@ -901,16 +1136,20 @@ function clearConnectDrag() {
   connectMove = null
   connectUp = null
   magHoverId.value = null
+  setDrawingPenCursor(false)
 }
 
 /** Mag-point mousedown: start a draft path. */
 function onConnectStart(noteId, side) {
-  if (!connectActive.value) return
   const note = notes.value.find((n) => n.id === noteId)
   if (isNoteFrozen(note)) return
+  // Allow drawing from a selected sticky, or while the suggest/connect tool is armed.
+  if (!connectActive.value && selectedId.value !== noteId && draft.value?.fromId !== noteId) return
   clearConnectDrag()
   const from = magPos(noteId, side)
   draft.value = { fromId: noteId, fromSide: side, x: from.x, y: from.y }
+  // Hand → pen immediately on grab (override mag grab cursor right away).
+  setDrawingPenCursor(true)
 
   connectMove = (ev) => {
     if (!draft.value) return
@@ -929,38 +1168,58 @@ function onConnectStart(noteId, side) {
 /** Mag-point mouseup: commit a path. Same sticky (any mag point) is ignored. */
 function onConnectEnd(noteId, side) {
   if (!draft.value) return
-  const fromNote = notes.value.find((n) => n.id === draft.value.fromId)
+  const fromId = draft.value.fromId
+  const fromSide = draft.value.fromSide
+  const fromNote = notes.value.find((n) => n.id === fromId)
   const toNote = notes.value.find((n) => n.id === noteId)
-  const sameNote = draft.value.fromId === noteId
+  const sameNote = fromId === noteId
   if (!sameNote && !isNoteFrozen(fromNote) && !isNoteFrozen(toNote)) {
     connections.value.push({
       id: nextConnId++,
-      fromId: draft.value.fromId,
-      fromSide: draft.value.fromSide,
+      fromId,
+      fromSide,
       toId: noteId,
       toSide: side,
       ...emptyRelation(),
     })
+    // Keep other AI dashes; only drop the pair that is now hand-linked.
+    pruneSuggestedLinkBetween(fromId, noteId)
   }
   clearConnectDrag()
   draft.value = null
 }
 
-/** Idle canvas: no selection, no connector tool, no in-progress path. Sticky place-tool stays on. */
+/**
+ * Idle canvas: drop selection / draft.
+ * AI suggested blues stay until dismiss, keep, suggest-icon toggle, or Esc (after draft).
+ */
 function resetToIdle() {
   clearArmed.value = false
   clearConnectDrag()
   draft.value = null
-  if (activeTool.value === 'connect') activeTool.value = null
-  if (activeTool.value === 'group') {
-    clearGroupStroke()
-    groupHint.value = ''
-    activeTool.value = null
-  }
   selectedId.value = null
   selectedConnId.value = null
   if (patternGather.value) endPatternGather(false)
-  clearSuggestions()
+  const suggestionsOpen =
+    suggestedLinks.value.length > 0 || suggestLoading.value || suggestError.value || suggestSourceId.value != null
+  if (suggestionsOpen) {
+    // Keep blues + suggest session; only leave other tools.
+    if (activeTool.value === 'group') {
+      clearGroupStroke()
+      groupHint.value = ''
+      activeTool.value = 'connect'
+    } else if (activeTool.value && activeTool.value !== 'connect') {
+      activeTool.value = 'connect'
+    }
+  } else {
+    if (activeTool.value === 'connect') activeTool.value = null
+    if (activeTool.value === 'group') {
+      clearGroupStroke()
+      groupHint.value = ''
+      activeTool.value = null
+    }
+    clearSuggestions()
+  }
   const el = document.activeElement
   if (el instanceof HTMLElement && (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
     el.blur()
@@ -970,7 +1229,16 @@ function resetToIdle() {
 /** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky / group tools still handle the click. */
 function onCanvasMouseDown(e) {
   if (stickyActive.value || groupActive.value) return
-  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock') || e.target.closest('.pattern-frame-caption')) return
+  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock') || e.target.closest('.pattern-frame-caption') || e.target.closest('.suggest-wrap')) return
+  // Mag points sit outside the note box. A near-miss used to hit the canvas, deselect,
+  // and make all four mags vanish — treat that as grabbing the mag instead.
+  const at = clientToCanvas(e)
+  const grab = nearestMagGrab(at.x, at.y)
+  if (grab) {
+    e.preventDefault()
+    onConnectStart(grab.noteId, grab.side)
+    return
+  }
   resetToIdle()
 
   const drag = {
@@ -1036,6 +1304,11 @@ function moveNote(id, dx, dy) {
     visitor.to = { x: visitor.to.x + dx, y: visitor.to.y + dy }
     return
   }
+  const parked = suggestPark.value?.visitors.find((item) => item.id === id)
+  if (parked) {
+    parked.to = { x: parked.to.x + dx, y: parked.to.y + dy }
+    return
+  }
   const note = notes.value.find((n) => n.id === id)
   if (!note || isNoteFrozen(note)) return
   if (patternGather.value && (!patternAdmitFrom || patternAdmitFrom.id !== id)) {
@@ -1055,6 +1328,10 @@ function onNoteMoveEnd(id) {
   }
   patternDragId.value = null
   patternAdmitFrom = null
+  if (suggestPark.value && suggestSourceId.value != null) {
+    const source = notes.value.find((note) => note.id === suggestSourceId.value)
+    if (source) refreshSuggestedSides(source)
+  }
 }
 
 /** Persist contenteditable text. */
@@ -1337,6 +1614,8 @@ const TAB_BADGE_PAD = 16
 const TAB_PLUS_W = 28
 const TAB_LINE_H = 31
 const CLUSTER_GAP = 28
+const RELATED_WHY_H = 42
+const RELATED_GAP_X = 56
 
 function noteTabCount(note) {
   const labels = Array.isArray(note.pinnedLabels) ? note.pinnedLabels : []
@@ -1497,6 +1776,48 @@ function clusterSlotsAround(memberNotes, sourceId) {
   const dx = source.x - compact[idx].x
   const dy = source.y - compact[idx].y
   return shiftSlotGrid(compact, dx, dy)
+}
+
+/** Keep the clicked idea still; stack related ideas to its right with room for a why caption. */
+function clusterSlotsBeside(memberNotes, sourceId) {
+  const source = memberNotes.find((note) => note.id === sourceId) || memberNotes[0]
+  const byId = new Map()
+  byId.set(source.id, slotForNote(source, source.x, source.y))
+  const srcVis = noteVisualBox(source)
+  const startX = srcVis.x + srcVis.w + RELATED_GAP_X
+  let y = source.y
+  for (const note of memberNotes) {
+    if (note.id === source.id) continue
+    const slot = slotForNote(note, startX, y)
+    slot.vy -= RELATED_WHY_H
+    slot.vh += RELATED_WHY_H
+    byId.set(note.id, slot)
+    y = slot.y + slot.h + noteRationaleExtent(note) + CLUSTER_GAP + RELATED_WHY_H
+  }
+  return memberNotes.map((note) => byId.get(note.id) || slotForNote(note, note.x, note.y))
+}
+
+function relatedWhyText(note, sourceNote, focusWhy) {
+  const focus = String(focusWhy || '').trim()
+  const sourceKept = keptRationaleLabels(sourceNote)
+  const noteKept = keptRationaleLabels(note)
+  const shared = []
+  const seen = new Set()
+  for (const label of noteKept) {
+    const text = String(label?.text || '').trim()
+    if (!text) continue
+    const hit = sourceKept.some((other) => sameRationale(label, other) || isSimilarLabel(text, String(other?.text || '').trim()))
+    if (!hit) continue
+    const key = label.rid ? `rid:${label.rid}` : `t:${text.toLowerCase()}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    shared.push(text)
+  }
+  const main = shared.find((text) => text === focus || isSimilarLabel(text, focus)) || focus || shared[0]
+  const extras = shared.filter((text) => text !== main && !(focus && isSimilarLabel(text, focus)))
+  if (!main) return 'shares a related rationale'
+  if (extras.length) return `also uses “${main}” · also “${extras[0]}”`
+  return `also uses “${main}”`
 }
 
 function shiftSlotGrid(slots, dx, dy) {
@@ -1813,13 +2134,14 @@ const patternKeepCopy = computed(() => {
 const patternGatherHint = computed(() => {
   const origin = patternGather.value?.origin
   if (origin === 'lasso') return 'your group · write why they belong together · enter suggests labels · keep group · esc cancels'
-  if (origin === 'label') return 'ideas that share this rationale · keep nearby or put back · esc cancels'
+  if (origin === 'label') return 'related ideas moved beside this one · each caption says why · keep nearby or put back · esc cancels'
   if (origin === 'suggest') return 'groups for this idea · ← → see others · keep group or put back · or draw your own'
   return 'dashed frame = suggested group · the line on the frame is why they sit together · drag an idea out or drop one in · keep group · esc cancels'
 })
 
 const patternFrameStyle = computed(() => {
-  if (patternGather.value?.origin === 'suggest') return null
+  const origin = patternGather.value?.origin
+  if (origin === 'suggest' || origin === 'label') return null
   const box = patternMembersBox(patternDragId.value)
   if (!box) return null
   const pad = 20
@@ -1830,6 +2152,24 @@ const patternFrameStyle = computed(() => {
     height: `${box.maxY - box.minY + pad * 2}px`,
   }
 })
+
+const labelGatherCaptions = computed(() => {
+  const gather = patternGather.value
+  if (gather?.origin !== 'label') return []
+  return gather.visitors
+})
+
+function relatedWhyStyle(visitor) {
+  const note = notes.value.find((item) => item.id === visitor.id)
+  if (!note) return { display: 'none' }
+  const pos = liveNotePos(note)
+  const extraY = tabClearY(note)
+  return {
+    left: `${pos.x}px`,
+    top: `${pos.y - extraY - 6}px`,
+    width: `${Math.max(noteSize(note).width, 140)}px`,
+  }
+}
 
 function sharedPatternLabelTexts(gather) {
   if (!gather?.visitors.length || gather.origin === 'lasso') return []
@@ -2114,9 +2454,10 @@ function beginGather(memberNotes, { sourceId = null, origin = 'pattern', focusWh
   if (sorted.length < 2) return false
   endPatternGather(false)
   const sid = sourceId ?? sorted[0].id
-  const slots = origin === 'label' ? clusterSlotsAround(sorted, sid) : clusterSlots(sorted)
+  const slots = origin === 'label' ? clusterSlotsBeside(sorted, sid) : clusterSlots(sorted)
   const memberKey = memberSetKey(sorted.map((note) => note.id))
   const saved = origin === 'lasso' ? savedLassoGroup(memberKey) : null
+  const sourceNote = sorted.find((note) => note.id === sid) || sorted[0]
   const labelWhy = String(focusWhy || '').trim() || (origin === 'label' ? sharedLabelTextsForNoteIds(sorted.map((note) => note.id))[0] || '' : '')
   patternGather.value = {
     sourceId: sid,
@@ -2133,6 +2474,7 @@ function beginGather(memberNotes, { sourceId = null, origin = 'pattern', focusWh
       from: { x: note.x, y: note.y },
       to: { x: slots[i].x, y: slots[i].y },
       picked: false,
+      why: origin === 'label' && note.id !== sid ? relatedWhyText(note, sourceNote, labelWhy) : '',
     })),
   }
   selectedId.value = sid
@@ -2600,13 +2942,15 @@ function onKeydown(e) {
       endPatternGather(false)
       return
     }
-    if (suggestedLinks.value.length || suggestLoading.value || suggestError.value || connectActive.value) {
-      clearSuggestions()
-      activeTool.value = null
+    // First Esc cancels an in-progress yellow dash only; blues stay.
+    if (draft.value) {
+      clearConnectDrag()
       draft.value = null
       return
     }
-    if (draft.value) {
+    if (suggestedLinks.value.length || suggestLoading.value || suggestError.value || connectActive.value) {
+      clearSuggestions()
+      activeTool.value = null
       draft.value = null
       return
     }
@@ -2857,8 +3201,8 @@ onUnmounted(() => {
     <div
       ref="canvasRef"
       class="canvas"
-      :class="{ placing: stickyActive, connecting: connectActive, grouping: groupActive, 'group-focus': patternDimActive }"
-      :style="connectActive || groupActive ? { cursor: PEN_CURSOR } : undefined"
+      :class="{ placing: stickyActive, connecting: connectActive || !!draft, drawing: !!draft, grouping: groupActive, 'group-focus': patternDimActive }"
+      :style="groupActive || connectActive || draft ? { cursor: PEN_CURSOR } : undefined"
       @mousedown="onCanvasMouseDown"
       @click="onCanvasClick"
     >
@@ -2880,7 +3224,12 @@ onUnmounted(() => {
       </svg>
 
       <div class="notes-layer" :style="notesLayerStyle">
-        <svg class="connectors" overflow="visible" aria-hidden="true">
+        <svg
+          class="connectors"
+          :class="{ 'suggest-front': suggestDimActive, drawing: !!draft }"
+          overflow="visible"
+          aria-hidden="true"
+        >
           <g v-for="line in renderedConnections" v-show="connectionOnGroupStage(line)" :key="line.id">
             <path
               class="connector-hit"
@@ -2920,7 +3269,7 @@ onUnmounted(() => {
               stroke="transparent"
               stroke-width="18"
               stroke-linecap="round"
-              @mousedown.stop.prevent="toggleSuggestedLink(line.key)"
+              @mousedown.stop.prevent="activateSuggestedLink(line.key); suggestWhyOpen = suggestWhyOpen === line.key ? null : line.key"
             />
             <path
               class="suggest-line"
@@ -2939,6 +3288,16 @@ onUnmounted(() => {
             <span class="pattern-frame-kicker">{{ patternFrameKicker }}</span>
             <span v-if="patternGroupWhy && !patternJoiningId" class="pattern-frame-why">{{ patternGroupWhy }}</span>
           </div>
+        </div>
+        <div
+          v-for="visitor in labelGatherCaptions"
+          :key="`why-${visitor.id}`"
+          class="related-why"
+          :class="{ source: visitor.id === patternGather.sourceId }"
+          :style="relatedWhyStyle(visitor)"
+        >
+          <span class="related-why-kicker">{{ visitor.id === patternGather.sourceId ? 'this idea' : 'related because' }}</span>
+          <span v-if="visitor.why" class="related-why-text">{{ visitor.why }}</span>
         </div>
         <svg v-if="groupStrokePath" class="group-lasso" overflow="visible" aria-hidden="true">
           <path
@@ -2988,31 +3347,40 @@ onUnmounted(() => {
           v-show="!patternDimActive"
           :key="`sug-chip-${line.key}`"
           class="suggest-wrap"
+          :class="{ open: suggestWhyOpen === line.key || suggestWhyHover === line.key, inert: !!draft }"
           :style="{
             left: `${line.mid.x}px`,
             top: `${line.mid.y}px`,
-            zIndex: 24,
+            zIndex: draft ? 0 : (suggestWhyOpen === line.key || suggestWhyHover === line.key ? 42 : 40),
+            pointerEvents: draft ? 'none' : 'auto',
           }"
           @pointerdown.stop
           @mousedown.stop
         >
-          <button
-            type="button"
+          <div
             class="suggest-pick"
             :class="{ on: line.picked }"
-            :title="line.picked ? 'Unselect this suggested link' : 'Select this suggested link'"
-            @click.stop="toggleSuggestedLink(line.key)"
+            @mouseenter="suggestWhyHover = line.key"
+            @mouseleave="suggestWhyHover = null"
+            @click="onSuggestFrameClick(line.key, $event)"
           >
-            <span class="suggest-check" :class="{ on: line.picked }" />
+            <button
+              type="button"
+              class="suggest-check"
+              :class="{ on: line.picked }"
+              :title="line.picked ? 'Unselect this suggested link' : 'Select this suggested link'"
+              @click.stop="toggleSuggestedLink(line.key)"
+            />
             <span class="suggest-why">{{ line.why }}</span>
-          </button>
+          </div>
         </div>
         <template v-for="note in notes" :key="note.id">
           <StickyNoteCard
             :note="note"
             :scale="scale"
             :selected="selectedId === note.id"
-            :connect-mode="noteShowsMag(note)"
+            :connect-mode="noteSuggestArmed(note)"
+            :show-mag="noteShowsMag(note)"
             :mag-outset="MAG_OUTSET"
             :drafting="!!draft"
             :draft-from-id="draft?.fromId ?? null"
@@ -3022,16 +3390,17 @@ onUnmounted(() => {
             :owner-directory="ownerDirectory"
             :display-x="liveNotePos(note).x"
             :display-y="liveNotePos(note).y"
-            :gathering="patternAnimatingIds.has(note.id) || (patternHitIds.has(note.id) && patternGather?.origin !== 'suggest')"
+            :gathering="patternAnimatingIds.has(note.id) || (patternHitIds.has(note.id) && patternGather?.origin !== 'suggest') || suggestParkedIds.has(note.id)"
             :gather-pick="Boolean(patternGather) && patternGather.origin !== 'label' && patternGather.origin !== 'suggest' && patternHitIds.has(note.id)"
             :leaving-group="patternLeavingId === note.id"
             :joining-group="patternJoiningId === note.id"
             :search-hit="searchHitIds.has(note.id) || (patternHitIds.has(note.id) && patternGather?.origin !== 'suggest') || patternJoiningId === note.id"
             :search-picked="searchPickedIds.has(note.id) || patternPickedIds.has(note.id)"
-            :search-dim="searchDimActive || (patternGather?.origin === 'suggest' && !patternHitIds.has(note.id) && !patternAnimatingIds.has(note.id))"
+            :search-dim="searchDimActive || (suggestDimActive && !suggestParkedIds.has(note.id) && selectedId !== note.id && magHoverId !== note.id) || (patternGather?.origin === 'suggest' && !patternHitIds.has(note.id) && !patternAnimatingIds.has(note.id))"
             :preview-scale="patternGather?.origin === 'suggest' && patternHitIds.has(note.id) ? suggestNoteScale : 1"
             :stage-hidden="patternDimActive && !noteOnGroupStage(note.id)"
             :suggesting="suggestLoading && suggestSourceId === note.id"
+            :suggest-source="suggestSourceId === note.id && suggestPulledIds.size > 0"
             :suggest-hit="suggestTargetIds.has(note.id)"
             :suggest-picked="suggestedLinks.some((link) => link.toId === note.id && link.picked)"
             @move="moveNote"
@@ -3381,7 +3750,7 @@ onUnmounted(() => {
         <div v-else-if="groupActive" class="hint">draw around ideas to group them · esc to cancel</div>
         <div v-else-if="suggestError" class="hint">{{ suggestError }} · or drag a mag point to draw your own</div>
         <div v-else-if="suggestLoading" class="hint">looking for related ideas… · you can still drag a mag point</div>
-        <div v-else-if="suggestedLinks.length" class="hint">blue dashed = AI · yellow dashed = you drawing · click a blue line to keep it</div>
+        <div v-else-if="suggestedLinks.length" class="hint">blue dashed = AI · click blue to pull closer · drag a mag point to draw your own (blues stay) · dismiss / esc to clear</div>
         <div v-else-if="connectActive" class="hint">drag a mag point on this note · other notes show mag points when the pen is close</div>
         <div v-else-if="patternGather" class="hint">{{ patternGatherHint }}</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
@@ -3509,7 +3878,7 @@ onUnmounted(() => {
   height: 100%;
   position: relative;
   overflow: hidden;
-  cursor: grab;
+  cursor: default;
   touch-action: none;
   overscroll-behavior: none;
 }
@@ -3517,6 +3886,30 @@ onUnmounted(() => {
 .canvas.placing,
 .canvas.grouping {
   cursor: crosshair;
+}
+
+.canvas.connecting .note {
+  cursor: default;
+}
+
+.canvas.connecting .mag-point,
+.canvas.connecting .mag-point:hover {
+  cursor: grab;
+}
+
+.canvas.connecting .mag-point:active {
+  cursor: grabbing;
+}
+
+/* Once a mag is grabbed, switch to the pen immediately for the whole drag. */
+.canvas.drawing,
+.canvas.drawing .note,
+.canvas.drawing .note *,
+.canvas.drawing .mag-point,
+.canvas.drawing .mag-point:hover,
+.canvas.drawing .mag-point:active,
+.canvas.drawing .mag-point.blocked {
+  cursor: inherit !important;
 }
 
 .group-lasso-layer {
@@ -3632,6 +4025,14 @@ onUnmounted(() => {
   height: 1px;
 }
 
+.connectors.suggest-front {
+  z-index: 34;
+}
+
+.connectors.drawing .suggest-hit {
+  pointer-events: none;
+}
+
 .connector-hit {
   pointer-events: stroke;
   cursor: pointer;
@@ -3658,33 +4059,40 @@ onUnmounted(() => {
 .suggest-wrap {
   position: absolute;
   width: max-content;
-  max-width: 260px;
-  transform: translate(-50%, -50%);
+  max-width: 148px;
+  transform: translate(-50%, calc(-100% - 8px));
   pointer-events: auto;
   z-index: 24;
+}
+
+.suggest-wrap.open {
+  max-width: 240px;
 }
 
 .suggest-pick {
   display: inline-flex;
   align-items: flex-start;
-  gap: 6px;
+  gap: 5px;
   box-sizing: border-box;
   width: max-content;
-  max-width: 260px;
+  max-width: 148px;
   margin: 0;
-  padding: 6px 9px;
+  padding: 3px 7px;
   border: 1px dashed #93c5fd;
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--chrome);
   color: #1e3a5f;
-  box-shadow: 0 8px 20px rgba(44, 40, 31, 0.12);
-  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(44, 40, 31, 0.1);
+}
+
+.suggest-wrap.open .suggest-pick {
+  max-width: 240px;
 }
 
 .suggest-pick.on {
   border-style: solid;
   border-color: #60a5fa;
-  background: rgba(147, 197, 253, 0.28);
+  background: #fff;
 }
 
 .suggest-check {
@@ -3692,9 +4100,11 @@ onUnmounted(() => {
   width: 13px;
   height: 13px;
   margin-top: 1px;
+  padding: 0;
   border: 1.5px solid var(--line);
-  border-radius: 4px;
+  border-radius: 3px;
   background: var(--paper);
+  cursor: pointer;
 }
 
 .suggest-check.on {
@@ -3704,17 +4114,30 @@ onUnmounted(() => {
 }
 
 .suggest-why {
-  flex: 0 1 auto;
-  min-width: 9em;
-  max-width: 220px;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 124px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
   text-align: left;
-  white-space: normal;
-  overflow-wrap: break-word;
-  word-break: normal;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: 10px;
+  line-height: 1.3;
   color: var(--ink-muted);
+  cursor: default;
+}
+
+.suggest-wrap.open .suggest-why {
+  max-width: 214px;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+  overflow-wrap: break-word;
 }
 
 .suggest-pick.on .suggest-why {
@@ -3790,6 +4213,42 @@ onUnmounted(() => {
 
 .pattern-frame.joining .pattern-frame-kicker {
   color: #92400e;
+}
+
+.related-why {
+  position: absolute;
+  z-index: 22;
+  transform: translateY(-100%);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  pointer-events: none;
+  transition: left 0.38s ease, top 0.38s ease;
+}
+
+.related-why-kicker {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: #2563eb;
+}
+
+.related-why.source .related-why-kicker {
+  color: var(--ink-muted);
+}
+
+.related-why-text {
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 4px 0 0;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #1d4ed8;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 .notes-layer > :deep(.note),
@@ -4156,6 +4615,14 @@ onUnmounted(() => {
   color: var(--ink-faint);
   margin: 0;
   letter-spacing: 0.04em;
+}
+</style>
+
+<style>
+/* Force pen immediately after grabbing a mag (overrides grab on the mag itself). */
+html.drawing-pen,
+html.drawing-pen * {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23fde68a' stroke='%232c281f' stroke-width='1.2' d='M3.2 21.2 5 17.8 18.6 4.2a1.5 1.5 0 0 1 2.1 2.1L7.1 20l-3.9 1.2z'/%3E%3C/svg%3E") 3 21, crosshair !important;
 }
 </style>
 

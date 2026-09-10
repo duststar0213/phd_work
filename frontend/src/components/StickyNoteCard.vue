@@ -36,7 +36,8 @@ const props = defineProps({
   note: { type: Object, required: true },
   scale: { type: Number, default: 1 },
   selected: { type: Boolean, default: false },
-  connectMode: { type: Boolean, default: false },
+  connectMode: { type: Boolean, default: false }, // suggest/link tool armed (icon + hints)
+  showMag: { type: Boolean, default: false }, // mag points visible (select, or near yellow dash)
   magOutset: { type: Number, default: 18 }, // px from note edge to mag-point center
   drafting: { type: Boolean, default: false }, // true while dragging a connector from a mag point
   draftFromId: { type: [Number, String], default: null }, // origin note; same-note mag points cannot drop
@@ -57,6 +58,7 @@ const props = defineProps({
   suggesting: { type: Boolean, default: false },
   suggestHit: { type: Boolean, default: false },
   suggestPicked: { type: Boolean, default: false },
+  suggestSource: { type: Boolean, default: false },
   previewScale: { type: Number, default: 1 },
 })
 
@@ -71,7 +73,11 @@ function labelPattern(label) {
 
 const emit = defineEmits(['move', 'move-end', 'textChange', 'select', 'colorChange', 'resize', 'metrics', 'connectStart', 'connectEnd', 'request-relation', 'requestDelete', 'toggleRationale', 'openRationale', 'pin-change', 'labels-change', 'revive', 'inspect-pattern', 'toggle-gather'])
 
+/** Circle-number gather is parked: hide the badge and do not open related ideas. */
+const SHOW_PATTERN_COUNT = false
+
 function patternAcross(label) {
+  if (!SHOW_PATTERN_COUNT) return 0
   const owners = Number(labelPattern(label)?.owners) || 0
   if (owners >= 2) return owners
   const n = recurrence(label)
@@ -886,6 +892,8 @@ function onMagMouseUp(e, side) {
       'stage-hidden': stageHidden,
       'suggest-hit': suggestHit && !suggestPicked && !frozen,
       'suggest-picked': suggestPicked && !frozen,
+      'suggest-source': suggestSource && !frozen,
+      'connect-ready': showMag && !frozen,
       gathering: gathering && !dragging && !resizing,
       'gather-pickable': gatherPick && !dragging && !resizing,
       'leaving-group': leavingGroup,
@@ -947,9 +955,10 @@ function onMagMouseUp(e, side) {
           <ConnectionIcon :size="18" />
         </button>
         <div v-if="connectMode" class="tool-hint">
-          <span>yellow dash = you</span>
-          <span>blue dash = AI</span>
-          <span>esc to cancel</span>
+          <span>yellow dash = you drawing</span>
+          <span>hand cursor on a mag = grab to draw</span>
+          <span>click blue dash to pull closer</span>
+          <span>dismiss / esc to clear blues</span>
         </div>
       </div>
       <div class="toolbar-item">
@@ -979,7 +988,7 @@ function onMagMouseUp(e, side) {
       />
     </template>
 
-    <template v-if="connectMode && !frozen">
+    <template v-if="showMag && !frozen">
       <button
         v-for="side in SIDES"
         :key="side"
@@ -1167,7 +1176,6 @@ function onMagMouseUp(e, side) {
       type="button"
       :class="{ open: note.rationaleOpen }"
       :title="note.rationaleOpen ? 'Hide rationale' : 'Show rationale'"
-      :style="{ color: textColor }"
       @pointerdown.stop
       @mousedown.stop
       @click.stop="toggleRationale"
@@ -1208,7 +1216,7 @@ function onMagMouseUp(e, side) {
   user-select: none;
   transform-origin: top left;
   z-index: 1;
-  cursor: grab;
+  cursor: default;
   touch-action: none;
   overflow: visible;
   pointer-events: auto;
@@ -1276,18 +1284,25 @@ function onMagMouseUp(e, side) {
     0 8px 24px rgba(37, 99, 235, 0.22);
 }
 
+.note.connect-ready {
+  z-index: 36;
+}
+
+.note.suggest-source {
+  z-index: 38;
+}
+
 .note.suggest-hit {
-  z-index: 21;
   box-shadow:
-    0 0 0 2px #b45309,
-    0 8px 24px rgba(180, 83, 9, 0.18);
+    0 0 0 2px #93c5fd,
+    0 8px 24px rgba(37, 99, 235, 0.14);
 }
 
 .note.suggest-picked {
-  z-index: 22;
+  z-index: 37;
   box-shadow:
     0 0 0 2.5px #2563eb,
-    0 8px 24px rgba(37, 99, 235, 0.22);
+    0 10px 28px rgba(37, 99, 235, 0.28);
 }
 
 /* Scaled tray minis shrink a 1.5px selected ring to almost nothing.
@@ -1925,21 +1940,33 @@ function onMagMouseUp(e, side) {
 
 .mag-point {
   position: absolute;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   padding: 0;
   border-radius: 50%;
   background: #fff;
   border: 2px solid #fde68a;
   box-sizing: border-box;
   z-index: 6;
-  cursor: inherit;
+  cursor: grab;
   transform: translate(-50%, -50%);
 }
 
+/* Invisible hit pad: mags sit outside the note, so near-misses used to hit empty canvas. */
+.mag-point::before {
+  content: '';
+  position: absolute;
+  inset: -12px;
+}
+
 .mag-point:hover {
-  transform: translate(-50%, -50%) scale(1.25);
+  transform: translate(-50%, -50%) scale(1.2);
   background: #fde68a;
+  cursor: grab;
+}
+
+.mag-point:active {
+  cursor: grabbing;
 }
 
 .mag-point.blocked,
@@ -1974,23 +2001,25 @@ function onMagMouseUp(e, side) {
   left: 50%;
   bottom: 3px;
   transform: translateX(-50%);
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 16px;
+  width: 26px;
+  height: 24px;
   padding: 0;
-  border: 0;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.18);
-  color: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(44, 40, 31, 0.18);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.22);
+  color: rgba(22, 22, 29, 0.72);
   cursor: pointer;
   z-index: 5;
 }
 
 .fold-btn:hover {
-  background: rgba(0, 0, 0, 0.28);
-  color: rgba(0, 0, 0, 0.7);
+  background: rgba(255, 255, 255, 0.42);
+  border-color: rgba(44, 40, 31, 0.32);
+  color: rgba(22, 22, 29, 0.92);
 }
 
 .fold-btn svg {

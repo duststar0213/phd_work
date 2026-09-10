@@ -145,6 +145,7 @@ function isTabEcho(label) {
 }
 
 const tabGroups = computed(() => clusterSimilarLabels(pinnedLabels.value))
+const canAddTab = computed(() => pinnedLabels.value.length < MAX_PINNED || creating.value)
 
 function applyLiveEmbedHits(vec) {
   const hits = {}
@@ -285,6 +286,7 @@ function onAddClick(e) {
 }
 
 function beginCreateTab() {
+  if (creating.value || pinnedLabels.value.length >= MAX_PINNED) return
   addHover.value = false
   creating.value = true
   createDraft.value = ''
@@ -379,17 +381,6 @@ function onCreateKeydown(e) {
         </span>
       </div>
     </div>
-    <button
-      v-if="open && !abandoned"
-      type="button"
-      class="edge-fold open"
-      title="Hide rationale"
-      @click.stop="emit('toggle-rationale')"
-    >
-      <svg viewBox="0 0 12 8" aria-hidden="true">
-        <path d="M2 2.5 L6 6 L10 2.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-      </svg>
-    </button>
     <div
       v-if="!abandoned"
       class="edge-add-wrap"
@@ -415,13 +406,28 @@ function onCreateKeydown(e) {
         <button type="button" @mousedown.prevent="acceptShortSuggest">use</button>
         <button type="button" @mousedown.prevent="skipShortSuggest">keep mine</button>
       </div>
-      <span v-else-if="addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
-      <button
-        type="button"
-        class="edge-add"
-        title="Add a rationale label"
-        @click="onAddClick"
-      >+</button>
+      <span v-else-if="canAddTab && addHover" class="edge-tab ghost">{{ GHOST_TAB }}</span>
+      <div class="edge-btns">
+        <button
+          v-if="open || !canAddTab"
+          type="button"
+          class="edge-fold"
+          :class="{ open }"
+          :title="open ? 'Hide rationale' : 'Show rationale'"
+          @click.stop="emit('toggle-rationale')"
+        >
+          <svg viewBox="0 0 12 8" aria-hidden="true">
+            <path d="M2 2.5 L6 6 L10 2.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <button
+          v-if="canAddTab"
+          type="button"
+          class="edge-add"
+          title="Add a rationale label"
+          @click="onAddClick"
+        >+</button>
+      </div>
     </div>
   </div>
 </template>
@@ -615,7 +621,14 @@ function onCreateKeydown(e) {
 .edge-add-wrap {
   position: relative;
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.edge-btns {
+  display: flex;
   align-items: center;
+  gap: 4px;
 }
 
 .tab-shorten {
@@ -666,35 +679,32 @@ function onCreateKeydown(e) {
   display: flex;
   align-items: center;
   justify-content: center;
+  width: 26px;
+  height: 24px;
   padding: 0;
-  border: 0;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.28);
-  color: rgba(22, 22, 29, 0.78);
+  margin: 0;
+  border: 1px solid rgba(44, 40, 31, 0.22);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.88);
+  color: rgba(22, 22, 29, 0.92);
   cursor: pointer;
 }
 
-.edge-fold {
-  width: 16px;
-  height: 12px;
-}
-
 .edge-add {
-  width: 16px;
-  height: 12px;
-  font-size: 10px;
-  line-height: 12px;
+  font-size: 18px;
+  line-height: 22px;
 }
 
 .edge-fold:hover,
 .edge-add:hover {
-  background: rgba(255, 255, 255, 0.45);
-  color: rgba(22, 22, 29, 0.92);
+  background: #fff;
+  border-color: rgba(44, 40, 31, 0.4);
+  color: #16161d;
 }
 
 .edge-fold svg {
-  width: 9px;
-  height: 6px;
+  width: 12px;
+  height: 8px;
   display: block;
   transition: transform 0.14s ease;
 }
