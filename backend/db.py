@@ -1,11 +1,14 @@
 """SQLite store for study participants, sessions, canvas snapshots, and events."""
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+# Serverless hosts only allow writes under /tmp, so the location is configurable.
+# Unset means the repo's own data directory, as on the lab server.
+DATA_DIR = Path(os.getenv("REPERTOIRE_DATA_DIR") or Path(__file__).resolve().parent / "data")
 DB_PATH = DATA_DIR / "repertoire.db"
 ALLOWLIST_PATH = DATA_DIR / "allowlist.txt"
 SESSION_DAYS = 14

@@ -227,7 +227,12 @@ STUDY_CAP = int(os.getenv("STUDY_CAP", str(db.STUDY_CAP)) or db.STUDY_CAP)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     clear_local_proxies()
-    db.init_db()
+    try:
+        db.init_db()
+    except OSError:
+        # Read-only filesystem: the AI routes and the invitation gate need no database,
+        # and accounts and boards live in the participant's browser either way.
+        log.warning("no writable data directory — running without the study database")
     yield
 
 
