@@ -6,9 +6,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Serverless hosts only allow writes under /tmp, so the location is configurable.
-# Unset means the repo's own data directory, as on the lab server.
-DATA_DIR = Path(os.getenv("REPERTOIRE_DATA_DIR") or Path(__file__).resolve().parent / "data")
+# Vercel Functions expose a read-only deployment bundle; only /tmp is writable.
+# Keep local development data in backend/data unless a directory is explicitly set.
+DEFAULT_DATA_DIR = "/tmp/repertoire" if os.getenv("VERCEL") else str(Path(__file__).resolve().parent / "data")
+DATA_DIR = Path(os.getenv("REPERTOIRE_DATA_DIR") or DEFAULT_DATA_DIR)
 DB_PATH = DATA_DIR / "repertoire.db"
 ALLOWLIST_PATH = DATA_DIR / "allowlist.txt"
 SESSION_DAYS = 14
