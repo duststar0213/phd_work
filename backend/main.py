@@ -209,11 +209,66 @@ reading: kind reflection, because it reports a difficulty and proposes nothing
 bad: What criteria separate a rejected idea from a dropped one? (answers the reflection for them)
 good: What should the canvas show differently once that difference is known?
 """
+CONTEXT_QUESTIONS_PROMPT = """You read a designer's project brief and ask them questions back.
+
+The brief is whatever they wrote about the project as a whole, plus any images they attached
+(sketches, screenshots, photos, moodboards, whiteboards). Read the images as part of the brief.
+
+Return JSON only:
+{"questions":[{"text":"...","kind":"goal|user|constraint|scope|tension"}]}
+
+Rules:
+- 3 to 5 questions
+- EXACTLY ONE question has kind "goal". It is your reading of what they are trying to achieve,
+  put back to them as a question they can confirm or correct, e.g.
+  "Are you trying to make X easier for Y, rather than Z?"
+  Commit to a real reading. A vague goal question is worse than a wrong one.
+- every other question must QUOTE OR NAME something from this brief: a word they used, a thing
+  visible in an image, a group, a number, a constraint they stated
+- before you keep a question, test it: could it be sent to a completely different project with
+  no edit? If yes, throw it away and ask about something in this brief instead
+- never ask them to elaborate. "What specific features do you envision?", "Can you say more
+  about X?", "How do you plan to do X?" are all asking for detail, not for reasoning — banned
+- banned outright because they fit any project: who are your users, what is your goal, what
+  does success look like, what are your concerns, what is your timeline
+- if the brief leaves something load-bearing unsaid, name the missing piece yourself and ask
+  the decision that turns on it
+- do not answer anything for them, do not give advice, do not propose solutions
+- each question at most 20 words, ending in a question mark
+- same language as the brief
+- no chatbot tone, no markdown, no preamble, no numbering
+
+kind means: goal = your reading of the design goal · user = who it is for · constraint = a
+limit they must work inside · scope = what is in or out · tension = two things in the brief
+that pull against each other
+
+The user message may list questions already asked. Do not ask any of those again, in any wording.
+Ask what the brief opens up next.
+
+Examples of the judgement wanted:
+brief: A canvas where designers keep sticky notes and the AI labels their rationale. For my PhD study, 15 participants.
+bad: What are you hoping participants will do? (fits any study)
+bad: What specific features do you envision for the labelling? (asks for detail, not reasoning)
+bad: How will you make sure participants engage? (fits any study)
+good (goal): Are you trying to make rationale visible as people work, rather than collected afterwards?
+good (tension): If the AI labels rationale, what stops participants writing for the AI instead?
+good (scope): Does a label belong to the sticky note, or to the move the designer just made?
+good (user): Which of the 15 would still write rationale without the labels?
+
+brief: [image of a whiteboard with three columns: intake, triage, resolve] plus "hospital nurse handover tool"
+bad: Can you tell me more about the whiteboard? (asks for detail, names nothing)
+good (scope): Does the tool cover the triage column, or only carry notes between intake and resolve?
+"""
 MAX_KNOWN_LABELS = 40  # caps prompt size; the newest labels are the ones worth matching
 MAX_SUGGEST_LINKS = 5
 MAX_SUGGEST_WHY_WORDS = 12
 MAX_GROUP_WHY_WORDS = 18
 MAX_WHY_QUESTION_WORDS = 16
+MAX_CONTEXT_QUESTIONS = 5
+MAX_CONTEXT_QUESTION_WORDS = 20
+MAX_CONTEXT_IMAGES = 5
+MAX_IMAGE_CHARS = 1_400_000  # one downscaled data URL; the browser caps size before sending
+CONTEXT_QUESTION_KINDS = ("goal", "user", "constraint", "scope", "tension")
 MAX_CONTEXT_CHARS = 1500  # the standing brief is background, so it must not crowd out the idea
 MIN_WHY_QUESTION_CHARS = 12
 MIN_RATIONALE_CHARS = 1
@@ -372,6 +427,13 @@ class AskWhyRequest(BaseModel):
     answer: str = Field(default="", max_length=4000)  # rationale written so far
     asked: list[str] = Field(default_factory=list, max_length=8)  # never ask these again
     context: str = Field(default="", max_length=MAX_CONTEXT_CHARS)
+
+
+class ContextQuestionsRequest(BaseModel):
+    context: str = Field(default="", max_length=MAX_CONTEXT_CHARS)
+    # Downscaled data URLs from the browser; never stored, only read for this one call.
+    images: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_IMAGES)
+    asked: list[str] = Field(default_factory=list, max_length=12)  # never ask these again
 
 
 def clear_local_proxies() -> None:
@@ -1209,6 +1271,96 @@ async def ask_why(req: AskWhyRequest):
     if reply["question"] and any(same_question(reply["question"], item) for item in req.asked):
         reply["question"] = ""
     return {**reply, "model": model}
+
+
+def parse_context_questions(raw: str, asked: list[str]) -> list[dict]:
+    """Parse model JSON into [{text, kind}, ...], dropping repeats of anything already asked."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise api_error(502, "bad_model_json", "The AI returned no usable questions. Try again.") from exc
+
+    items = data.get("questions") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+
+    questions: list[dict] = []
+    goal_taken = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        body = clip_words(str(item.get("text", "")).strip(), MAX_CONTEXT_QUESTION_WORDS)
+        if not body:
+            continue
+        if any(same_question(body, seen) for seen in asked):
+            continue
+        if any(same_question(body, seen["text"]) for seen in questions):
+            continue
+        kind = str(item.get("kind", "scope")).strip().lower()
+        if kind not in CONTEXT_QUESTION_KINDS:
+            kind = "scope"
+        # The prompt asks for exactly one reading of the goal; keep the first if it sends more.
+        if kind == "goal":
+            if goal_taken:
+                kind = "scope"
+            else:
+                goal_taken = True
+        questions.append({"text": body, "kind": kind})
+        if len(questions) >= MAX_CONTEXT_QUESTIONS:
+            break
+    return questions
+
+
+def context_questions_content(req: ContextQuestionsRequest) -> list[dict]:
+    """Brief + attached images as one multimodal user message."""
+    brief = " ".join(str(req.context or "").split())[:MAX_CONTEXT_CHARS].strip()
+    lines = [f"project brief\n{brief}" if brief else "project brief\n(nothing written yet)"]
+    asked = [str(item).strip() for item in req.asked if str(item).strip()]
+    if asked:
+        lines.append("already asked (never ask these again):\n" + "\n".join(f"- {item}" for item in asked))
+    parts: list[dict] = [{"type": "text", "text": "\n\n".join(lines)}]
+    for url in req.images:
+        url = str(url or "").strip()
+        if not url.startswith("data:image/") or len(url) > MAX_IMAGE_CHARS:
+            continue
+        parts.append({"type": "image_url", "image_url": {"url": url, "detail": "low"}})
+    return parts
+
+
+@app.post("/api/context-questions")
+async def context_questions(req: ContextQuestionsRequest):
+    """Read the standing brief (text + attached images) and ask the designer back."""
+    brief = req.context.strip()
+    images = [url for url in req.images if str(url or "").strip().startswith("data:image/")]
+    if len(brief) < 12 and not images:
+        return {"questions": [], "model": ""}
+
+    client = get_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": CONTEXT_QUESTIONS_PROMPT},
+                {"role": "user", "content": context_questions_content(req)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.6,
+            max_tokens=420,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise openai_http_error(exc) from exc
+
+    content = response.choices[0].message.content
+    if not content:
+        return {"questions": [], "model": model}
+    return {"questions": parse_context_questions(content, req.asked), "model": model}
 
 
 @app.post("/api/detect-reflection")

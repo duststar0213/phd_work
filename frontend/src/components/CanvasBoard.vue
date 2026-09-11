@@ -5,7 +5,8 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue' // Vue 3 reactivity + lifecycle
 import { fetchCanvas, logEvent, logout, saveCanvas } from '../api/session'
-import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, suggestGroupWhy, narrativeSharedWhy, clusterSimilarLabels, isSimilarLabel } from '../api/rationale'
+import { patternStatsFromLabels, persistedRationaleLabels, embedTexts, cosine, asVector, suggestLinks, suggestGroupWhy, narrativeSharedWhy, clusterSimilarLabels, isSimilarLabel, askContextQuestions } from '../api/rationale'
+import { importContextImage, imageFilesFrom, IMAGE_ACCEPT, MAX_CONTEXT_IMAGES } from '../contextImages'
 import StickyNoteCard from './StickyNoteCard.vue'
 import StickyNoteIcon from './StickyNoteIcon.vue'
 import GroupIcon from './GroupIcon.vue'
@@ -143,6 +144,18 @@ const canvasRef = ref(null)
 const designContext = ref('')
 const contextOpen = ref(false)
 const contextRef = ref(null)
+// Pictures pinned to the brief: sketches, screenshots, whatever frames the project.
+const contextImages = ref([]) // [{ id, name, dataUrl, w, h }]
+const contextImageError = ref('')
+const contextFileRef = ref(null)
+const contextDropActive = ref(false)
+// What the AI asks back once the brief changes. Bubbles live in canvas space.
+const contextQuestions = ref([]) // [{ id, text, kind, x, y }]
+const contextQuestionsLoading = ref(false)
+const contextQuestionsError = ref('')
+const contextDismissed = ref([]) // texts waved away; the AI must not raise them again
+let contextSeed = '' // brief fingerprint at the last generation, so reopening is free
+let contextAbort = null
 const searchOpen = ref(false)
 const searchQuery = ref('')
 const searchHits = ref([]) // [{ id, score, title, why }]
@@ -209,6 +222,14 @@ const MAG_GRAB_PX = 26
 const RATIONALE_GAP = 28
 /** Room to paste a brief and some material, without letting the saved board grow unbounded. */
 const MAX_DESIGN_CONTEXT = 4000
+/** Short briefs say too little to ask anything specific back. */
+const MIN_CONTEXT_FOR_QUESTIONS = 12
+/** Question bubbles sit on a rail down the left of whatever the designer is looking at. */
+const QUESTION_RAIL_INSET = 44
+const QUESTION_RAIL_TOP = 64
+const QUESTION_RAIL_STEP = 96
+/** Cap the dismiss memory so the prompt stays small on a long session. */
+const MAX_DISMISSED_QUESTIONS = 12
 /** Used until a dock is measured, so the dashed frame grows on the same click as V. */
 const RATIONALE_DOCK_FALLBACK = 220
 const dockHeights = ref({})
@@ -1236,7 +1257,7 @@ function resetToIdle() {
 /** Empty-canvas press: return to idle, then pan if the pointer moves. Sticky / group tools still handle the click. */
 function onCanvasMouseDown(e) {
   if (stickyActive.value || groupActive.value) return
-  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock') || e.target.closest('.pattern-frame-caption') || e.target.closest('.suggest-wrap')) return
+  if (e.target.closest('.note') || e.target.closest('.relation-wrap') || e.target.closest('.rationale-dock') || e.target.closest('.pattern-frame-caption') || e.target.closest('.suggest-wrap') || e.target.closest('.context-bubble')) return
   // Mag points sit outside the note box. A near-miss used to hit the canvas, deselect,
   // and make all four mags vanish — treat that as grabbing the mag instead.
   const at = clientToCanvas(e)
@@ -1277,6 +1298,7 @@ function onCanvasMouseDown(e) {
 /** Place one note at the click (canvas coords), then disarm the tool. */
 function onCanvasClick(e) {
   if (groupActive.value) return
+  if (e.target.closest('.context-bubble')) return
   if (!stickyActive.value || !canvasRef.value) return
 
   const rect = canvasRef.value.getBoundingClientRect()
@@ -2934,7 +2956,7 @@ function onKeydown(e) {
       return
     }
     if (contextOpen.value) {
-      contextOpen.value = false
+      closeContext()
       if (typing && e.target instanceof HTMLElement) e.target.blur()
       return
     }
@@ -3070,12 +3092,159 @@ function canvasPayload() {
     nextConnId,
     nextGroupId,
     designContext: designContext.value,
+    contextImages: contextImages.value,
+    contextQuestions: contextQuestions.value,
+    contextDismissed: contextDismissed.value,
+    contextSeed,
   }
 }
 
 function toggleContext() {
-  contextOpen.value = !contextOpen.value
-  if (contextOpen.value) nextTick(() => contextRef.value?.focus())
+  if (contextOpen.value) {
+    closeContext()
+    return
+  }
+  contextOpen.value = true
+  contextImageError.value = ''
+  nextTick(() => contextRef.value?.focus())
+}
+
+/** Closing the brief is what asks the AI to read it back; reopening an unchanged brief is free. */
+function closeContext() {
+  if (!contextOpen.value) return
+  contextOpen.value = false
+  contextDropActive.value = false
+  refreshContextQuestions()
+}
+
+/** What the AI has already been shown. Same fingerprint means nothing new to read. */
+function contextFingerprint() {
+  return `${designContext.value.trim()}::${contextImages.value.map((item) => item.id).join(',')}`
+}
+
+async function addContextImages(files) {
+  const list = Array.from(files || [])
+  if (!list.length) return
+  contextImageError.value = ''
+  for (const file of list) {
+    if (contextImages.value.length >= MAX_CONTEXT_IMAGES) {
+      contextImageError.value = `${MAX_CONTEXT_IMAGES} images is the limit · remove one first`
+      break
+    }
+    try {
+      const image = await importContextImage(file)
+      contextImages.value = [...contextImages.value, image]
+    } catch (err) {
+      contextImageError.value = err?.message || "That image couldn't be imported."
+    }
+  }
+}
+
+function onContextFilePick(event) {
+  addContextImages(event.target.files)
+  event.target.value = '' // so picking the same file twice still fires
+}
+
+function onContextPaste(event) {
+  const files = imageFilesFrom(event.clipboardData)
+  if (!files.length) return // a plain text paste belongs to the textarea
+  event.preventDefault()
+  addContextImages(files)
+}
+
+function onContextDrop(event) {
+  contextDropActive.value = false
+  const files = imageFilesFrom(event.dataTransfer)
+  if (!files.length) return
+  event.preventDefault()
+  addContextImages(files)
+}
+
+function onContextDragOver(event) {
+  if (!Array.from(event.dataTransfer?.types || []).includes('Files')) return
+  event.preventDefault()
+  contextDropActive.value = true
+}
+
+function removeContextImage(id) {
+  contextImages.value = contextImages.value.filter((item) => item.id !== id)
+  contextImageError.value = ''
+}
+
+/** Lay the bubbles on a rail down the left of the current view, in canvas space. */
+function questionRailSlots(count) {
+  const origin = viewPointToCanvas(QUESTION_RAIL_INSET, QUESTION_RAIL_TOP)
+  const { h } = viewSize()
+  // Never run the rail into the tool well at the bottom of the screen.
+  const room = Math.max(1, Math.floor((h - QUESTION_RAIL_TOP - 150) / QUESTION_RAIL_STEP) + 1)
+  const step = count > room ? QUESTION_RAIL_STEP * (room / count) : QUESTION_RAIL_STEP
+  return Array.from({ length: count }, (_, i) => ({
+    x: origin.x,
+    y: origin.y + (i * step) / (scale.value || 1),
+  }))
+}
+
+/**
+ * Read the brief back as questions. Each run replaces the bubbles, because the questions
+ * are about the brief as it stands now; dismissed ones are sent along so they stay gone.
+ */
+async function refreshContextQuestions() {
+  const seed = contextFingerprint()
+  if (seed === contextSeed) return
+  const brief = designContext.value.trim()
+  if (brief.length < MIN_CONTEXT_FOR_QUESTIONS && !contextImages.value.length) {
+    contextSeed = seed
+    contextQuestions.value = []
+    return
+  }
+
+  contextAbort?.abort()
+  contextAbort = new AbortController()
+  const signal = contextAbort.signal
+  contextQuestionsLoading.value = true
+  contextQuestionsError.value = ''
+  logEvent('context_questions', { chars: brief.length, images: contextImages.value.length }).catch(() => {})
+
+  try {
+    const result = await askContextQuestions(
+      brief,
+      contextImages.value.map((item) => item.dataUrl),
+      { asked: contextDismissed.value, signal },
+    )
+    if (signal.aborted) return
+    contextSeed = seed
+    const slots = questionRailSlots(result.questions.length)
+    contextQuestions.value = result.questions.map((item, i) => ({
+      id: `q-${Date.now()}-${i}`,
+      text: item.text,
+      kind: item.kind,
+      x: slots[i].x,
+      y: slots[i].y,
+    }))
+    if (!result.questions.length) contextQuestionsError.value = 'nothing new to ask about the brief'
+  } catch (err) {
+    if (signal.aborted || err?.code === 'cancelled') return
+    contextQuestionsError.value = err?.message || "couldn't read the brief back"
+  } finally {
+    if (!signal.aborted) contextQuestionsLoading.value = false
+  }
+}
+
+/** Dismiss is also a signal: the AI never raises that question again. */
+function dismissContextQuestion(id) {
+  const question = contextQuestions.value.find((item) => item.id === id)
+  if (!question) return
+  contextQuestions.value = contextQuestions.value.filter((item) => item.id !== id)
+  contextDismissed.value = [...contextDismissed.value, question.text].slice(-MAX_DISMISSED_QUESTIONS)
+  logEvent('context_question_dismissed', { kind: question.kind }).catch(() => {})
+}
+
+function clearContextQuestions() {
+  contextAbort?.abort()
+  contextAbort = null
+  contextQuestions.value = []
+  contextQuestionsLoading.value = false
+  contextQuestionsError.value = ''
 }
 
 let saveTimer = null
@@ -3180,6 +3349,30 @@ onMounted(async () => {
     const maxGroupId = groups.value.reduce((max, group) => Math.max(max, Number(group.id) || 0), 0)
     nextGroupId = Number(data.nextGroupId) > 0 ? Number(data.nextGroupId) : maxGroupId + 1
     designContext.value = typeof data.designContext === 'string' ? data.designContext : ''
+    contextImages.value = (Array.isArray(data.contextImages) ? data.contextImages : [])
+      .filter((item) => item && String(item.dataUrl || '').startsWith('data:image/'))
+      .slice(0, MAX_CONTEXT_IMAGES)
+      .map((item) => ({
+        id: String(item.id || `img-${Math.random().toString(36).slice(2, 10)}`),
+        name: String(item.name || 'image'),
+        dataUrl: item.dataUrl,
+        w: Number(item.w) || 0,
+        h: Number(item.h) || 0,
+      }))
+    contextQuestions.value = (Array.isArray(data.contextQuestions) ? data.contextQuestions : [])
+      .filter((item) => item && String(item.text || '').trim())
+      .map((item, i) => ({
+        id: String(item.id || `q-restored-${i}`),
+        text: String(item.text),
+        kind: String(item.kind || 'scope'),
+        x: Number(item.x) || 0,
+        y: Number(item.y) || 0,
+      }))
+    contextDismissed.value = (Array.isArray(data.contextDismissed) ? data.contextDismissed : [])
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .slice(-MAX_DISMISSED_QUESTIONS)
+    contextSeed = typeof data.contextSeed === 'string' ? data.contextSeed : contextFingerprint()
   } catch {
     notes.value = []
     groups.value = []
@@ -3201,6 +3394,7 @@ onMounted(async () => {
   )
   watch(pan, scheduleSave, { deep: true })
   watch(designContext, scheduleSave)
+  watch([contextImages, contextQuestions, contextDismissed], scheduleSave, { deep: true })
 })
 
 onUnmounted(() => {
@@ -3218,6 +3412,7 @@ onUnmounted(() => {
   clearTimeout(saveTimer)
   window.clearTimeout(patternAnimTimer)
   suggestAbort?.abort()
+  contextAbort?.abort()
 })
 </script>
 
@@ -3398,6 +3593,29 @@ onUnmounted(() => {
             />
             <span class="suggest-why">{{ line.why }}</span>
           </div>
+        </div>
+        <!-- The AI reading the brief back. Not attached to any note: these are about the project. -->
+        <div
+          v-for="question in contextQuestions"
+          :key="question.id"
+          class="context-bubble"
+          :class="[`kind-${question.kind}`, { inert: !!draft }]"
+          :style="{
+            left: `${question.x}px`,
+            top: `${question.y}px`,
+            pointerEvents: draft ? 'none' : 'auto',
+          }"
+          @pointerdown.stop
+          @mousedown.stop
+        >
+          <span class="context-bubble-kind">{{ question.kind === 'goal' ? 'is this your goal?' : question.kind }}</span>
+          <p class="context-bubble-text">{{ question.text }}</p>
+          <button
+            type="button"
+            class="context-bubble-drop"
+            title="Dismiss — the AI will not ask this again"
+            @click="dismissContextQuestion(question.id)"
+          >×</button>
         </div>
         <template v-for="note in notes" :key="note.id">
           <StickyNoteCard
@@ -3785,6 +4003,18 @@ onUnmounted(() => {
         <div v-else-if="connectActive" class="hint">drag a mag point on this note · other notes show mag points when the pen is close</div>
         <div v-else-if="patternGather" class="hint">{{ patternGatherHint }}</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
+        <div v-else-if="contextQuestionsLoading" class="hint">reading your brief back…</div>
+        <div v-else-if="contextQuestionsError" class="hint">{{ contextQuestionsError }}</div>
+        <div v-else-if="contextQuestions.length" class="hint">the AI's questions about this project · × dismisses one for good</div>
+        <button
+          v-if="contextQuestions.length"
+          type="button"
+          class="tool-btn"
+          title="Clear every question bubble"
+          @click="clearContextQuestions"
+        >
+          <span class="btn-label">clear questions</span>
+        </button>
         <button
           v-if="suggestedLinks.length"
           type="button"
@@ -3846,10 +4076,17 @@ onUnmounted(() => {
         </button>
         <div class="context-slot">
           <!-- Standing brief: the designer writes here whenever they like and the AI never answers it. -->
-          <div v-if="contextOpen" class="context-panel">
+          <div
+            v-if="contextOpen"
+            class="context-panel"
+            :class="{ dropping: contextDropActive }"
+            @dragover="onContextDragOver"
+            @dragleave="contextDropActive = false"
+            @drop="onContextDrop"
+          >
             <div class="context-head">
               <span class="context-title">what are you designing?</span>
-              <button type="button" class="context-close" title="Close" @click="contextOpen = false">×</button>
+              <button type="button" class="context-close" title="Close" @click="closeContext">×</button>
             </div>
             <textarea
               ref="contextRef"
@@ -3857,8 +4094,41 @@ onUnmounted(() => {
               class="context-input"
               :maxlength="MAX_DESIGN_CONTEXT"
               placeholder="Describe the design goal, who it is for, constraints — or paste any material that frames this work."
+              @paste="onContextPaste"
             />
-            <p class="context-hint">background for the AI's questions · nothing is generated from this · edit it any time</p>
+            <div v-if="contextImages.length" class="context-shots">
+              <div v-for="image in contextImages" :key="image.id" class="context-shot">
+                <img :src="image.dataUrl" :alt="image.name" />
+                <button
+                  type="button"
+                  class="context-shot-drop"
+                  :title="`Remove ${image.name}`"
+                  @click="removeContextImage(image.id)"
+                >×</button>
+              </div>
+            </div>
+            <div class="context-actions">
+              <button
+                type="button"
+                class="context-add"
+                :disabled="contextImages.length >= MAX_CONTEXT_IMAGES"
+                title="Attach a sketch, screenshot or photo"
+                @click="contextFileRef?.click()"
+              >
+                + image
+              </button>
+              <span class="context-count">{{ contextImages.length }}/{{ MAX_CONTEXT_IMAGES }} · or paste / drop</span>
+              <input
+                ref="contextFileRef"
+                class="context-file"
+                type="file"
+                :accept="IMAGE_ACCEPT"
+                multiple
+                @change="onContextFilePick"
+              />
+            </div>
+            <p v-if="contextImageError" class="context-warn">{{ contextImageError }}</p>
+            <p class="context-hint">close this and the AI reads it back as questions on the canvas</p>
           </div>
           <button
             type="button"
@@ -4633,6 +4903,170 @@ onUnmounted(() => {
   letter-spacing: 0.03em;
   line-height: 1.4;
   color: var(--ink-faint);
+}
+
+.context-panel.dropping {
+  border-color: rgba(180, 83, 9, 0.55);
+  box-shadow: 0 12px 32px rgba(180, 83, 9, 0.22);
+}
+
+.context-shots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.context-shot {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--paper);
+}
+
+.context-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.context-shot-drop {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(44, 40, 31, 0.66);
+  color: #fff;
+  font-size: 12px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.context-shot-drop:hover {
+  background: rgba(44, 40, 31, 0.88);
+}
+
+.context-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.context-add {
+  padding: 4px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-muted);
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.context-add:hover:not(:disabled) {
+  border-color: rgba(180, 83, 9, 0.45);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.context-add:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.context-count {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  color: var(--ink-faint);
+}
+
+.context-file {
+  display: none;
+}
+
+.context-warn {
+  margin: 0;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 9px;
+  line-height: 1.4;
+  color: var(--accent);
+}
+
+/* Questions the AI asks back about the whole project, parked on the canvas. */
+.context-bubble {
+  position: absolute;
+  box-sizing: border-box;
+  width: 230px;
+  padding: 9px 24px 9px 11px;
+  border: 1px solid rgba(180, 83, 9, 0.35);
+  border-radius: 12px 12px 12px 3px;
+  background: var(--chrome);
+  box-shadow: 0 6px 18px rgba(44, 40, 31, 0.12);
+  pointer-events: auto;
+  z-index: 16;
+}
+
+.context-bubble.inert {
+  opacity: 0.4;
+}
+
+/* The AI's reading of the design goal is the one worth answering first. */
+.context-bubble.kind-goal {
+  border-color: rgba(180, 83, 9, 0.75);
+  border-width: 1.5px;
+  background: #fffaf2;
+}
+
+.context-bubble-kind {
+  display: block;
+  margin-bottom: 3px;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.context-bubble.kind-goal .context-bubble-kind {
+  color: var(--accent);
+}
+
+.context-bubble-text {
+  margin: 0;
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink);
+  overflow-wrap: break-word;
+}
+
+.context-bubble-drop {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 13px;
+  line-height: 17px;
+  cursor: pointer;
+}
+
+.context-bubble-drop:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .search-input {

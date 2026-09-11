@@ -10,6 +10,10 @@ const MAX_LABEL_WORDS = 10
 const MAX_KNOWN_LABELS = 40 // matches the backend cap; newest labels are the ones worth matching
 const MAX_CONTEXT_CHARS = 1500 // the brief is background, so it must not crowd out the idea itself
 const MAX_ASKED_QUESTIONS = 8 // earlier questions the model must not ask again
+const MAX_CONTEXT_QUESTIONS = 5 // matches the backend cap on questions back from the brief
+const MAX_ASKED_CONTEXT_QUESTIONS = 12 // brief questions already put to the designer
+const MAX_CONTEXT_IMAGES = 5 // matches the backend cap on images attached to the brief
+const CONTEXT_QUESTION_KINDS = ['goal', 'user', 'constraint', 'scope', 'tension']
 const NEW_CLAUSE_WORDS = 4 // unmatched content words that make an addition worth labelling
 const MAX_LABELLED_CHARS = 4000 // reflection already turned into labels, sent as background
 
@@ -177,6 +181,54 @@ export async function detectEmbeddedReflection(idea, options = {}) {
   return {
     hasReflection: Boolean(data.has_reflection),
     excerpt: String(data.excerpt || '').trim(),
+    model: data.model || '',
+  }
+}
+
+/**
+ * POST /api/context-questions. The standing brief plus any attached images, read back
+ * as questions about this project. Returns [{ text, kind }]; kind "goal" is the AI's
+ * reading of the design goal. Images are data URLs, already downscaled by the browser.
+ */
+export async function askContextQuestions(context, images = [], options = {}) {
+  const response = await fetchWithTimeout(
+    '/api/context-questions',
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        context: clipContext(context),
+        images: (Array.isArray(images) ? images : [])
+          .map((url) => String(url || ''))
+          .filter((url) => url.startsWith('data:image/'))
+          .slice(0, MAX_CONTEXT_IMAGES),
+        asked: (Array.isArray(options.asked) ? options.asked : [])
+          .map((item) => String(item || '').trim())
+          .filter(Boolean)
+          .slice(-MAX_ASKED_CONTEXT_QUESTIONS),
+      }),
+      signal: options.signal,
+    },
+    REQUEST_TIMEOUT_MS,
+  )
+  const data = await readJson(response)
+  if (!response.ok) throw toApiError(response.status, data)
+  const seen = new Set()
+  return {
+    questions: (Array.isArray(data.questions) ? data.questions : [])
+      .map((item) => ({
+        text: String(item?.text || '').trim(),
+        kind: CONTEXT_QUESTION_KINDS.includes(item?.kind) ? item.kind : 'scope',
+      }))
+      .filter((item) => {
+        if (!item.text) return false
+        const key = item.text.toLowerCase()
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      .slice(0, MAX_CONTEXT_QUESTIONS),
     model: data.model || '',
   }
 }
