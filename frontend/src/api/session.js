@@ -146,7 +146,16 @@ export async function fetchCanvas() {
 export function saveCanvas(payload) {
   const email = getSessionEmail()
   if (!email) return Promise.reject(new SessionError('Please sign in with your email.', { code: 'auth_required', status: 401 }))
-  saveLocalCanvas(email, payload)
+  try {
+    saveLocalCanvas(email, payload)
+  } catch (err) {
+    // Browser storage is finite and context images are the one thing that can fill it.
+    return Promise.reject(
+      new SessionError('The board is too big to save in this browser. Remove a context image.', {
+        code: 'storage_full',
+      }),
+    )
+  }
   return Promise.resolve({ ok: true })
 }
 

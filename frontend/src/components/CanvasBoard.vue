@@ -154,6 +154,7 @@ const contextQuestions = ref([]) // [{ id, text, kind, x, y }]
 const contextQuestionsLoading = ref(false)
 const contextQuestionsError = ref('')
 const contextDismissed = ref([]) // texts waved away; the AI must not raise them again
+const saveError = ref('') // browser storage refused the board, usually a context image too many
 let contextSeed = '' // brief fingerprint at the last generation, so reopening is free
 let contextAbort = null
 const searchOpen = ref(false)
@@ -3169,6 +3170,7 @@ function onContextDragOver(event) {
 function removeContextImage(id) {
   contextImages.value = contextImages.value.filter((item) => item.id !== id)
   contextImageError.value = ''
+  saveError.value = '' // freeing room is the fix, so let the next save clear or repeat it
 }
 
 /** Lay the bubbles on a rail down the left of the current view, in canvas space. */
@@ -3213,8 +3215,10 @@ async function refreshContextQuestions() {
     )
     if (signal.aborted) return
     contextSeed = seed
-    const slots = questionRailSlots(result.questions.length)
-    contextQuestions.value = result.questions.map((item, i) => ({
+    // No kind labels on the bubbles, so the goal reading earns its weight by sitting first.
+    const ordered = [...result.questions].sort((a, b) => (a.kind === 'goal' ? -1 : 0) - (b.kind === 'goal' ? -1 : 0))
+    const slots = questionRailSlots(ordered.length)
+    contextQuestions.value = ordered.map((item, i) => ({
       id: `q-${Date.now()}-${i}`,
       text: item.text,
       kind: item.kind,
@@ -3255,7 +3259,10 @@ function scheduleSave() {
   if (!loaded) return
   clearTimeout(saveTimer)
   saveTimer = setTimeout(() => {
-    saveCanvas(canvasPayload()).catch(() => {})
+    saveCanvas(canvasPayload()).catch((err) => {
+      // A full browser store means the board silently stops saving, so say so.
+      saveError.value = err?.code === 'storage_full' ? err.message : ''
+    })
   }, 1400)
 }
 
@@ -3372,7 +3379,8 @@ onMounted(async () => {
       .map((item) => String(item || '').trim())
       .filter(Boolean)
       .slice(-MAX_DISMISSED_QUESTIONS)
-    contextSeed = typeof data.contextSeed === 'string' ? data.contextSeed : contextFingerprint()
+    // Empty means never generated, so a brief written before this existed still gets read back.
+    contextSeed = typeof data.contextSeed === 'string' ? data.contextSeed : ''
   } catch {
     notes.value = []
     groups.value = []
@@ -3599,7 +3607,7 @@ onUnmounted(() => {
           v-for="question in contextQuestions"
           :key="question.id"
           class="context-bubble"
-          :class="[`kind-${question.kind}`, { inert: !!draft }]"
+          :class="{ inert: !!draft }"
           :style="{
             left: `${question.x}px`,
             top: `${question.y}px`,
@@ -3608,7 +3616,6 @@ onUnmounted(() => {
           @pointerdown.stop
           @mousedown.stop
         >
-          <span class="context-bubble-kind">{{ question.kind === 'goal' ? 'is this your goal?' : question.kind }}</span>
           <p class="context-bubble-text">{{ question.text }}</p>
           <button
             type="button"
@@ -4003,6 +4010,7 @@ onUnmounted(() => {
         <div v-else-if="connectActive" class="hint">drag a mag point on this note · other notes show mag points when the pen is close</div>
         <div v-else-if="patternGather" class="hint">{{ patternGatherHint }}</div>
         <div v-else-if="searchOpen && !searchHits.length && !searchError" class="hint">press enter to look up · esc to close</div>
+        <div v-else-if="saveError" class="hint">{{ saveError }}</div>
         <div v-else-if="contextQuestionsLoading" class="hint">reading your brief back…</div>
         <div v-else-if="contextQuestionsError" class="hint">{{ contextQuestionsError }}</div>
         <div v-else-if="contextQuestions.length" class="hint">the AI's questions about this project · × dismisses one for good</div>
@@ -5000,16 +5008,20 @@ onUnmounted(() => {
   color: var(--accent);
 }
 
-/* Questions the AI asks back about the whole project, parked on the canvas. */
+/* Questions the AI asks back about the whole project. Same blue as the rationale
+   question bubble in RationaleModule, because both are the AI asking, not telling. */
 .context-bubble {
   position: absolute;
   box-sizing: border-box;
-  width: 230px;
-  padding: 9px 24px 9px 11px;
-  border: 1px solid rgba(180, 83, 9, 0.35);
-  border-radius: 12px 12px 12px 3px;
-  background: var(--chrome);
-  box-shadow: 0 6px 18px rgba(44, 40, 31, 0.12);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 220px;
+  padding: 8px 8px 8px 10px;
+  border: 1px solid #a8caf4;
+  border-radius: 12px;
+  background: #e8f1fd;
+  box-shadow: 0 6px 18px rgba(30, 58, 95, 0.18);
   pointer-events: auto;
   z-index: 16;
 }
@@ -5018,55 +5030,34 @@ onUnmounted(() => {
   opacity: 0.4;
 }
 
-/* The AI's reading of the design goal is the one worth answering first. */
-.context-bubble.kind-goal {
-  border-color: rgba(180, 83, 9, 0.75);
-  border-width: 1.5px;
-  background: #fffaf2;
-}
-
-.context-bubble-kind {
-  display: block;
-  margin-bottom: 3px;
-  font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 8px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-}
-
-.context-bubble.kind-goal .context-bubble-kind {
-  color: var(--accent);
-}
-
 .context-bubble-text {
+  flex: 1;
+  min-width: 0;
   margin: 0;
-  font-family: 'DM Mono', ui-monospace, monospace;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
-  color: var(--ink);
+  color: #1e3a5f;
   overflow-wrap: break-word;
 }
 
 .context-bubble-drop {
-  position: absolute;
-  top: 5px;
-  right: 5px;
-  width: 17px;
-  height: 17px;
+  flex: none;
+  width: 16px;
+  height: 16px;
   padding: 0;
   border: 0;
-  border-radius: 5px;
+  border-radius: 4px;
   background: transparent;
-  color: var(--ink-faint);
-  font-size: 13px;
-  line-height: 17px;
+  color: #1e3a5f;
+  opacity: 0.5;
   cursor: pointer;
+  font-size: 13px;
+  line-height: 16px;
 }
 
 .context-bubble-drop:hover {
-  background: var(--accent-soft);
-  color: var(--accent);
+  opacity: 1;
+  background: rgba(30, 58, 95, 0.12);
 }
 
 .search-input {
